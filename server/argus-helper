@@ -271,7 +271,8 @@ def signins():
     # Counted exactly as the Sign-In Attempts page counts its "last 24 hours";
     # one read of the SSH log gives both numbers.
     try:
-        rows, _, accepted = refused_rows("1", known_own_networks())
+        admin, other = _split(_read_seen(), caller_address())
+        rows, _, accepted = refused_rows("1", admin, other)
     except Refused:
         return None
     return {"accepted_24h": accepted, "refused_24h": sum(r["tries"] for r in rows)}
@@ -3268,14 +3269,20 @@ def service_update(args):
 # an attacker chooses (a user name, a banner) can't add, move or hide an address:
 # the address taken is always the one the logging program itself wrote.
 #
-# Matt's own addresses are never shown. "Own" means any address that has proved
-# it holds a real key or password: an SSH sign-in, or the key step of one
-# ("Partial publickey", logged at LogLevel VERBOSE, so a right key with a wrong
-# code still counts), mail through dovecot or postfix, the address of the Argus
-# session asking right now, and anything in
-# /etc/argus/own-addresses (one address or network per line). Own addresses are
-# remembered for 180 days in OWN_SEEN; IPv6 is matched by /64, since phones and
-# home routers change the rest of the address.
+# Addresses that have signed in successfully come in two kinds (own_split):
+# - admin: a finished SSH sign-in ("Accepted") as mattridge or root, the address
+#   of the Argus session asking right now, and anything in
+#   /etc/argus/own-addresses (one address or network per line). Never shown,
+#   never blockable, and the only kind let through ahead of the block list.
+#   Admin trust lasts 180 days from the last admin sign-in.
+# - other: a mailbox (dovecot, postfix) or upload account signed in. Left out of
+#   the list unless the address was also refused, then shown as "Has Signed In";
+#   blockable after a typed confirmation, in case that password was stolen.
+# A key step without the code ("Partial publickey", logged at LogLevel VERBOSE)
+# proves nothing on its own: someone with a stolen key gets that far. For
+# mattridge or root it is shown as "Used Your SSH Key".
+# Kept for 180 days in OWN_SEEN; entries from before the split read as other.
+# IPv6 is matched by /64, since phones and home routers change the rest.
 #
 # Locations come from DB-IP's free "lite" databases (CC BY 4.0), downloaded
 # monthly by geo-update into GEO_DIR; nothing is looked up online.
@@ -3308,7 +3315,10 @@ SSH_HEADS = [
     ("ssh", re.compile(r"^error: maximum authentication attempts exceeded for (?:invalid user )?(.*) from$")),
     ("probe", re.compile(r"^Connection closed by$")),
 ]
-SSH_OWN_RE = re.compile(r"^(?:Accepted|Partial) \S+ for \S+ from " + IPT + r" port \d+" + SSH_KEY_SUFFIX + r"$")
+# Only a finished sign-in counts. "Partial" means the key was accepted and the
+# authenticator code is still to come: someone holding a stolen key gets that far.
+SSH_OWN_RE = re.compile(r"^Accepted \S+ for (\S+) from " + IPT + r" port \d+" + SSH_KEY_SUFFIX + r"$")
+SSH_PARTIAL_RE = re.compile(r"^Partial \S+ for (\S+) from " + IPT + r" port \d+" + SSH_KEY_SUFFIX + r"$")
 SSH_PROBE_RE = re.compile(r"^(?:Unable to negotiate with|banner exchange: Connection from) " + IPT + r" port (\d+): ")
 NF_WARN_RE = re.compile(DOCKER_TS + r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d WARN: \d+ more attempts in the next \d+ seconds until " + IPT + r"(?:/\d+)? is banned$")
 NF_BAN_RE = re.compile(DOCKER_TS + r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [A-Z]+: Banning " + IPT + r"(?:/\d+)? for \d+ minutes?$")
@@ -3353,29 +3363,107 @@ def caller_address():
     return None
 
 
-def own_networks():
-    """Every network that is Matt's (see the section comment). Refuses if a
-    sign-in log can't be read, rather than risk showing one of his."""
-    now = int(time.time())
+ADMIN_USERS = ("mattridge", "root")
+
+
+def _finite(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and _math.isfinite(v)
+
+
+def _read_seen():
+    """OWN_SEEN as {ip: {"t": last seen, "via": "admin"|"other", "ta": last admin
+    sign-in (admin only)}}. Entries from the
+    older format (a bare time) didn't record how they signed in, so they count
+    as "other" until an admin sign-in from them is seen again."""
     try:
-        seen = {k: int(v) for k, v in json.load(open(OWN_SEEN)).items() if plain_ip(k) == k}
-    except (OSError, ValueError, AttributeError, TypeError):
-        seen = {}
-    found = set()
+        raw = json.load(open(OWN_SEEN))
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for k, v in (raw.items() if isinstance(raw, dict) else []):
+        if plain_ip(k) != k:
+            continue
+        if _finite(v):
+            out[k] = {"t": int(v), "via": "other"}
+        elif isinstance(v, dict) and _finite(v.get("t")) and v.get("via") in ("admin", "other"):
+            e = {"t": int(v["t"]), "via": v["via"]}
+            if e["via"] == "admin":
+                ta = v.get("ta")
+                e["ta"] = int(ta) if _finite(ta) else e["t"]
+            out[k] = e
+    return out
+
+
+def _manual_nets():
+    nets = set()
+    try:
+        with open(OWN_MANUAL) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    try:
+                        nets.add(_ipaddress.ip_network(line, strict=False))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return nets
+
+
+def _split(seen, me):
+    now = time.time()
+    admin = {own_net(ip) for ip, v in seen.items()
+             if v["via"] == "admin" and now - v.get("ta", v["t"]) < OWN_KEEP_S} | _manual_nets()
+    if me:
+        admin.add(own_net(me))
+    other = {}
+    for ip, v in seen.items():
+        n = own_net(ip)
+        if n not in admin:
+            other[n] = max(other.get(n, 0), v["t"])
+    return admin, other
+
+
+def own_split():
+    """Matt's networks, in two kinds (see the section comment):
+    admin: where mattridge or root finished an SSH sign-in (Accepted), the session asking, and
+      /etc/argus/own-addresses. Never shown, never blockable.
+    other: where only a mailbox or an upload account signed in successfully.
+      Left out of the counts like the admin ones, but they can be blocked after
+      a typed confirmation, in case that password was stolen.
+    Returns (admin set, {network: last sign-in time}). Refuses if a sign-in
+    log can't be read, rather than risk showing one of his."""
+    now = int(time.time())
+    seen = _read_seen()
+    found = {}
     counts = {}
+
+    def note(ip, via):
+        ip = plain_ip(ip) if ip else None
+        if ip and found.get(ip) != "admin":
+            found[ip] = via
     # journalctl --grep exits 1 when nothing matches; that is an empty result, not a failure.
     try:
-        p = subprocess.run(["journalctl", "-u", "ssh", "--no-pager", "-o", "cat", "--grep", "^(Accepted|Partial) "],
+        # Only the last 180 days, with times: admin trust runs from the sign-in
+        # itself, not from when the journal was last read.
+        p = subprocess.run(["journalctl", "-u", "ssh", "--since", "-%dd" % (OWN_KEEP_S // 86400), "--no-pager",
+                            "-o", "short-unix", "--grep", "^Accepted "],
                            capture_output=True, text=True, errors="replace", timeout=60)
         acc = p.stdout if p.returncode == 0 or (p.returncode == 1 and not (p.stderr or "").strip()) else None
     except (OSError, subprocess.TimeoutExpired):
         acc = None
     if acc is None:
         raise Refused("could not read the SSH sign-in log, so your own addresses can't be left out safely")
+    when = {}
     for line in acc.splitlines():
-        m = SSH_OWN_RE.match(line)
+        j = re.match(r"^(\d+)\.\d+ \S+ \S+: (.*)$", line)
+        m = SSH_OWN_RE.match(j.group(2)) if j else None
         if m:
-            found.add(plain_ip(m.group(1)))
+            admin_line = m.group(1) in ADMIN_USERS
+            note(m.group(2), "admin" if admin_line else "other")
+            ip = plain_ip(m.group(2))
+            if admin_line and ip:
+                when[ip] = max(when.get(ip, 0), min(int(j.group(1)), now))
     counts["ssh"] = len(found)
     for name, rx in ((DOVECOT, DOVECOT_LOGIN_RE), (POSTFIX, POSTFIX_SASL_RE)):
         before = len(found)
@@ -3386,14 +3474,23 @@ def own_networks():
         for line in out.splitlines():
             m = rx.match(line)
             if m:
-                found.add(plain_ip(m.group(1)))
+                note(m.group(1), "other")
         counts[name.split("-")[1]] = len(found) - before
-    found.add(caller_address())
+    me = caller_address()
+    note(me, "admin")
     OWN_COUNTS.update(counts)
-    found.discard(None)
-    for ip in found:
-        seen[ip] = now
-    seen = {k: v for k, v in seen.items() if now - v < OWN_KEEP_S}
+    for ip, via in found.items():
+        old = seen.get(ip) or {}
+        if via == "admin":
+            seen[ip] = {"t": now, "via": "admin", "ta": max(when.get(ip, now), old.get("ta", 0))}
+        elif old.get("via") == "admin":
+            seen[ip] = {"t": now, "via": "admin", "ta": old["ta"]}    # a mail sign-in doesn't renew admin
+        else:
+            seen[ip] = {"t": now, "via": "other"}
+    for k, v in seen.items():
+        if v["via"] == "admin" and now - v["ta"] >= OWN_KEEP_S:
+            seen[k] = {"t": v["t"], "via": "other"}          # no SSH sign-in from it for 180 days
+    seen = {k: v for k, v in seen.items() if now - v["t"] < OWN_KEEP_S}
     try:
         os.makedirs(os.path.dirname(OWN_SEEN), mode=0o700, exist_ok=True)
         fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(OWN_SEEN), prefix=".own-")
@@ -3407,18 +3504,7 @@ def own_networks():
             raise
     except (OSError, ValueError, TypeError):
         pass
-    nets = {own_net(ip) for ip in seen}
-    try:
-        for line in open(OWN_MANUAL):
-            line = line.split("#", 1)[0].strip()
-            if line:
-                try:
-                    nets.add(_ipaddress.ip_network(line, strict=False))
-                except ValueError:
-                    pass
-    except OSError:
-        pass
-    return nets
+    return _split(seen, me)
 
 
 _GEO = {}
@@ -3477,34 +3563,15 @@ def geo_info():
     return info
 
 
-def known_own_networks():
-    """Matt's networks without re-reading the mail logs: the remembered list,
-    the manual list and the address of the session asking. Quick enough for the
+def known_own_networks(admin_only=False):
+    """Matt's networks without re-reading the logs: the remembered list, the
+    manual list and the address of the session asking. Quick enough for the
     dashboard; the Sign-In Attempts page refreshes the remembered list itself."""
-    nets = set()
-    try:
-        for k in json.load(open(OWN_SEEN)):
-            if plain_ip(k) == k:
-                nets.add(own_net(k))
-    except (OSError, ValueError, TypeError):
-        pass
-    me = caller_address()
-    if me:
-        nets.add(own_net(me))
-    try:
-        for line in open(OWN_MANUAL):
-            line = line.split("#", 1)[0].strip()
-            if line:
-                try:
-                    nets.add(_ipaddress.ip_network(line, strict=False))
-                except ValueError:
-                    pass
-    except OSError:
-        pass
-    return nets
+    admin, other = _split(_read_seen(), caller_address())
+    return admin if admin_only else admin | set(other)
 
 
-def refused_rows(days, mine):
+def refused_rows(days, mine, signed_in=()):
     """Refused SSH and mail sign-ins over `days` days, one row per address,
     leaving out Matt's networks. Shared by the page and the dashboard tile, so
     both count the same way. Returns (rows, number left out, accepted sign-ins)."""
@@ -3517,7 +3584,8 @@ def refused_rows(days, mine):
         ip = plain_ip(ip)
         if not ip:
             return
-        e = seen.setdefault(ip, {"ssh": set(), "probes": set(), "mail": 0, "banned": 0, "users": {}, "first": ts, "last": ts, "times": []})
+        e = seen.setdefault(ip, {"ssh": set(), "probes": set(), "mail": 0, "banned": 0, "users": {}, "first": ts, "last": ts, "times": [],
+                                 "keyok": False})
         e["times"].append(ts)
         e["first"], e["last"] = min(e["first"], ts), max(e["last"], ts)
         if kind == "ssh":
@@ -3529,6 +3597,8 @@ def refused_rows(days, mine):
             e["probes"].add(conn or ts)
         elif kind == "mail":
             e["mail"] += 1
+        elif kind == "keyok":
+            e["keyok"] = True
         elif kind == "ban":
             e["banned"] += 1
             e["mail"] += 1            # the attempt that triggered the ban logs no WARN line
@@ -3541,6 +3611,11 @@ def refused_rows(days, mine):
         ts, msg = int(m.group(1)), m.group(2)
         if msg.startswith("Accepted ") and SSH_OWN_RE.match(msg):
             accepted += 1
+            continue
+        k = SSH_PARTIAL_RE.match(msg)
+        if k:
+            if k.group(1) in ADMIN_USERS:
+                hit(k.group(2), ts, "keyok")       # your key, from an address you never finished signing in from
             continue
         p = SSH_PROBE_RE.match(msg)
         if p:
@@ -3573,12 +3648,19 @@ def refused_rows(days, mine):
         if any(a in n for n in mine):
             left_out += 1
             continue
+        has_signed_in = any(a in n for n in signed_in)
+        if has_signed_in and not (e["ssh"] or e["mail"] or e["keyok"]):
+            left_out += 1             # only probes from an address that signs in: not worth listing
+            continue
         vis = visits_of(e["times"])
         rows.append({"ip": ip, "ssh": len(e["ssh"]), "mail": e["mail"], "banned": e["banned"], "probes": len(e["probes"]),
                      "tries": len(e["ssh"]) + e["mail"], "users": [u for u in users if USER_RE.fullmatch(u)][:8],
                      "first": e["first"], "last": e["last"], "visits": len(vis),
-                     "days": len({datetime.date.fromtimestamp(t) for t in e["times"]})})
-    rows.sort(key=lambda r: (-r["tries"], -r["probes"], -r["last"]))
+                     "days": len({datetime.date.fromtimestamp(t) for t in e["times"]}),
+                     "signed_in": has_signed_in, "key_ok": e["keyok"]})
+    # Your key without the code first, then signed-in addresses that were also
+    # refused, then the busiest: only the first 400 are shown.
+    rows.sort(key=lambda r: (not r["key_ok"], not r["signed_in"], -r["tries"], -r["probes"], -r["last"]))
     return rows, left_out, accepted
 
 
@@ -3587,7 +3669,8 @@ def attacks(args):
     days = args[0] if args else "1"
     if len(args) > 1 or days not in ("1", "7", "30"):
         raise UnexpectedArgs()
-    rows, left_out, _ = refused_rows(days, own_networks())
+    admin, other = own_split()
+    rows, left_out, _ = refused_rows(days, admin, other)
     countries = {}
     for r in rows:
         r.update(locate(r["ip"]))
@@ -3666,6 +3749,8 @@ def trace(args):
     ip = plain_ip(unhex(one_arg(args), 45))
     if not ip:
         raise Refused("that is not a public address")
+    if any(_ipaddress.ip_address(ip) in n for n in known_own_networks(admin_only=True)):
+        raise Refused("that address is one of yours")
     # Only addresses that have tried this server (or are blocked): TCP probes to
     # port 22 of an arbitrary address would look like a scan from here.
     if not blocked_match(ip) and not address_events(ip, 30, timeout=20):
@@ -3980,7 +4065,7 @@ def ip_info(args):
     ip = plain_ip(unhex(one_arg(args), 45))
     if not ip:
         raise Refused("that is not a public address")
-    mine = known_own_networks()
+    mine = known_own_networks(admin_only=True)
     if any(_ipaddress.ip_address(ip) in n for n in mine):
         raise Refused("that address is one of yours")
     NOTED.append(["ip-info", ip])
@@ -4170,12 +4255,13 @@ def server_networks():
 
 
 def own_for_table():
-    """Matt's networks for the accept set: the full list when the logs can be
-    read, the quick one otherwise."""
+    """Matt's admin networks for the accept set: refreshed from the logs when
+    they can be read, the remembered ones otherwise. Addresses known only from
+    a mailbox or upload sign-in are not let through ahead of the blocks."""
     try:
-        return set(own_networks()) | set(known_own_networks())
+        return own_split()[0] | known_own_networks(admin_only=True)
     except Refused:
-        return set(known_own_networks())
+        return known_own_networks(admin_only=True)
 
 
 def block_counters():
@@ -4213,10 +4299,14 @@ def block_list(args):
     return {"blocked": rows, "active": live, "boot": os.path.isfile("/etc/systemd/system/argus-blocklist.service")}
 
 
+SIGNED_IN_REFUSAL = "signed in successfully here"
+
+
 def block_add(args):
-    """block-add <hexnetwork> <hexnote|none>"""
-    if len(args) != 2:
+    """block-add <hexnetwork> <hexnote|none> [confirm-signed-in]"""
+    if len(args) not in (2, 3) or len(args) == 3 and args[2] != "confirm-signed-in":
         raise UnexpectedArgs()
+    confirmed = len(args) == 3
     raw = unhex(args[0], 50)
     note = unhex(args[1], 120) if args[1] != "none" else ""
     if not NOTE_RE.fullmatch(note):
@@ -4233,10 +4323,15 @@ def block_add(args):
     for n in server_networks():
         if n.version == net.version and n.overlaps(net):
             raise Refused("that would cut this server off (it contains the server's own address, its gateway or its name server)")
-    mine = own_networks()
+    mine, other = own_split()
+    mine = mine | known_own_networks(admin_only=True)
     for n in mine:
         if n.version == net.version and n.overlaps(net):
             raise Refused("that overlaps one of your own addresses (" + ("a network you sign in from" if n.prefixlen < 64 or n.version == 4 else "your IPv6 network") + "); not blocked")
+    hits = [t for n, t in other.items() if n.version == net.version and n.overlaps(net)]
+    if hits and not confirmed:
+        raise Refused("that address " + SIGNED_IN_REFUSAL + " (a mailbox or upload account) on " +
+                      datetime.date.fromtimestamp(max(hits)).isoformat() + "; confirm to block it anyway")
     # A wider block on the provider you sign in from could catch your next
     # address, which isn't known yet. Single addresses are still allowed.
     if net.num_addresses > 1:
@@ -4247,6 +4342,9 @@ def block_add(args):
             raise Refused("the provider of that network isn't known; block single addresses there instead")
         if any(locate(str(n.network_address)).get("asn") == asn for n in mine):
             raise Refused("that network belongs to the same provider you sign in from; block single addresses there instead")
+        if not confirmed and any(locate(str(n.network_address)).get("asn") == asn for n in other):
+            raise Refused("that network is on a provider where a mailbox or upload account has " + SIGNED_IN_REFUSAL +
+                          ", so its users could be cut off; confirm to block it anyway")
     with change_lock():
         entries = read_blocked()
         if str(net) in entries:
@@ -4261,8 +4359,8 @@ def block_add(args):
         if len(entries) >= BLOCK_MAX:
             raise Refused("the block list is full (%d)" % BLOCK_MAX)
         entries[str(net)] = {"added": int(time.time()), "note": note}
-        save_and_apply(entries, mine | set(known_own_networks()))
-    return {"blocked": str(net), "replaced": replaced}
+        save_and_apply(entries, mine)
+    return {"blocked": str(net), "replaced": replaced, "signed_in": bool(hits)}
 
 
 def block_remove(args):

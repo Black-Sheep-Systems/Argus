@@ -1300,3 +1300,197 @@ needs nftables 1.0.8 or later; the server has 1.1.3, and it also parses here on 
   nobody are accepted.
 
 Result: CLEAR (no Critical, High or Medium; Low still open: R-H1c)
+
+## Re-audit 3 (R-H1c fix: admin and other own addresses) - Sentinel, 2026-11-01
+
+Read the changed lines only: argus-helper SSH_OWN_RE 3312, ADMIN_USERS / _read_seen / _manual_nets / _split /
+own_split / own_networks 3357-3476, known_own_networks 3535-3540, refused_rows 3543-3623, attacks 3626-3632, signins
+270-278, ip_info 4025-4027, own_for_table 4214-4221, block_add 4259-4317; app.js row pill 1219 and blockIt 1298-1323;
+and accounts-setup.sh 70-90 for the sshd settings the classification depends on. The tests pass (27 passed). This was a
+code review; nothing was run on the server.
+
+| Item | Status | Evidence |
+|---|---|---|
+| R-H1c mail login counts as "own" | Fixed for mail and upload sign-ins (new Medium R-H1d below on SSH Partial lines) | Only the admin set reaches the accept sets: block_add passes `mine` (admin plus known admin) to save_and_apply (4283-4284, 4316), and block_remove uses own_for_table, which is admin only (4214-4221). The same-provider check uses admin only (4300). A mail-only or upload-only overlap is refused unless the third argument is exactly `confirm-signed-in` (4264, 4288-4291); any other third word is UnexpectedArgs (test). Admin overlaps are refused before the confirmation is looked at, so the confirmation can't unlock them (4285-4287). |
+| Crafted log lines / user names | Sound | Lines come from `journalctl -u ssh`, which only matches trusted fields (_SYSTEMD_UNIT, or PID 1 / UID 0 fields), so another local user can't add entries. SSH_OWN_RE is anchored at both ends; sshd escapes control characters in what it logs, so a user name can't start a new line; an Accepted line only names a real account that signed in. ADMIN_USERS is an exact tuple match. |
+| Admin is sticky in note() and in the merge | Sound for one call; see R-H1e for time | `found.get(ip) != "admin"` stops an "other" sighting from lowering an admin one; 3455 keeps an old admin. |
+| Old {ip: time} entries read as "other" | Accepted direction; see R-H1f | That only makes them blockable after confirmation. They are not let through ahead of blocks. |
+| Confirmation step | Sound (not a security boundary, and doesn't need to be) | It is a renderer prompt before Matt's own call. Anyone who can call the helper can already add and remove blocks, so sending `confirm-signed-in` directly gains nothing: it can't block an admin address, the server, or a network on Matt's provider. The renderer resends only when the refusal text matches SIGNED_IN_REFUSAL, and only after the typed BLOCK. |
+| "Has Signed In" listing | Sound | refused_rows leaves out admin by containment and lists other-only addresses that have SSH or mail tries, marked `signed_in`; app.js 1219 shows the pill through el() (textContent). |
+
+### R-H1d. A stolen SSH key alone, without the authenticator code, makes the attacker's address "admin"
+- Severity: Medium
+- Category: CWE-287 Improper Authentication (trust from a partial authentication) / CWE-284
+- Location: argus-helper 3312 (SSH_OWN_RE accepts `Partial`), 3427 (journalctl grep `^(Accepted|Partial) `), 3437
+  (admin when the user is mattridge or root); accounts-setup.sh 82 and the mattridge setup (`AuthenticationMethods
+  publickey,keyboard-interactive`); test_attacks.py 141-163 asserts that `Partial publickey for root` gives admin.
+- Description: sshd writes `Partial publickey for mattridge from IP ...` when the key is accepted and the second
+  factor (the authenticator code) has not been given yet. Someone who has stolen Matt's private key but not his phone
+  gets that line on the first try. Their address then becomes admin for 180 days. It is (a) never blockable,
+  (b) accepted ahead of every drop in own4/own6, and (c) left out of the Sign-In Attempts page entirely, along with
+  their failed codes (`Failed keyboard-interactive/pam for mattridge`). They can try codes for months, held back
+  only by the PAM rate limit, and Matt never sees it and can't block it. The second factor exists to cover exactly
+  this case, a stolen key. A real sign-in by Matt always ends in an `Accepted keyboard-interactive/pam for
+  mattridge` line, so counting Partial adds nothing for him. The same applies to root if root is ever given a
+  two-step AuthenticationMethods.
+- Remediation:
+  1. Count only completed sign-ins (argus-helper 3312 and 3427):
+     ```python
+     SSH_OWN_RE = re.compile(r"^Accepted \S+ for (\S+) from " + IPT + r" port \d+" + SSH_KEY_SUFFIX + r"$")
+     SSH_PARTIAL_RE = re.compile(r"^Partial \S+ for (\S+) from " + IPT + r" port \d+" + SSH_KEY_SUFFIX + r"$")
+     ...
+     p = subprocess.run(["journalctl", "-u", "ssh", "--no-pager", "-o", "cat", "--grep", "^Accepted "], ...)
+     ```
+     Partial lines then make an address neither admin nor other. An upload account's Partial line (key without
+     code) also no longer marks the address "Has Signed In".
+  2. Show it instead of hiding it (refused_rows, around 3578): a Partial line for an ADMIN_USERS name from an address
+     with no Accepted line means Matt's key is in someone else's hands.
+     ```python
+     pm = SSH_PARTIAL_RE.match(msg)
+     if pm:
+         if pm.group(1) in ADMIN_USERS:
+             hit(pm.group(2), ts, "keyok")
+         continue
+     ```
+     In hit(): `elif kind == "keyok": e["keyok"] = True` (add `"keyok": False` to the setdefault). In the row:
+     `"key_ok": e["keyok"]`, and do not drop such a row in the probes-only skip. In app.js next to 1219:
+     `if (r.key_ok) vis.append(el('span', 'Used Your SSH Key', 'pill bad'));`. If Matt's own address ever produces
+     Partial-then-Accepted, it is admin and is left out before this point, so he isn't shown his own sign-ins.
+  3. Tests: in test_own_sign_in_lines, assert the Partial line does NOT match SSH_OWN_RE. In
+     test_own_split_trusts_only_admin_ssh_sign_ins, the expected sets become admin {45.33.5.1, 45.33.6.2} and other
+     {45.33.5.2, 45.33.5.3, 45.33.5.4, 45.33.6.1}. Add a test: `Partial publickey for mattridge from 45.33.5.9`
+     plus `Failed keyboard-interactive/pam for mattridge from 45.33.5.9 port 22 ssh2` gives an address in neither
+     set, listed by refused_rows with `key_ok` true, and blockable without a confirmation.
+- Verification: run the tests. On the server, sign in as mattridge from a second network and abort at the code
+  prompt. That address is not in own-seen.json as admin, not in own4 in the BLOCK_NFT file (`nft list set inet argus own4`), appears on
+  the page marked "Used Your SSH Key", and block-add on it succeeds without `confirm-signed-in`.
+
+### R-H1e. An address that was once admin stays admin as long as anything signs in from it
+- Severity: Low
+- Category: CWE-284 Improper Access Control (stale trust)
+- Location: argus-helper 3453-3456 (each sighting sets `t` to now and keeps `via: "admin"` if it was admin before)
+- Description: the 180-day clock runs from the last sighting of any kind. If Matt's home or hotel address is handed to
+  someone else, one mailbox login from it, which is the stolen-password case R-H1c was about, keeps it admin
+  (unblockable and accepted ahead of drops) for as long as those logins keep coming. It is bounded only by the full
+  journal still holding the old Accepted line, or by the mail logins stopping.
+- Remediation: keep the admin time separately and expire admin by it.
+  ```python
+  # own_split, replacing 3453-3456
+  for ip, via in found.items():
+      old = seen.get(ip) or {}
+      ta = now if via == "admin" else old.get("ta")
+      seen[ip] = {"t": now, "via": "admin" if ta else "other", **({"ta": ta} if ta else {})}
+  for v in seen.values():
+      if v.get("ta") and now - v["ta"] >= OWN_KEEP_S:
+          v["via"] = "other"
+          v.pop("ta")
+  seen = {k: v for k, v in seen.items() if now - v["t"] < OWN_KEEP_S}
+  ```
+  In _read_seen, for a dict entry with via "admin" carry `"ta": int(v.get("ta", v["t"]))` when it is a number; an
+  admin entry with no usable ta uses t. Note: `found` admin comes from the whole journal (no --since), so while the
+  old Accepted line is still in the journal, ta is refreshed. That is the intended behaviour.
+- Verification: test with own-seen.json `{"45.33.7.1": {"t": now, "via": "admin", "ta": now - 181*86400}}`, no SSH
+  line and one Dovecot login from 45.33.7.1: the address is in `other`, not `admin`.
+
+### R-H1f. Informational
+- Old-format entries become "other", and the refusal then says "(a mailbox or upload account)" although the address
+  may have been Matt's SSH one. Each call reads the whole journal again, so anything still in it is admin again at
+  once; only addresses older than the journal stay downgraded. Suggest: record legacy entries as `via: "other",
+  "legacy": true` and say "signed in successfully here before Argus kept track of how" in the refusal for them.
+- IPv6 admin is the whole /64 (own_net), so another device on the same /64 (a hotel or shared network) is unblockable
+  too. Unchanged from before; noted only.
+- caller_address() trusts SSH_CONNECTION from the parent processes' environment and saves it as admin for 180 days. Only
+  someone who can already run the helper as root can set it, so it is not an escalation. Running the helper by hand
+  from a long-lived tmux shell can save a stale address as admin.
+- _split compares "other" against admin by equality, not containment, so an address inside a wider manual network
+  still shows in `other`. Every user of the sets checks admin by containment first (refused_rows, block_add), so
+  there is no effect.
+
+Result: ISSUES FOUND (Medium: R-H1d; Low: R-H1e)
+
+## Re-audit 4 (R-H1d / R-H1e fixes, cycle 1) - Sentinel, 2026-11-01
+
+Read the changed lines only: argus-helper SSH_OWN_RE / SSH_PARTIAL_RE 3320-3321, _finite / _read_seen 3368-3393,
+own_split 3424-3497, refused_rows 3562-3650, trace 3730-3741, block_add 4291-4346; app.js 1220; and the new tests
+(test_attacks.py 91-95 and 175-210). The tests pass (32 passed). This was a code review; nothing was run on the server.
+
+| Item | Status | Evidence |
+|---|---|---|
+| R-H1d key accepted, code not | Fixed | 3320 and the journal search at 3441 take `^Accepted` only, so a Partial line never makes an address own of either kind. In refused_rows (3603-3607), a Partial line for an ADMIN_USERS name gives `keyok`, and the probes-only skip keeps such rows (3640). A Partial-only address with no other tries is still listed, because the skip applies only to signed-in addresses. The pill goes through el() (textContent). An attacker can still only become admin through an Accepted line for mattridge or root (which needs the code) or as the caller session, which needs access that is already root-equivalent. |
+| R-H1e admin expiry | Fixed in OWN_SEEN; residual R-H1g | Only an admin sighting sets `ta` to now (3473). A mail or upload sighting keeps the old `ta` (3475), and admin drops to "other" when `now - ta >= 180 days` (3478-3480). Every admin entry carries `ta`, so `old["ta"]` and `v["ta"]` can't raise KeyError. Admin entries from before this change take `ta = t`, so they fall to "other" at most 180 days after deploy, even if mail sign-ins continue. |
+| `_read_seen` hardening | Fixed | NaN, Infinity and bools are rejected by `_finite` for both `t` and `ta`. Unknown `via` values, strings and private addresses are dropped (test). |
+| Wide block on an "other" network's provider | Sound | An admin provider is still a hard refusal (4335). An "other" provider is a confirmable SIGNED_IN_REFUSAL (4336-4338). The renderer matches that text and resends with `confirm-signed-in` only after the typed BLOCK. Confirming can't override admin, server or admin-provider refusals, because those are checked first or regardless of `confirmed`. |
+| trace refuses admin | Sound | 3737-3738 (admin only). Tracing an "other" address is allowed, which fits: it may be an attacker. |
+| Old wider accept set | Unfinished until deploy | The live own4/own6 sets still hold the mail-derived addresses until the table is next written. The planned one-off re-apply on deploy (any block-add/block-remove, or a helper run that calls save_and_apply with own_for_table()) is required. Check it with `nft list set inet argus own4`. |
+| R-H1f legacy wording | Unfinished (Informational) | Not done, as stated. |
+
+### R-H1g. Admin expiry counts from when the journal was read, not from when Matt signed in
+- Severity: Low
+- Category: CWE-613 Insufficient Session Expiration (stale trust)
+- Location: argus-helper 3441 (`journalctl -u ssh --no-pager -o cat --grep "^Accepted "`, with no `--since` and no
+  timestamps) and 3471-3473 (`ta` is set to `now` for every admin address found)
+- Description: the search reads the whole journal. An `Accepted publickey for mattridge` line from, say, 14 months
+  ago is still "found" on every call while the journal keeps it. Each time that sets `ta = now`, so that address
+  never expires. A persistent journal is limited only by size (by default 10% of the filesystem, capped at 4 GB), and
+  on a quiet server that can be years. So the claim "180 days after the last admin sign-in" holds only once the line
+  has rotated out. Until then, a reassigned old address of Matt's stays unblockable and is let through ahead of the
+  blocks: the R-H1e case. The expiry test passes because its fake journal has no old line.
+- Remediation: take the time from the line itself, and only for the last 180 days. Replace 3440-3454:
+  ```python
+  p = subprocess.run(["journalctl", "-u", "ssh", "--since", "-%dd" % (OWN_KEEP_S // 86400), "--no-pager",
+                      "-o", "short-unix", "--grep", "^Accepted "],
+                     capture_output=True, text=True, errors="replace", timeout=60)
+  ...
+  when = {}
+  for line in acc.splitlines():
+      lm = re.match(r"^(\d+)\.\d+ \S+ \S+: (.*)$", line)
+      if not lm:
+          continue
+      m = SSH_OWN_RE.match(lm.group(2))
+      if m:
+          via = "admin" if m.group(1) in ADMIN_USERS else "other"
+          note(m.group(2), via)
+          ip = plain_ip(m.group(2))
+          if ip and via == "admin":
+              when[ip] = max(when.get(ip, 0), min(int(lm.group(1)), now))
+  ```
+  and at 3473: `seen[ip] = {"t": now, "via": "admin", "ta": max(when.get(ip, now), old.get("ta", 0))}`. The caller
+  session has no entry in `when`, so it keeps `ta = now`, which is right. `--grep` matches MESSAGE, so it still works
+  with `-o short-unix`.
+- Tests: a fake journal line `"<now-200d>.000001 host sshd-session[1]: Accepted publickey for mattridge from
+  45.33.7.8 port 22 ssh2"` must give 45.33.7.8 `ta` equal to that time, so it is not admin when combined with an
+  OWN_SEEN entry. The fake subprocess.run should also assert that `--since` is in the arguments. A line from 10 days
+  ago gives admin with `ta` equal to that line's time.
+- Verification: on the server, `journalctl -u ssh --grep '^Accepted ' -o short-unix | head -1` shows the oldest
+  line. After a refresh, own-seen.json gives that address `ta` equal to the line's time (not today), or no entry at
+  all if it is older than 180 days.
+
+### R-H1h. Informational
+- The dashboard tile (`signins`) adds up `tries` only, so an address with a key-accepted line and no other tries
+  adds 0 there. The page shows it. Consider putting a count of `key_ok` rows on the tile, since it is the one event
+  that means Matt's key is out.
+- If Matt himself signs in from a new network and stops at the code prompt, that address gets the red pill until an
+  Accepted line from it is seen. This is expected; the wording could say "your key, without the code".
+
+Result: CLEAR (no Critical, High or Medium; Low open: R-H1g; unfinished: the deploy re-apply and the R-H1f wording)
+
+## Re-audit 5 (R-H1g fix, cycle 2) - Sentinel, 2026-11-01
+
+Read the changed lines only: argus-helper _split, the own_split journal read and admin-time merge, and the refused_rows
+sort (3663); plus the new test. The tests pass (34 passed). This was a code review; nothing was run on the server.
+
+| Item | Status | Evidence |
+|---|---|---|
+| R-H1g admin time from the journal read | Fixed | The search is now `--since -180d -o short-unix --grep "^Accepted "`, and `--grep` still matches MESSAGE. Each line's own time is parsed, and `min(line_ts, now)` stops a future-dated clock from stretching trust. A line that doesn't parse is skipped (`m` is None). `ta = max(line time, old ta)`. Only the caller session, which has no line, falls back to now. A 200-day-old line is no longer read, so it can't renew anything (test). |
+| Expiry applied everywhere | Fixed | _split counts an entry as admin only while `now - ta < 180 days`, so known_own_networks (dashboard, ip_info, trace, and own_for_table's fallback) expires admin too, without a log read. An expired admin entry now falls into `other`, because the `via == "other"` condition was removed from the second loop. That is the intended direction: blockable after confirmation, and not in the accept sets. |
+| Accept sets | Sound | Unchanged: own4/own6 still come only from the admin set. |
+| List order | Sound | key_ok rows, then signed-in rows, then tries. A "Used Your SSH Key" row can't fall outside the 400 shown. |
+| Deploy re-apply | Unfinished until deploy | The planned one-off re-apply, and the check that own4/own6 hold only admin networks, is still needed. Until then the live sets carry the old wider list. |
+| R-H1f legacy wording | Unfinished (Informational) | Not done, as stated in cycle 1. |
+
+### R-H1i. Informational
+- With signed-in rows sorted ahead, the "Busiest N of M shown" label (app.js) is no longer strictly true once there
+  are more than 400 rows. Suggest "Top N of M shown (keys used and signed-in addresses first)".
+- The dashboard tile still adds up tries only, so a key-only row adds 0 there (R-H1h, unchanged).
+
+Result: CLEAR (no Critical, High or Medium; R-H1c, R-H1d, R-H1e and R-H1g are resolved in code; unfinished: the deploy re-apply and the R-H1f wording)

@@ -1205,7 +1205,7 @@ async function loadSignins() {
     + `. All refused.${t.returning ? ` ${t.returning.toLocaleString()} of them came back on more than one day.` : ''}${t.bans ? ` mailcow banned ${t.bans} ${t.bans === 1 ? 'address' : 'addresses'} for repeated mail failures.` : ''}`;
   $('si-countries').textContent = d.countries.length ? 'Most attempts from: ' + d.countries.slice(0, 8).map(([c, n]) => `${c} (${n.toLocaleString()})`).join(', ') : '';
   $('si-credit').textContent = (d.geo?.credit || '') + (d.geo?.updated ? ` · updated ${d.geo.updated}` : ' · location data not downloaded yet') + ' · Map: Natural Earth.';
-  $('si-count').textContent = d.rows.length < t.addresses ? `Busiest ${d.rows.length} of ${t.addresses.toLocaleString()} shown here and on the map` : `${t.addresses.toLocaleString()}`;
+  $('si-count').textContent = d.rows.length < t.addresses ? `Top ${d.rows.length} of ${t.addresses.toLocaleString()} shown here and on the map (your key used and signed-in addresses first, then the busiest)` : `${t.addresses.toLocaleString()}`;
   drawMap(d.rows, d.server, null);
   $('si-rows').replaceChildren(...d.rows.map((r) => {
     const tries = el('div');
@@ -1216,6 +1216,8 @@ async function loadSignins() {
     vis.append(el('span', `${r.visits} ${r.visits === 1 ? 'visit' : 'visits'} · ${r.days} ${r.days === 1 ? 'day' : 'days'}`, 'small'));
     if (r.days > 1) vis.append(el('span', 'Returning', 'pill warn'));
     if (r.blocked) vis.append(el('span', 'Blocked', 'pill bad'));
+    if (r.signed_in) vis.append(el('span', 'Has Signed In', 'pill unknown'));
+    if (r.key_ok) vis.append(el('span', 'Used Your SSH Key', 'pill bad'));
     return row([el('span', r.ip, 'mono'), placeText(r), el('span', r.network || '', 'small'), tries, vis,
       el('span', (r.users || []).join(', '), 'mono small'), el('span', new Date(r.last * 1000).toLocaleString(), 'small'),
       button('Details', '', () => showAddress(r))]);
@@ -1298,11 +1300,23 @@ async function blockIt(network, r, reg) {
   const owner = reg.org || reg.name || r.network || 'unknown owner';
   const wide = !/\/(32|128)$/.test(network);
   if (!await confirmAction({ title: `Block ${network}?`,
-    text: wide ? `Every address in ${network} (${owner}) is cut off from the whole server: SSH, mail and websites. Use this when one network keeps sending attackers; anyone legitimate on it is blocked too. The server can still reach out to it (sending mail, updates); only connections that network starts are dropped, so mail sent from it is refused too. Your own known addresses are never blocked, but if you later sign in from a new address inside this network you'd be locked out. The way back in is the Oracle Cloud console: run sudo nft destroy table inet argus && sudo systemctl disable argus-blocklist.service, unblock the network in Argus, then run sudo systemctl enable argus-blocklist.service.`
+    text: wide ? `Every address in ${network} (${owner}) is cut off from the whole server: SSH, mail and websites. Use this when one network keeps sending attackers; anyone legitimate on it is blocked too. The server can still reach out to it (sending mail, updates); only connections that network starts are dropped, so mail sent from it is refused too. Addresses you sign in from over SSH are never blocked, but if you later sign in from a new address inside this network you'd be locked out. The way back in is the Oracle Cloud console: run sudo nft destroy table inet argus && sudo systemctl disable argus-blocklist.service, unblock the network in Argus, then run sudo systemctl enable argus-blocklist.service.`
       : `${r.ip} (${owner}, ${placeText(r)}) is cut off from the whole server: SSH, mail and websites. You can unblock it at any time below.`,
     ok: 'Block', word: wide ? 'BLOCK' : undefined })) return;
+  const note = hex(`From Sign-In Attempts: ${owner}`.replace(/[^A-Za-z0-9 .,:;()'/@_+-]/g, '').slice(0, 120));
   try {
-    const res = await call('block-add', [hex(network), hex(`From Sign-In Attempts: ${owner}`.replace(/[^A-Za-z0-9 .,:;()'/@_+-]/g, '').slice(0, 120))]);
+    let res;
+    try { res = await call('block-add', [hex(network), note]); }
+    catch (err) {
+      const why = errText(err);
+      if (!/signed in successfully here/.test(why)) throw err;
+      // A mailbox or upload account signed in from here. That is either its
+      // owner or someone with a stolen password; Matt decides.
+      if (!await confirmAction({ title: `Block ${network} Anyway?`,
+        text: `${why[0].toUpperCase()}${why.slice(1)}. If that sign-in was the mailbox or upload account's owner, blocking cuts them off too. If you believe the password was stolen, block it and change that password.`,
+        ok: 'Block Anyway', word: 'BLOCK' })) return;
+      res = await call('block-add', [hex(network), note, 'confirm-signed-in']);
+    }
     const rep = res?.replaced?.length ? ` It replaces the narrower ${res.replaced.length === 1 ? 'block' : 'blocks'} on ${res.replaced.join(', ')}.` : '';
     say(`${network} is blocked.${rep}`);
   } catch (err) { say('It was not blocked: ' + errText(err)); return; }

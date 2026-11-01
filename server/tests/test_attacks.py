@@ -1,7 +1,7 @@
 """Tests for the Sign-In Attempts log parsing in argus-helper.
 
 Run from the repository: python3 server/tests/test_attacks.py
-No server needed: the helper's run() and own_networks() are replaced with
+No server needed: the helper's run() and own_split() are replaced with
 fixtures, so this checks the parsing, counting and exclusion rules only."""
 import importlib.machinery
 import importlib.util
@@ -18,7 +18,7 @@ loader = importlib.machinery.SourceFileLoader("helper", os.path.join(HERE, "..",
 spec = importlib.util.spec_from_loader("helper", loader)
 h = importlib.util.module_from_spec(spec)
 loader.exec_module(h)
-ORIGINAL_OWN_NETWORKS = h.own_networks
+ORIGINAL_OWN_SPLIT = h.own_split
 
 T = 1793500000
 SSH = "\n".join(f"{T + i}.000001 host sshd-session[{100 + i}]: {m}" for i, m in enumerate([
@@ -53,11 +53,19 @@ def fake_run(cmd, timeout=20, stderr_too=False):
     return ""
 
 
+def jlines(msgs, ts=None):
+    """Journal lines as journalctl -o short-unix writes them."""
+    import time
+    ts = int(time.time()) - 60 if ts is None else ts
+    return "\n".join(f"{ts}.000001 host sshd-session[{100 + i}]: {m}" for i, m in enumerate(msgs))
+
+
 class Attacks(unittest.TestCase):
     def setUp(self):
         h.run = fake_run
         h.locate = lambda ip: {}
-        h.own_networks = lambda: {h.own_net("2a02:1:2:3::1")}      # one of Matt's IPv6 /64s
+        h.own_split = lambda: ({h.own_net("2a02:1:2:3::1")}, {h.own_net("45.33.1.90"): 1, h.own_net("45.33.1.6"): 1})
+        # 2a02:1:2:3::/64 is Matt's (admin); 45.33.1.90 and 45.33.1.6 have had a mailbox sign in
 
     def result(self):
         return {r["ip"]: r for r in h.attacks(["1"])["rows"]}
@@ -86,9 +94,32 @@ class Attacks(unittest.TestCase):
     def test_key_fingerprint_suffix_still_parses(self):
         self.assertEqual(self.result()["45.33.1.90"]["ssh"], 1)
 
+    def test_your_key_without_the_code_is_listed_and_marked(self):
+        extra = (f"\n{T + 50}.000001 host sshd-session[900]: Partial publickey for mattridge from 45.33.8.1 port 22 ssh2: ED25519 SHA256:abc"
+                 f"\n{T + 51}.000001 host sshd-session[900]: Failed keyboard-interactive/pam for mattridge from 45.33.8.1 port 22 ssh2")
+        h.run = lambda cmd, timeout=20, stderr_too=False: (fake_run(cmd) + extra) if cmd[:1] == ["journalctl"] else fake_run(cmd)
+        r = self.result()["45.33.8.1"]
+        self.assertTrue(r["key_ok"])
+        self.assertFalse(r["signed_in"])
+
+    def test_your_key_row_is_shown_even_behind_400_busier_addresses(self):
+        lines = [f"{T + i}.000001 host sshd-session[{i}]: Invalid user a from 45.{34 + i // 250}.{i % 250}.1 port {i}" for i in range(450)
+                 for _ in (0, 1)]
+        lines.append(f"{T + 999}.000001 host sshd-session[9]: Partial publickey for mattridge from 45.33.8.2 port 22 ssh2")
+        big = "\n".join(lines)
+        h.run = lambda cmd, timeout=20, stderr_too=False: big if cmd[:1] == ["journalctl"] else ""
+        rows = h.attacks(["30"])["rows"]
+        self.assertEqual(len(rows), 400)
+        self.assertEqual(rows[0]["ip"], "45.33.8.2")
+
+    def test_signed_in_address_with_refused_tries_is_listed_and_marked(self):
+        rows = self.result()
+        self.assertTrue(rows["45.33.1.90"]["signed_in"])
+        self.assertFalse(rows["45.33.1.5"]["signed_in"])
+        self.assertNotIn("45.33.1.6", rows)     # signed in, and only scanned: left out
+
     def test_probes_and_private_and_ipv6(self):
         rows = self.result()
-        self.assertEqual(rows["45.33.1.6"]["probes"], 1)
         self.assertEqual(rows["45.33.1.7"]["probes"], 1)
         self.assertEqual(rows["45.33.1.8"]["probes"], 1)
         self.assertNotIn("10.0.0.5", rows)                 # private, never shown
@@ -113,9 +144,11 @@ class Attacks(unittest.TestCase):
 
     def test_own_sign_in_lines(self):
         for line in ("Accepted publickey for root from 45.33.4.1 port 22 ssh2: ED25519 SHA256:I8fHgkz7nhxQzFNpqIqRhxK4fN2PMbTnUr7yEn83Ylw",
-                     "Partial publickey for mattridge from 45.33.4.2 port 22 ssh2: ED25519 SHA256:abc",
                      "Accepted keyboard-interactive/pam for mattridge from 45.33.4.3 port 22 ssh2"):
             self.assertIsNotNone(h.SSH_OWN_RE.match(line), line)
+        partial = "Partial publickey for mattridge from 45.33.4.2 port 22 ssh2: ED25519 SHA256:abc"
+        self.assertIsNone(h.SSH_OWN_RE.match(partial))
+        self.assertEqual(h.SSH_PARTIAL_RE.match(partial).group(2), "45.33.4.2")
         self.assertIsNone(h.SSH_OWN_RE.match("Invalid user Accepted publickey for x from 45.33.4.4 port 1"))
         mixed = "Nov  1 10:12:57 67189641cc02 postfix/submission/smtpd[43510]: 4kX9Lq2Zb7z9vH: client=unknown[45.33.4.5], sasl_method=PLAIN, sasl_username=a@b.c"
         self.assertEqual(h.POSTFIX_SASL_RE.match(mixed).group(1), "45.33.4.5")
@@ -127,9 +160,87 @@ class Attacks(unittest.TestCase):
             h.run = lambda cmd, timeout=20, stderr_too=False: None                             # mail log unreadable
             h.OWN_SEEN = "/nonexistent/own-seen.json"
             with self.assertRaises(h.Refused):
-                ORIGINAL_OWN_NETWORKS()
+                ORIGINAL_OWN_SPLIT()
         finally:
             h.subprocess.run, h.OWN_SEEN = real_sp, real_seen
+
+    def test_own_split_trusts_only_admin_ssh_sign_ins(self):
+        import json, tempfile
+        d = tempfile.mkdtemp()
+        seen = os.path.join(d, "own-seen.json")
+        with open(seen, "w") as f:
+            json.dump({"45.33.6.1": 1793400000, "45.33.6.2": {"t": 1793400000, "via": "admin"}}, f)   # old and new format
+        ssh = jlines(["Accepted publickey for mattridge from 45.33.5.1 port 22 ssh2",
+                      "Accepted publickey for upload1 from 45.33.5.2 port 22 ssh2",
+                      "Accepted publickey for upload1 from 45.33.5.3 port 22 ssh2",
+                      "Partial publickey for root from 45.33.5.3 port 23 ssh2"])
+        dove = "Oct 30 10:00:00 host dovecot: imap-login: Login: user=<a@b.c>, method=PLAIN, rip=45.33.5.4, lip=10.0.0.1, mpid=1"
+        real = (h.subprocess.run, h.run, h.OWN_SEEN, h.OWN_MANUAL, h.caller_address)
+        try:
+            h.subprocess.run = lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=ssh, stderr="")
+            h.run = lambda cmd, timeout=20, stderr_too=False: dove if h.DOVECOT in cmd else ""
+            h.OWN_SEEN, h.OWN_MANUAL, h.caller_address = seen, os.path.join(d, "none"), lambda: None
+            admin, other = ORIGINAL_OWN_SPLIT()
+        finally:
+            h.subprocess.run, h.run, h.OWN_SEEN, h.OWN_MANUAL, h.caller_address = real
+        net = h.own_net
+        self.assertEqual(admin, {net("45.33.5.1"), net("45.33.6.2")})
+        self.assertEqual(set(other), {net("45.33.5.2"), net("45.33.5.3"), net("45.33.5.4"), net("45.33.6.1")})
+        with open(seen) as f:
+            self.assertEqual(json.load(f)["45.33.5.3"]["via"], "other")     # a Partial line is not a sign-in
+
+    def test_admin_trust_runs_from_the_sign_in_not_from_reading_the_journal(self):
+        import time
+        now = int(time.time())
+        args = []
+        line = "Accepted publickey for mattridge from %s port 22 ssh2"
+        ssh = jlines([line % "45.33.7.8"], now - 200 * 86400) + "\n" + jlines([line % "45.33.7.9"], now - 10 * 86400)
+        (admin, other), seen = self._split_with({}, ssh=ssh, args=args)
+        self.assertNotIn(h.own_net("45.33.7.8"), admin)
+        self.assertIn(h.own_net("45.33.7.9"), admin)
+        self.assertIn("--since", args[0])
+        import json
+        with open(seen) as f:
+            self.assertEqual(json.load(f)["45.33.7.9"]["ta"], now - 10 * 86400)
+
+    def _split_with(self, seen_data, ssh="", dove="", args=None):
+        import json, tempfile
+        d = tempfile.mkdtemp()
+        seen = os.path.join(d, "own-seen.json")
+        with open(seen, "w") as f:
+            f.write(seen_data if isinstance(seen_data, str) else json.dumps(seen_data))
+        real = (h.subprocess.run, h.run, h.OWN_SEEN, h.OWN_MANUAL, h.caller_address)
+        try:
+            def fake(cmd, **k):
+                if args is not None:
+                    args.append(cmd)
+                return types.SimpleNamespace(returncode=0, stdout=ssh, stderr="")
+            h.subprocess.run = fake
+            h.run = lambda cmd, timeout=20, stderr_too=False: dove if h.DOVECOT in cmd else ""
+            h.OWN_SEEN, h.OWN_MANUAL, h.caller_address = seen, os.path.join(d, "none"), lambda: None
+            return ORIGINAL_OWN_SPLIT(), seen
+        finally:
+            h.subprocess.run, h.run, h.OWN_SEEN, h.OWN_MANUAL, h.caller_address = real
+
+    def test_admin_trust_expires_180_days_after_the_last_admin_sign_in(self):
+        import json, time
+        now = int(time.time())
+        dove = "Oct 30 10:00:00 host dovecot: imap-login: Login: user=<a@b.c>, method=PLAIN, rip=45.33.7.1, lip=10.0.0.1, mpid=1"
+        (admin, other), seen = self._split_with({"45.33.7.1": {"t": now - 10, "via": "admin", "ta": now - 181 * 86400}}, dove=dove)
+        self.assertNotIn(h.own_net("45.33.7.1"), admin)
+        self.assertIn(h.own_net("45.33.7.1"), other)
+        (admin, _), _ = self._split_with({"45.33.7.2": {"t": now - 86400, "via": "admin", "ta": now - 100 * 86400}}, dove=dove.replace("7.1", "7.2"))
+        self.assertIn(h.own_net("45.33.7.2"), admin)          # still within 180 days; a mail sign-in keeps it, doesn't renew it
+
+    def test_old_entry_becomes_admin_after_an_admin_ssh_sign_in(self):
+        (admin, other), _ = self._split_with({"45.33.7.3": 1793400000},
+                                             ssh=jlines(["Accepted publickey for mattridge from 45.33.7.3 port 22 ssh2"]))
+        self.assertIn(h.own_net("45.33.7.3"), admin)
+        self.assertNotIn(h.own_net("45.33.7.3"), other)
+
+    def test_malformed_seen_entries_are_ignored(self):
+        (admin, other), _ = self._split_with('{"45.33.7.4": Infinity, "45.33.7.5": true, "10.0.0.1": 5, "45.33.7.6": {"t": 5, "via": "boss"}, "45.33.7.7": "x"}')
+        self.assertEqual((admin, other), (set(), {}))
 
     def test_mapped_ipv4_is_normalised(self):
         self.assertEqual(h.plain_ip("::ffff:45.33.1.5"), "45.33.1.5")
@@ -193,8 +304,8 @@ class Intel(unittest.TestCase):
         self.assertEqual(r["networks"], ["45.33.0.0/16"])
 
     def test_block_refuses_own_server_private_and_too_wide(self):
-        real = (h.own_networks, h.server_networks)
-        h.own_networks = lambda: {h.own_net("45.33.9.9")}
+        real = (h.own_split, h.server_networks)
+        h.own_split = lambda: ({h.own_net("45.33.9.9")}, {})
         h.server_networks = lambda: {h._ipaddress.ip_network(h.SERVER_IP)}
         try:
             for net, why in (("10.0.0.0/24", "public"), ("45.0.0.0/8", "too wide"), ("45.33.9.0/24", "your own"),
@@ -203,25 +314,25 @@ class Intel(unittest.TestCase):
                     h.block_add([net.encode().hex(), "none"])
                 self.assertIn(why, str(cm.exception))
         finally:
-            h.own_networks, h.server_networks = real
+            h.own_split, h.server_networks = real
 
-    def _block_with(self, entries, net):
+    def _block_with(self, entries, net, confirm=False, other=None):
         import contextlib
         saved = {}
-        real = (h.read_blocked, h.save_and_apply, h.change_lock, h.server_networks, h.locate, h.known_own_networks, h.geo_reader)
+        real = (h.read_blocked, h.save_and_apply, h.change_lock, h.server_networks, h.locate, h.known_own_networks, h.geo_reader, h.own_split)
         if h.geo_reader is not self._no_db:
             h.geo_reader = lambda kind: object()
-        h.own_networks = lambda: {h.own_net("45.33.9.9")}
+        h.own_split = lambda: ({h.own_net("45.33.9.9")}, other or {})
         h.read_blocked = lambda: dict(entries)
         h.save_and_apply = lambda e, mine: saved.update(e=e, mine=mine)
         h.change_lock = contextlib.nullcontext
         h.server_networks = lambda: {h._ipaddress.ip_network(h.SERVER_IP)}
         h.locate = lambda ip: {"asn": 1 if ip.startswith("45.33.9") else 2}
-        h.known_own_networks = lambda: set()
+        h.known_own_networks = lambda admin_only=False: set()
         try:
-            return h.block_add([net.encode().hex(), "none"]), saved
+            return h.block_add([net.encode().hex(), "none"] + (["confirm-signed-in"] if confirm else [])), saved
         finally:
-            (h.read_blocked, h.save_and_apply, h.change_lock, h.server_networks, h.locate, h.known_own_networks, h.geo_reader) = real
+            (h.read_blocked, h.save_and_apply, h.change_lock, h.server_networks, h.locate, h.known_own_networks, h.geo_reader, h.own_split) = real
 
     @staticmethod
     def _no_db(kind):
@@ -239,6 +350,26 @@ class Intel(unittest.TestCase):
             self.assertEqual(r["blocked"], "46.1.2.3/32")
         finally:
             h.geo_reader = real
+
+    def test_address_where_a_mailbox_signed_in_needs_confirmation(self):
+        other = {h.own_net("46.2.2.2"): 1793500000}
+        with self.assertRaises(h.Refused) as cm:
+            self._block_with({}, "46.2.2.2", other=other)
+        self.assertIn(h.SIGNED_IN_REFUSAL, str(cm.exception))
+        r, saved = self._block_with({}, "46.2.2.2", confirm=True, other=other)
+        self.assertEqual(r["blocked"], "46.2.2.2/32")
+        self.assertTrue(r["signed_in"])
+        self.assertNotIn(h.own_net("46.2.2.2"), saved["mine"])     # not let through ahead of the block
+        with self.assertRaises(h.UnexpectedArgs):
+            h.block_add([b"46.2.2.2".hex(), "none", "yes"])
+
+    def test_network_on_a_provider_a_mailbox_uses_needs_confirmation(self):
+        other = {h.own_net("46.5.5.5"): 1793500000}
+        with self.assertRaises(h.Refused) as cm:
+            self._block_with({}, "46.5.9.0/24", other=other)
+        self.assertIn(h.SIGNED_IN_REFUSAL, str(cm.exception))
+        r, _ = self._block_with({}, "46.5.9.0/24", confirm=True, other=other)
+        self.assertEqual(r["blocked"], "46.5.9.0/24")
 
     def test_block_inside_an_existing_block_is_refused(self):
         with self.assertRaises(h.Refused) as cm:

@@ -44,9 +44,9 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now argus-geo-update.timer >/dev/null 2>&1
 # Log the key step of a key-and-code sign-in ("Partial publickey ..."), so the
-# Sign-In Attempts page can tell Matt's own addresses (right key) from attackers.
+# Sign-In Attempts page can flag an address that used Matt's key without his code.
 if [ ! -f /etc/ssh/sshd_config.d/04-argus-loglevel.conf ]; then
-  printf '%s\n' '# Argus: log key steps, so a right key with a wrong code is recognised as Matt.' 'LogLevel VERBOSE' > /etc/ssh/sshd_config.d/04-argus-loglevel.conf
+  printf '%s\n' '# Argus: log key steps, so a right key with a wrong code is flagged as Used Your SSH Key.' 'LogLevel VERBOSE' > /etc/ssh/sshd_config.d/04-argus-loglevel.conf
   chmod 0644 /etc/ssh/sshd_config.d/04-argus-loglevel.conf
   if sshd -t; then systemctl reload ssh; else rm -f /etc/ssh/sshd_config.d/04-argus-loglevel.conf; echo "sshd rejected LogLevel VERBOSE; left as it was"; fi
 fi

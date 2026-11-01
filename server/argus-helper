@@ -266,13 +266,13 @@ def updates():
 
 
 def signins():
-    out = run(["journalctl", "-u", "ssh", "--since", "-24h", "-o", "cat", "--no-pager"], timeout=30)
-    if out is None:
+    # Counted exactly as the Sign-In Attempts page counts its "last 24 hours";
+    # one read of the SSH log gives both numbers.
+    try:
+        rows, _, accepted = refused_rows("1", known_own_networks())
+    except Refused:
         return None
-    accepted = sum(1 for l in out.splitlines() if l.startswith("Accepted "))
-    # One refused attempt can log several lines; count it once per source address and port.
-    refused = len({m.group(1) for m in re.finditer(r"^(?:Invalid user|Failed ).* from (\S+ port \d+)", out, re.M)})
-    return {"accepted_24h": accepted, "refused_24h": refused}
+    return {"accepted_24h": accepted, "refused_24h": sum(r["tries"] for r in rows)}
 
 
 def hephaestus():
@@ -3475,12 +3475,37 @@ def geo_info():
     return info
 
 
-def attacks(args):
-    """attacks [1|7|30]: refused sign-ins by address over that many days."""
-    days = args[0] if args else "1"
-    if len(args) > 1 or days not in ("1", "7", "30"):
-        raise UnexpectedArgs()
-    mine = own_networks()
+def known_own_networks():
+    """Matt's networks without re-reading the mail logs: the remembered list,
+    the manual list and the address of the session asking. Quick enough for the
+    dashboard; the Sign-In Attempts page refreshes the remembered list itself."""
+    nets = set()
+    try:
+        for k in json.load(open(OWN_SEEN)):
+            if plain_ip(k) == k:
+                nets.add(own_net(k))
+    except (OSError, ValueError, TypeError):
+        pass
+    me = caller_address()
+    if me:
+        nets.add(own_net(me))
+    try:
+        for line in open(OWN_MANUAL):
+            line = line.split("#", 1)[0].strip()
+            if line:
+                try:
+                    nets.add(_ipaddress.ip_network(line, strict=False))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return nets
+
+
+def refused_rows(days, mine):
+    """Refused SSH and mail sign-ins over `days` days, one row per address,
+    leaving out Matt's networks. Shared by the page and the dashboard tile, so
+    both count the same way. Returns (rows, number left out, accepted sign-ins)."""
     j = run(["journalctl", "-u", "ssh", "--since", "-%sd" % days, "-o", "short-unix", "--no-pager"], timeout=90)
     if j is None:
         raise Refused("could not read the SSH log")
@@ -3505,11 +3530,15 @@ def attacks(args):
             e["banned"] += 1
             e["mail"] += 1            # the attempt that triggered the ban logs no WARN line
 
+    accepted = 0
     for line in j.splitlines():
         m = re.match(r"^(\d+)\.\d+ \S+ \S+: (.*)$", line)
         if not m:
             continue
         ts, msg = int(m.group(1)), m.group(2)
+        if msg.startswith("Accepted ") and SSH_OWN_RE.match(msg):
+            accepted += 1
+            continue
         p = SSH_PROBE_RE.match(msg)
         if p:
             hit(p.group(1), ts, "probe", conn=p.group(1) + ":" + p.group(2))
@@ -3545,6 +3574,15 @@ def attacks(args):
                      "tries": len(e["ssh"]) + e["mail"], "users": [u for u in users if USER_RE.fullmatch(u)][:8],
                      "first": e["first"], "last": e["last"]})
     rows.sort(key=lambda r: (-r["tries"], -r["probes"], -r["last"]))
+    return rows, left_out, accepted
+
+
+def attacks(args):
+    """attacks [1|7|30]: refused sign-ins by address over that many days."""
+    days = args[0] if args else "1"
+    if len(args) > 1 or days not in ("1", "7", "30"):
+        raise UnexpectedArgs()
+    rows, left_out, _ = refused_rows(days, own_networks())
     countries = {}
     for r in rows:
         r.update(locate(r["ip"]))

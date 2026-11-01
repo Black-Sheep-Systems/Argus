@@ -1,0 +1,21 @@
+{
+  "name": "argus",
+  "version": "0.1.0",
+  "description": "Admin app for the Black Sheep server",
+  "private": true,
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "vendor": "node vendor.js",
+    "postinstall": "node vendor.js"
+  },
+  "devDependencies": {
+    "electron": "44.9.0"
+  },
+  "dependencies": {
+    "@xterm/xterm": "6.0.0",
+    "@xterm/addon-fit": "0.11.0",
+    "qrcode-generator": "2.0.4"
+  }
+}

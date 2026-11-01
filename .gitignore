@@ -1,0 +1,6 @@
+target/
+*.dump
+build.log
+node_modules/
+app/native/
+app/renderer/vendor/

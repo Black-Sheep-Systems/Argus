@@ -1,0 +1,36 @@
+// The only things the Argus window can ask for.
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+
+contextBridge.exposeInMainWorld('argus', {
+  signInStart: (passphrase) => ipcRenderer.invoke('argus:signInStart', passphrase),
+  signInFinish: (code) => ipcRenderer.invoke('argus:signInFinish', code),
+  status: () => ipcRenderer.invoke('argus:status'),
+  disconnect: () => ipcRenderer.invoke('argus:disconnect'),
+  helper: (action, args = []) => ipcRenderer.invoke('argus:helper', action, args),
+  label: () => ipcRenderer.invoke('argus:label'),
+  connected: () => ipcRenderer.invoke('argus:connected'),
+  appControl: (op) => ipcRenderer.invoke('argus:app', op),
+  termOpen: (cols, rows) => ipcRenderer.invoke('argus:termOpen', cols, rows),
+  termRead: () => ipcRenderer.invoke('argus:termRead'),
+  termWrite: (data) => ipcRenderer.invoke('argus:termWrite', data),
+  termResize: (cols, rows) => ipcRenderer.invoke('argus:termResize', cols, rows),
+  termClose: () => ipcRenderer.invoke('argus:termClose'),
+  copy: (text, sensitive) => ipcRenderer.invoke('argus:copy', text, sensitive === true),
+  localList: (dir) => ipcRenderer.invoke('argus:localList', dir),
+  localHome: () => ipcRenderer.invoke('argus:localHome'),
+  filesList: (p) => ipcRenderer.invoke('argus:filesList', p),
+  filesPlan: (dir, name) => ipcRenderer.invoke('argus:filesPlan', dir, name),
+  filesUpload: (localPath, plan) => ipcRenderer.invoke('argus:filesUpload', localPath, plan),
+  localStat: (p) => ipcRenderer.invoke('argus:localStat', p),
+  localPeek: (p, image) => ipcRenderer.invoke('argus:localPeek', p, image),
+  filesPeek: (p, image) => ipcRenderer.invoke('argus:filesPeek', p, image),
+  filesDownload: (remotePath, localDir, overwrite) => ipcRenderer.invoke('argus:filesDownload', remotePath, localDir, overwrite),
+  filesMkdir: (dir, name) => ipcRenderer.invoke('argus:filesMkdir', dir, name),
+  deploySource: () => ipcRenderer.invoke('argus:deploySource'),
+  helperSecret: (action, args, secret) => ipcRenderer.invoke('argus:helperSecret', action, args, secret),
+  dnsCheck: (domain, selector) => ipcRenderer.invoke('argus:dnsCheck', domain, selector),
+  openMailAdmin: () => ipcRenderer.invoke('argus:openMailAdmin'),
+  deployPrepare: (commit) => ipcRenderer.invoke('argus:deployPrepare', commit),
+  // A file dragged in from Windows Explorer: its full path on this PC.
+  pathForFile: (file) => webUtils.getPathForFile(file),
+});

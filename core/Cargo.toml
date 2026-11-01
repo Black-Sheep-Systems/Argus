@@ -1,0 +1,20 @@
+[package]
+name = "argus-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "argus-signin-check"
+path = "src/bin/signin_check.rs"
+
+[dependencies]
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
+rpassword = "7"
+zeroize = "1"
+anyhow = "1"
+russh-sftp = "3.0.1"
+serde = { version = "1", features = ["derive"] }
+getrandom = "0.3"

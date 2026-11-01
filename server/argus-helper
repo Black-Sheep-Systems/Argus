@@ -1,0 +1,3376 @@
+#!/usr/bin/python3 -I
+"""argus-helper: the fixed list of things Argus may ask the server to do.
+
+Run as: sudo -n /usr/local/sbin/argus-helper --session <id> <action> [args]
+Every call is recorded in /var/log/argus/actions.log (time, session, action,
+args, result; never output, never secrets). This is not a security boundary:
+mattridge has full sudo. It keeps Argus's buttons to known, logged actions.
+
+Actions:
+  status                      read-only health report
+  activity                    the last 300 entries of this log
+  updates-list                packages waiting to update
+  backup-list                 backups kept on the server
+  rollback-list               earlier Hephaestus images to roll back to
+  job-status <job>            progress of a background job
+  service-restart <name>      restart one running container
+  backup-run mail|hephaestus  start a backup now
+  updates-apply               apply waiting updates (background job)
+  reboot                      restart the server in one minute
+  reboot-cancel               cancel a scheduled restart
+  heph-rollback <tag>         put an earlier Hephaestus image live (background job)
+  note-file <op> <hexpath>    record a file transfer Argus made over SFTP
+  file-commit ...             put an uploaded temporary file in place safely
+  file-mkdir <hexdir> <hexname>  new folder owned like its parent
+  heph-stage <tmpname> <commit>  check and unpack an uploaded Hephaestus package
+  heph-diff <commit>          the full changes a staged package would make
+  heph-deploy <commit>        build and put a staged package live (background job)
+  mail-overview               mailboxes, aliases, domains, two-factor status, queue and quarantine
+  mail-dkim <hexdomain>       the DKIM record mailcow expects for a domain
+  mailbox-add <hexlocal> <hexdomain> <quotaMB> <hexname>   password on stdin (or "generate")
+  mailbox-set <hexmailbox> active|inactive|quota <MB>
+  mailbox-password <hexmailbox>   new password on stdin (or "generate")
+  mailbox-delete <hexmailbox>
+  app-passwd-add <hexmailbox> <hexname>   returns a generated password once
+  app-passwd-delete <id>
+  alias-add <hexaddress> <hexgoto>
+  alias-delete <id>
+  mailq-flush | mailq-deliver <queueid> | mailq-delete <queueid>
+  quarantine-release <id> | quarantine-delete <id>
+  sites-list                  every site name: kind, answering, certificate days
+  caddy-show                  the web server's configuration files (read only)
+  caddy-check                 validate the configuration in a throwaway container
+  caddy-apply                 check, keep the last good copy, restart, test every site (job)
+  caddy-history               configurations kept from earlier applies
+  caddy-rollback <stamp>      put a kept configuration back (job)
+  cert-renew <hexname>        get a fresh certificate for one name (job)
+  site-add static|redirect|proxy <hexdomain> [<hextarget>]  add a site (job)
+  acct-list                   upload accounts, their keys and limits; Matt's own keys
+  acct-folders                folders under /srv that can be shared with an upload account
+  acct-mount-all              (at boot) connect every shared folder again
+  acct-add <name> <hexlabel|none> <MB> own|<hexfolder>   returns the authenticator secret once
+  acct-set <name> enable|disable | quota <MB> | label <hex|none> | new-code
+  acct-delete <name>          the account goes; its files are kept
+  key-add <account> <hexkey> | key-remove <account> <hexfingerprint>
+  heph-people                 Hephaestus staff and companies
+  heph-staff-add <hexemail> <hexnames> admin|technician   password on stdin
+  heph-company-add <slug> <hexname>
+  heph-user-add <slug> <hexemail> <hexnames> <role>   password on stdin
+  heph-user <hexemail> reset-totp|sign-out|set-password|reset-link
+  service-updates [refresh]   every service's version and any update (registry checks cached 6 h)
+  service-update <container>|mailcow   apply an update Argus can make (job)
+"""
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
+import fcntl
+
+LOG_DIR = "/var/log/argus"
+LOG = LOG_DIR + "/actions.log"
+HEPH_VERSION_FILE = "/var/lib/argus/heph-deployed"
+CADDYFILE = "/opt/web/Caddyfile"
+BACKUP_DIRS = {"mail": "/opt/backups/mailcow", "hephaestus": "/opt/backups/hephaestus"}
+OVERWRITE_BACKUPS = "/var/backups/argus"
+TIMERS = ["mailcow-backup", "heph-db-backup", "heph-sample-refresh", "apt-daily-upgrade", "nds-housekeeping"]
+# One-shot containers that are meant to exit after their job.
+ONE_SHOT = {"hephaestus-prod-migrate-1"}
+JOB_DIR = "/var/log/argus/jobs"
+JOBS = ("updates", "heph-rollback", "heph-deploy", "web", "svc-update")
+HEPH_DEPLOY_DIR = "/opt/hephaestus/deploy"
+CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+TAG_RE = re.compile(r"^pre-[A-Za-z0-9_.-]{1,64}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+DEADLINE_S = 45  # whole status call; late sections come back null
+os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def run(cmd, timeout=20):
+    """Run a fixed command; return stdout, or None if it failed."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def unit_active(unit):
+    """True while a unit is running or starting (read whatever the exit code)."""
+    try:
+        p = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.stdout.strip() in ("active", "activating", "reloading")
+
+
+def dpkg_busy():
+    """True if apt or dpkg holds its lock (both use fcntl locks)."""
+    try:
+        fd = os.open("/var/lib/dpkg/lock-frontend", os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.lockf(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def busy_reason():
+    for job in JOBS:
+        if unit_active("argus-" + job + ".service"):
+            return "the " + job + " job is still running"
+    if dpkg_busy():
+        return "the server is installing updates right now"
+    return None
+
+
+def safe(fn):
+    """Anything that can't be read is reported as null ("unknown" in Argus)."""
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+def server():
+    with open("/proc/uptime") as f:
+        up = int(float(f.read().split()[0]))
+    load = os.getloadavg()[0]
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            mem[k] = int(v.split()[0]) * 1024
+    du = shutil.disk_usage("/")
+    return {
+        "uptime_s": up,
+        "load_1m": round(load, 2),
+        "cpus": os.cpu_count(),
+        "mem_used_b": mem["MemTotal"] - mem["MemAvailable"],
+        "mem_total_b": mem["MemTotal"],
+        "disk_used_b": du.used,
+        "disk_total_b": du.total,
+        "reboot_needed": os.path.exists("/run/reboot-required"),
+        "reboot_scheduled": os.path.exists("/run/systemd/shutdown/scheduled"),
+    }
+
+
+def services():
+    out = run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}\t{{.Status}}"])
+    if out is None:
+        return None
+    running, stopped, unhealthy, finished, names = 0, [], [], [], []
+    for line in out.splitlines():
+        name, state, status = line.split("\t")
+        if state == "running":
+            running += 1
+            names.append(name)
+            if "(unhealthy)" in status:
+                unhealthy.append(name)
+        elif name in ONE_SHOT and "Exited (0)" in status:
+            finished.append(name)
+        else:
+            stopped.append(name)
+    return {"running": running, "unhealthy": unhealthy, "stopped": stopped, "finished_one_shot": finished,
+            "names": sorted(names)}
+
+
+def site_names():
+    names = []
+    with open(CADDYFILE) as f:
+        for line in f:
+            m = re.match(r"^([a-z0-9.,: -]+)\{\s*$", line)
+            if m:
+                names += [n for n in re.split(r"[,\s]+", m.group(1)) if n]
+    return [n for n in names if re.fullmatch(r"[a-z0-9.-]+", n)]
+
+
+def cert_days(name):
+    try:
+        p1 = subprocess.run(
+            ["openssl", "s_client", "-connect", "127.0.0.1:443", "-servername", name],
+            input="", capture_output=True, text=True, timeout=6)
+        p2 = subprocess.run(["openssl", "x509", "-noout", "-enddate"],
+                            input=p1.stdout, capture_output=True, text=True, timeout=5)
+        end = p2.stdout.strip().split("=", 1)[1]
+        exp = datetime.datetime.strptime(end, "%b %d %H:%M:%S %Y GMT").replace(tzinfo=datetime.timezone.utc)
+        return (exp - datetime.datetime.now(datetime.timezone.utc)).days
+    except Exception:
+        return None
+
+
+def websites():
+    names = site_names()
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        days = list(ex.map(cert_days, names))
+    return [{"name": n, "cert_days": d} for n, d in zip(names, days)]
+
+
+def jobs():
+    units = []
+    for n in TIMERS:
+        units += [n + ".service", n + ".timer"]
+    out = run(["systemctl", "show", "-p", "Id,LoadState,Result,ExecMainExitTimestamp,NextElapseUSecRealtime", *units])
+    if out is None:
+        return None
+    blocks = {}
+    for block in out.strip().split("\n\n"):
+        d = dict(l.split("=", 1) for l in block.splitlines() if "=" in l)
+        blocks[d.get("Id")] = d
+    res = []
+    for n in TIMERS:
+        svc, tmr = blocks.get(n + ".service", {}), blocks.get(n + ".timer", {})
+        if svc.get("LoadState") != "loaded" or tmr.get("LoadState") != "loaded":
+            res.append({"name": n, "result": "missing", "last_run": None, "next_run": None})
+            continue
+        res.append({"name": n, "result": svc.get("Result") or None,
+                    "last_run": svc.get("ExecMainExitTimestamp") or None,
+                    "next_run": tmr.get("NextElapseUSecRealtime") or None})
+    return res
+
+
+def backups():
+    res = {}
+    for k, path in BACKUP_DIRS.items():
+        try:
+            entries = [os.path.join(path, e) for e in os.listdir(path) if not e.endswith(".part")]
+            newest = max(entries, key=os.path.getmtime) if entries else None
+            res[k] = {"count": len(entries),
+                      "newest_age_h": round((time.time() - os.path.getmtime(newest)) / 3600, 1) if newest else None}
+        except OSError:
+            res[k] = None
+    res["overwrites_b"] = dir_size(OVERWRITE_BACKUPS) if os.path.isdir(OVERWRITE_BACKUPS) else 0
+    return res
+
+
+def updates():
+    out = run(["apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade"], timeout=25)
+    if out is None:
+        return None
+    lines = [l for l in out.splitlines() if l.startswith("Inst ")]
+    return {"waiting": len(lines), "security": sum(1 for l in lines if "security" in l.lower())}
+
+
+def signins():
+    out = run(["journalctl", "-u", "ssh", "--since", "-24h", "-o", "cat", "--no-pager"], timeout=30)
+    if out is None:
+        return None
+    accepted = sum(1 for l in out.splitlines() if l.startswith("Accepted "))
+    # One refused attempt can log several lines; count it once per source address and port.
+    refused = len({m.group(1) for m in re.finditer(r"^(?:Invalid user|Failed ).* from (\S+ port \d+)", out, re.M)})
+    return {"accepted_24h": accepted, "refused_24h": refused}
+
+
+def hephaestus():
+    ver = None
+    if os.path.exists(HEPH_VERSION_FILE):
+        with open(HEPH_VERSION_FILE) as f:
+            ver = f.read().strip()[:40] or None
+    st = run(["docker", "inspect", "-f", "{{.State.Health.Status}}", "hephaestus-prod-app-1"])
+    return {"version": ver, "app_health": st.strip() if st else None}
+
+
+def mail_status():
+    """Is mailcow's web side (webmail, admin, API) answering, and how big is the queue?"""
+    try:
+        q = mc("GET", "get/mailq/all", timeout=10)
+        return {"web_ok": True, "queue": len(q) if isinstance(q, list) else 0}
+    except Refused as e:
+        return {"web_ok": False, "queue": None, "problem": str(e)[:120]}
+
+
+SECTIONS = {"mail": mail_status, "server": server, "services": services, "websites": websites, "hephaestus": hephaestus,
+            "backups": backups, "jobs": jobs, "updates": updates, "signins": signins}
+
+
+class Refused(Exception):
+    """A request the helper will not carry out; the message says why."""
+
+
+def no_args(args):
+    if args:
+        raise UnexpectedArgs()
+
+
+def one_arg(args):
+    if len(args) != 1:
+        raise UnexpectedArgs()
+    return args[0]
+
+
+def must(cmd, timeout=90, pass_fds=()):
+    """Run a fixed command that changes something; raise if it fails."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, pass_fds=pass_fds)
+    except subprocess.TimeoutExpired:
+        raise Refused("the command took too long")
+    if p.returncode != 0:
+        raise Refused((p.stderr or p.stdout).strip().splitlines()[-1][:200] if (p.stderr or p.stdout).strip() else "the command failed")
+    return p.stdout
+
+
+# ---------- read-only ----------
+
+def activity(args):
+    no_args(args)
+    try:
+        with open(LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 256 * 1024))
+            lines = f.read().decode("utf-8", "replace").splitlines()[-300:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+CHANGELOG_CACHE = "/var/cache/argus/changelogs"
+PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,99}(:[a-z0-9]{1,20})?$")
+VER_RE = re.compile(r"^[A-Za-z0-9.+~:-]{1,100}$")
+URGENCY_RANK = {"low": 0, "medium": 1, "high": 2, "emergency": 3, "critical": 3}
+
+
+def pkg_description(name):
+    out = run(["apt-cache", "show", "--no-all-versions", name], timeout=10) or ""
+    for line in out.splitlines():
+        if line.startswith(("Description-en:", "Description:")):
+            return line.split(":", 1)[1].strip()[:200] or None
+    return None
+
+
+def pkg_changes(name, old, new):
+    """Change-log entries newer than the installed version: the highest
+    urgency among them and what they say. Cached by package and versions."""
+    key = os.path.join(CHANGELOG_CACHE, (name + "_" + (old or "") + "_" + new).replace(":", "%") + ".json")
+    try:
+        with open(key) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        pass
+    out = run(["apt-get", "-o", "Debug::NoLocking=1", "changelog", name], timeout=15)
+    if not out:
+        return {"urgency": None, "changes": []}
+    urgency, changes, entries, first_version = None, [], 0, None
+    for line in out.splitlines():
+        m = re.match(r"^\S+ \((\S+)\) .*;\s*urgency=(\w+)", line)
+        if m:
+            ver, urg = m.group(1), m.group(2).lower()
+            if first_version is None:
+                first_version = ver
+            if old and ver == old:
+                break
+            entries += 1
+            if entries > 20:
+                break
+            if urgency is None or URGENCY_RANK.get(urg, 0) > URGENCY_RANK.get(urgency, 0):
+                urgency = urg
+            if entries > 1 and len(changes) < 12:
+                changes.append("(" + ver + ")")
+            continue
+        if entries == 0 or line.startswith(" -- "):
+            continue
+        t = line.strip()
+        if t and len(changes) < 12:
+            changes.append(t[:160])
+    if first_version != new:
+        # Not the change log for the version on offer; say nothing rather
+        # than something wrong, and do not keep it.
+        return {"urgency": None, "changes": []}
+    res = {"urgency": urgency, "changes": changes}
+    try:
+        os.makedirs(CHANGELOG_CACHE, mode=0o700, exist_ok=True)
+        with open(key, "w") as f:
+            json.dump(res, f)
+    except OSError:
+        pass
+    return res
+
+
+def prune_cache():
+    cutoff = time.time() - 60 * 86400
+    try:
+        for e in os.listdir(CHANGELOG_CACHE):
+            f = os.path.join(CHANGELOG_CACHE, e)
+            if os.path.getmtime(f) < cutoff:
+                os.remove(f)
+    except OSError:
+        pass
+
+
+def need_level(source, security, urgency):
+    """How soon to apply, from where Debian published the update:
+      high   - Debian's security updates (it fixes a security problem),
+               or marked high/emergency/critical by its maintainer;
+      medium - stable-updates, which Debian keeps for fixes that cannot wait
+               for the next point release (time zones, broken services);
+      low    - an ordinary point-release update."""
+    if security:
+        return "high", "security"
+    if URGENCY_RANK.get(urgency or "", 0) >= 2:
+        return "high", "urgent"
+    if "-updates" in source:
+        return "medium", "stable-updates"
+    return "low", "routine"
+
+
+def updates_list(args):
+    no_args(args)
+    deadline = time.time() + 50   # the client waits 60 seconds in all
+    out = run(["apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade"], timeout=25)
+    if out is None:
+        raise Refused("could not read the update list")
+    pkgs = []
+    for line in out.splitlines():
+        m = re.match(r"^Inst (\S+) (?:\[(\S+)\] )?\((\S+) (.*)\)", line)
+        if not m:
+            continue
+        if not (PKG_RE.fullmatch(m.group(1)) and VER_RE.fullmatch(m.group(3))
+                and (m.group(2) is None or VER_RE.fullmatch(m.group(2)))):
+            pkgs.append({"name": m.group(1)[:100], "from": None, "to": "?", "source": "", "security": False,
+                         "description": None, "urgency": None, "changes": [], "level": None, "why": "unreadable"})
+            continue
+        source = m.group(4).split()[0][:60]
+        security = "security" in m.group(4).lower()
+        level, why = need_level(source, security, None)
+        pkgs.append({"name": m.group(1), "from": m.group(2), "to": m.group(3), "source": source,
+                     "security": security, "level": level, "why": why})
+    pkgs = pkgs[:60]
+    prune_cache()
+
+    def enrich(p):
+        p["description"] = pkg_description(p["name"])
+        ch = pkg_changes(p["name"], p["from"], p["to"])
+        p["urgency"], p["changes"] = ch["urgency"], ch["changes"]
+        p["level"], p["why"] = need_level(p["source"], p["security"], ch["urgency"])
+        return p
+
+    todo = [p for p in pkgs if p.get("why") != "unreadable"]
+    ex = ThreadPoolExecutor(max_workers=8)
+    futs = [ex.submit(enrich, p) for p in todo]
+    wait(futs, timeout=max(3, deadline - time.time()))
+    ex.shutdown(wait=False, cancel_futures=True)
+    for p, f in zip(todo, futs):
+        if not f.done() or f.exception():
+            p.setdefault("description", None)
+            p.setdefault("urgency", None)
+            p["changes"] = []
+    return pkgs
+
+
+def dir_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def backup_list(args):
+    no_args(args)
+    res = {}
+    for k, path in BACKUP_DIRS.items():
+        items = []
+        try:
+            for e in sorted(os.listdir(path), reverse=True):
+                if e.endswith(".part"):
+                    continue
+                full = os.path.join(path, e)
+                st = os.lstat(full)
+                size = dir_size(full) if os.path.isdir(full) else st.st_size
+                items.append({"name": e, "size_b": size,
+                              "time": datetime.datetime.fromtimestamp(st.st_mtime).astimezone().isoformat(timespec="minutes")})
+        except OSError:
+            items = None
+        res[k] = items
+    return res
+
+
+def heph_images():
+    out = run(["docker", "images", "hephaestus", "--format", "{{.Tag}}\t{{.ID}}\t{{.CreatedAt}}"])
+    if out is None:
+        raise Refused("could not list Hephaestus images")
+    rows = [l.split("\t") for l in out.splitlines() if l.count("\t") == 2]
+    live = next((r[1] for r in rows if r[0] == "local"), None)
+    return live, rows
+
+
+def rollback_list(args):
+    no_args(args)
+    live, rows = heph_images()
+    seen, out = {live}, []
+    for tag, iid, created in rows:
+        if not TAG_RE.fullmatch(tag) or iid in seen:
+            continue
+        seen.add(iid)
+        out.append({"tag": tag, "created": created})
+        if len(out) >= 8:
+            break
+    return {"live_version": hephaestus()["version"], "choices": out}
+
+
+def job_status(args):
+    job = one_arg(args)
+    if job not in JOBS:
+        raise Refused("unknown job")
+    active = unit_active("argus-" + job + ".service")
+    try:
+        with open(os.path.join(JOB_DIR, job + ".log"), errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return {"job": job, "running": active, "result": None, "log": []}
+    result = None
+    for line in reversed(lines):
+        if line.startswith("ARGUS-RESULT: "):
+            result = line.split(": ", 1)[1]
+            break
+    if result is None and not active:
+        result = "interrupted"
+    return {"job": job, "running": active, "result": result, "log": lines[-40:]}
+
+
+# ---------- changes ----------
+
+def service_restart(args):
+    name = one_arg(args)
+    if not CONTAINER_RE.fullmatch(name):
+        raise Refused("not a container name")
+    out = run(["docker", "ps", "--format", "{{.Names}}"])
+    if out is None or name not in out.split():
+        raise Refused("no running container by that name")
+    must(["docker", "restart", "-t", "30", name])
+    return {"restarted": name}
+
+
+BACKUP_UNITS = {"mail": "mailcow-backup.service", "hephaestus": "heph-db-backup.service"}
+
+
+def backup_run(args):
+    which = one_arg(args)
+    if which not in BACKUP_UNITS:
+        raise Refused("unknown backup")
+    must(["systemctl", "start", "--no-block", BACKUP_UNITS[which]])
+    return {"started": which}
+
+
+class change_lock:
+    """Only one change starts at a time (jobs and restarts share this)."""
+    def __enter__(self):
+        os.makedirs(JOB_DIR, mode=0o700, exist_ok=True)
+        self.fd = os.open(os.path.join(JOB_DIR, ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.fd)
+            raise Refused("another change is starting; try again in a moment")
+        why = busy_reason()
+        if why:
+            os.close(self.fd)
+            raise Refused("not now: " + why)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+        return False
+
+
+def start_job(job, script, max_s=3600):
+    """Run a fixed script as a background systemd unit with its own log.
+    Only one change runs at a time: no job starts while another job, or apt,
+    is busy."""
+    unit = "argus-" + job
+    with change_lock():
+        logf = os.path.join(JOB_DIR, job + ".log")
+        with open(logf, "w") as f:
+            f.write("started " + datetime.datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
+        os.chmod(logf, 0o600)
+        run(["systemctl", "reset-failed", unit + ".service"])
+        # The script runs as its own shell, never inside an `if`: bash turns
+        # off `set -e` and ERR traps for anything in an if-condition, which
+        # would let a failed step carry on. It is judged only by its exit code.
+        scriptf = os.path.join(JOB_DIR, job + ".sh")
+        fd = os.open(scriptf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o700)
+        with os.fdopen(fd, "w") as f:
+            f.write("#!/bin/bash\n" + script + "\n")
+        os.chmod(scriptf, 0o700)
+        wrapped = ("exec >>" + logf + " 2>&1; /bin/bash " + scriptf + "; rc=$?; "
+                   "if [ $rc = 0 ]; then echo 'ARGUS-RESULT: ok'; else echo \"ARGUS-RESULT: failed\"; exit 1; fi")
+        must(["systemd-run", "--unit=" + unit, "--description=Argus " + job, "--property=Type=exec",
+              "--property=RuntimeMaxSec=%d" % max_s, "/bin/bash", "-c", wrapped], timeout=20)
+        return {"job": job, "started": True}
+
+
+def updates_apply(args):
+    no_args(args)
+    return start_job("updates",
+                     "export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=600 update && "
+                     "apt-get -y -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade && "
+                     "if [ -e /run/reboot-required ]; then echo 'A restart is needed to finish these updates.'; fi")
+
+
+def reboot(args):
+    no_args(args)
+    with change_lock():
+        must(["shutdown", "-r", "+1", "Restart requested from Argus"])
+    return {"reboot_in_s": 60}
+
+
+def reboot_cancel(args):
+    no_args(args)
+    must(["shutdown", "-c"])
+    return {"cancelled": True}
+
+
+def heph_rollback(args):
+    tag = one_arg(args)
+    if not TAG_RE.fullmatch(tag):
+        raise Refused("not a rollback tag")
+    choices = [c["tag"] for c in rollback_list([])["choices"]]
+    if tag not in choices:
+        raise Refused("that image is not one of the rollback choices")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    keep = "pre-argus-" + stamp
+    version = tag[4:] if re.fullmatch(r"pre-[0-9a-f]{7,40}", tag) else "rollback to " + tag
+    # The database and its migrations are left alone: only the app container
+    # is recreated (--no-deps skips the migrate step). If the app is not
+    # healthy within two minutes, what was live before is put back.
+    script = (
+        "set -e; cd " + HEPH_DEPLOY_DIR + "; "
+        "docker tag hephaestus:local hephaestus:" + keep + "; "
+        "echo 'Kept the current version as hephaestus:" + keep + "'; "
+        "docker tag hephaestus:" + tag + " hephaestus:local; "
+        "if ! docker compose up -d --no-deps --no-build app; then echo 'Could not start it; putting the previous version back.'; "
+        "docker tag hephaestus:" + keep + " hephaestus:local; docker compose up -d --no-deps --no-build app; exit 1; fi; "
+        "ok=0; for i in $(seq 1 24); do sleep 5; "
+        "h=$(docker inspect -f '{{.State.Health.Status}}' hephaestus-prod-app-1 2>/dev/null || true); "
+        "echo \"health: $h\"; if [ \"$h\" = healthy ]; then ok=1; break; fi; done; "
+        "if [ $ok != 1 ]; then echo 'Not healthy after two minutes; putting the previous version back.'; "
+        "docker tag hephaestus:" + keep + " hephaestus:local; docker compose up -d --no-deps --no-build app; exit 1; fi; "
+        "printf '%s\\n' '" + version + "' > " + HEPH_VERSION_FILE + "; "
+        "echo 'Running the server checks:'; "
+        "out=$(HEPH_RESOLVE=desk.blksheepltd.com:443:127.0.0.1 bash scripts/verify.sh </dev/null 2>&1 || true); "
+        "echo \"$out\" | tail -6; "
+        "if ! echo \"$out\" | grep -Eq '[0-9]+ passed, 0 failed'; then "
+        "echo 'The earlier version IS LIVE, but the server checks did not all pass (see above).'; exit 3; fi; "
+        # keep only the three newest images Argus set aside
+        "docker images hephaestus --format '{{.Tag}}' | grep '^pre-argus-' | sort -r | tail -n +4 "
+        "| while read t; do docker rmi hephaestus:$t >/dev/null && echo \"Removed old copy $t\"; done; true"
+    )
+    return start_job("heph-rollback", script)
+
+
+NOTE_OPS = ("upload", "download", "mkdir")
+
+
+def note_file(args):
+    """SFTP transfers do not pass through this helper, so Argus records each
+    one here afterwards. The path arrives hex-encoded (only plain characters
+    reach the command line) and is logged, cut to 300 characters."""
+    if len(args) != 2 or args[0] not in NOTE_OPS or not re.fullmatch(r"[0-9a-f]{2,8192}", args[1]) or len(args[1]) % 2:
+        raise UnexpectedArgs()
+    path = bytes.fromhex(args[1]).decode("utf-8", "replace")
+    NOTED.append([args[0], path[:300]])
+    return {"noted": True}
+
+
+NOTED = []
+
+
+# ---------- safe file placement ----------
+# Uploads arrive over SFTP (as root) in a new private temporary file next to
+# the target. Everything that changes the real target happens here, through a
+# handle on the folder itself and without ever following a link, so nobody
+# who can write in that folder can redirect a root write elsewhere.
+
+import stat as _stat
+import shutil as _shutil
+
+TMP_RE = re.compile(r"^\.argus-upload-[0-9a-f]{16}$")
+OVERWRITE_ROOT = "/var/backups/argus"
+
+
+def unhex(h, limit):
+    if not re.fullmatch(r"[0-9a-f]{2,%d}" % (limit * 2), h) or len(h) % 2:
+        raise UnexpectedArgs()
+    return bytes.fromhex(h).decode("utf-8")
+
+
+def plain_name(n):
+    if not n or n in (".", "..") or "/" in n or "\0" in n or len(n) > 255:
+        raise Refused("not a usable file name")
+    return n
+
+
+def open_dir(path):
+    """A handle on an absolute folder, refusing any link along the way."""
+    if not path.startswith("/") or "\0" in path:
+        raise Refused("not a server path")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in [p for p in path.split("/") if p]:
+            if part in (".", ".."):
+                raise Refused("paths with .. are not accepted")
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                raise Refused(path + " is not a folder (or goes through a link)")
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def keep_backup(dfd, name, target_path):
+    """Copy the file about to be replaced to /var/backups/argus/<date>/<time>/<path>."""
+    now = datetime.datetime.now()
+    dest = os.path.join(OVERWRITE_ROOT, now.strftime("%Y-%m-%d"), now.strftime("%H%M%S")) + target_path
+    os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+    src = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    try:
+        if not _stat.S_ISREG(os.fstat(src).st_mode):
+            raise Refused("the file being replaced is not a plain file")
+        out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(src, "rb", closefd=False) as fi, os.fdopen(out, "wb") as fo:
+            _shutil.copyfileobj(fi, fo, 1024 * 1024)
+    finally:
+        os.close(src)
+    return dest
+
+
+def file_commit(args):
+    """file-commit <hexdir> <tmpname> <hexname> <uid> <gid> <mode-octal> <0|1 replace>
+    Put the uploaded temporary file in place as <name>, owned uid:gid with
+    the given mode. With replace=1 the existing file must still be a plain
+    file with exactly that owner and mode (what Matt confirmed); with 0 there
+    must be no file of that name."""
+    if len(args) != 7:
+        raise UnexpectedArgs()
+    d = unhex(args[0], 4096)
+    tmp = args[1]
+    name = plain_name(unhex(args[2], 255))
+    if not TMP_RE.fullmatch(tmp) or not all(re.fullmatch(r"[0-9]{1,10}", x) for x in args[3:5]) \
+            or not re.fullmatch(r"[0-7]{1,4}", args[5]) or args[6] not in ("0", "1"):
+        raise UnexpectedArgs()
+    uid, gid, mode, replace = int(args[3]), int(args[4]), int(args[5], 8), args[6] == "1"
+    target_path = d.rstrip("/") + "/" + name
+    web_lock = None
+    if (os.path.normpath(target_path) + "/").startswith(WEB_DIR + "/"):
+        # Under the same lock the web jobs start with, so none can start meanwhile.
+        web_lock = change_lock()
+        try:
+            web_lock.__enter__()
+        except Refused:
+            raise Refused("another change is running; upload to /opt/web again when it has finished")
+    try:
+        NOTED.append(["upload", target_path[:300]])
+        dfd = open_dir(d)
+        try:
+            st = os.stat(tmp, dir_fd=dfd, follow_symlinks=False)
+            if not _stat.S_ISREG(st.st_mode) or st.st_uid != 0:
+                raise Refused("the uploaded file is not where it should be")
+            try:
+                old = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                old = None
+            backup = None
+            if replace:
+                if old is None or not _stat.S_ISREG(old.st_mode) or old.st_uid != uid or old.st_gid != gid \
+                        or _stat.S_IMODE(old.st_mode) != mode:
+                    raise Refused(target_path + " changed on the server since you confirmed; look again")
+                backup = keep_backup(dfd, name, target_path)
+            elif old is not None:
+                raise Refused(target_path + " appeared on the server since you confirmed; look again")
+            tfd = os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            try:
+                fst = os.fstat(tfd)
+                if not _stat.S_ISREG(fst.st_mode) or fst.st_ino != st.st_ino or fst.st_nlink != 1 or fst.st_uid != 0:
+                    raise Refused("the uploaded file changed before it could be placed")
+                os.fchown(tfd, uid, gid)   # owner first: chown clears setuid/setgid
+                os.fchmod(tfd, mode)
+            finally:
+                os.close(tfd)
+            # rename never follows a link at the destination: it replaces the entry
+            os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            if backup:
+                NOTED[-1].append("old copy kept in " + backup[:300])
+            return {"target": target_path, "backup": backup}
+        finally:
+            os.close(dfd)
+    finally:
+        if web_lock is not None:
+            web_lock.__exit__(None, None, None)
+
+
+def file_discard(args):
+    """file-discard <hexdir> <tmpname>: remove a temporary upload after a failure."""
+    if len(args) != 2 or not TMP_RE.fullmatch(args[1]):
+        raise UnexpectedArgs()
+    dfd = open_dir(unhex(args[0], 4096))
+    try:
+        os.unlink(args[1], dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(dfd)
+    return {"removed": True}
+
+
+def file_mkdir(args):
+    """file-mkdir <hexdir> <hexname>: new folder, owned like its parent, 0755."""
+    if len(args) != 2:
+        raise UnexpectedArgs()
+    d = unhex(args[0], 4096)
+    name = plain_name(unhex(args[1], 255))
+    NOTED.append(["mkdir", (d.rstrip("/") + "/" + name)[:300]])
+    dfd = open_dir(d)
+    try:
+        pst = os.fstat(dfd)
+        try:
+            os.mkdir(name, 0o700, dir_fd=dfd)
+        except FileExistsError:
+            raise Refused("something called " + name + " is already there")
+        nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+        try:
+            os.fchown(nfd, pst.st_uid, pst.st_gid)
+            os.fchmod(nfd, 0o755)
+        finally:
+            os.close(nfd)
+        return {"path": d.rstrip("/") + "/" + name}
+    finally:
+        os.close(dfd)
+
+
+# ---------- Hephaestus deploy ----------
+# Same steps as the server chat's documented process (hephaestus-on-vps.md):
+# the package holds only Cargo.toml, Cargo.lock, crates/, migrations/,
+# deploy/ and tools/test/rls_invariants.sql; deploy/.env and
+# deploy/docker-compose.vps.yml on the server are never replaced.
+
+import tarfile as _tarfile
+
+DEPLOY_DIR = "/var/lib/argus/deploy"
+HEPH_DIR = "/opt/hephaestus"
+COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+PACKAGE_TOP = ("Cargo.toml", "Cargo.lock", "crates", "migrations", "deploy", "tools")
+PACKAGE_MAX = 300 * 1024 * 1024
+
+
+def package_member_ok(m):
+    n = m.name
+    if n.startswith("/") or "\\" in n or any(p in ("..", "") for p in n.rstrip("/").split("/")):
+        return False
+    top = n.split("/")[0]
+    if top not in PACKAGE_TOP:
+        return False
+    if top == "tools" and n.rstrip("/") not in ("tools", "tools/test", "tools/test/rls_invariants.sql"):
+        return False
+    base = n.rsplit("/", 1)[-1]
+    # the server's own .env (and any copy of it) and compose overlay are never
+    # part of a package; the template .env.example is.
+    if n.startswith("deploy/") and ((base.startswith(".env") and base != ".env.example") or base == "docker-compose.vps.yml"):
+        return False
+    if "/target/" in "/" + n + "/":
+        return False
+    return m.isfile() or m.isdir()
+
+
+def staged_dir(commit):
+    return os.path.join(DEPLOY_DIR, "src-" + commit)
+
+
+def heph_stage(args):
+    """Check the uploaded package, unpack it beside the live source and list
+    what would change. Nothing live is touched."""
+    if len(args) != 2 or not TMP_RE.fullmatch(args[0]) or not COMMIT_RE.fullmatch(args[1]):
+        raise UnexpectedArgs()
+    tmp, commit = args
+    NOTED.append(["stage", commit])
+    with change_lock():   # never while a deploy (or any other change) runs
+        return _heph_stage(tmp, commit)
+
+
+PACKAGE_UNPACKED_MAX = 1024 * 1024 * 1024
+PACKAGE_MEMBERS_MAX = 20000
+
+
+def _heph_stage(tmp, commit):
+    pkg = os.path.join(DEPLOY_DIR, tmp)
+    st = os.lstat(pkg)
+    if not _stat.S_ISREG(st.st_mode) or st.st_uid != 0:
+        raise Refused("the uploaded package is not where it should be")
+    try:
+        if st.st_size > PACKAGE_MAX:
+            raise Refused("the package is larger than expected")
+        dest = staged_dir(commit)
+        _shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest, mode=0o700)
+        with _tarfile.open(pkg, "r:*") as tf:
+            members = tf.getmembers()
+            if len(members) > PACKAGE_MEMBERS_MAX or sum(m.size for m in members) > PACKAGE_UNPACKED_MAX:
+                _shutil.rmtree(dest, ignore_errors=True)
+                raise Refused("the package unpacks to more than expected")
+            bad = [m.name for m in members if not package_member_ok(m)]
+            if bad:
+                _shutil.rmtree(dest, ignore_errors=True)
+                raise Refused("the package holds files it should not: " + ", ".join(bad[:5]))
+            if not any(m.name == "Cargo.toml" for m in members) or not any(m.name.startswith("crates/") for m in members):
+                _shutil.rmtree(dest, ignore_errors=True)
+                raise Refused("this does not look like the Hephaestus source")
+            tf.extractall(dest, members=members, filter="data")
+    finally:
+        try:
+            os.unlink(pkg)
+        except OSError:
+            pass
+    # what would change
+    changes = []
+    for part in PACKAGE_TOP:
+        a, b = os.path.join(HEPH_DIR, part), os.path.join(dest, part)
+        if part == "tools":
+            a, b = os.path.join(HEPH_DIR, "tools/test/rls_invariants.sql"), os.path.join(dest, "tools/test/rls_invariants.sql")
+        out = subprocess.run(["diff", "-rq", "-x", ".env*", "-x", "docker-compose.vps.yml", "-x", "target", a, b],
+                             capture_output=True, text=True, timeout=60).stdout
+        for line in out.splitlines():
+            m = re.match(r"^Files (.+) and (" + re.escape(dest) + r"/.+) differ$", line)
+            if m:
+                changes.append({"change": "changed", "path": os.path.relpath(m.group(2), dest)})
+                continue
+            m = re.match(r"^Only in (.+?): (.+)$", line)
+            if m:
+                where, name = m.group(1), m.group(2)
+                if where.startswith(dest):
+                    changes.append({"change": "added", "path": os.path.relpath(os.path.join(where, name), dest)})
+                else:
+                    changes.append({"change": "removed", "path": os.path.relpath(os.path.join(where, name), HEPH_DIR)})
+    live_m = set(os.listdir(os.path.join(HEPH_DIR, "migrations"))) if os.path.isdir(os.path.join(HEPH_DIR, "migrations")) else set()
+    new_m = sorted(set(os.listdir(os.path.join(dest, "migrations"))) - live_m) if os.path.isdir(os.path.join(dest, "migrations")) else []
+    with open(os.path.join(DEPLOY_DIR, "diff-" + commit + ".txt"), "w") as f:
+        subprocess.run(["diff", "-ruN", "-x", ".env*", "-x", "docker-compose.vps.yml", "-x", "target",
+                        "--label", "live", HEPH_DIR, dest], stdout=f, stderr=subprocess.DEVNULL, timeout=120)
+    # remove older staged packages
+    for e in os.listdir(DEPLOY_DIR):
+        if (e.startswith("src-") and e != "src-" + commit) or (e.startswith("diff-") and e != "diff-" + commit + ".txt"):
+            p = os.path.join(DEPLOY_DIR, e)
+            _shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.unlink(p)
+    return {"commit": commit, "live_version": hephaestus()["version"], "changes": changes[:2000],
+            "change_count": len(changes), "new_migrations": new_m}
+
+
+def heph_diff(args):
+    if len(args) != 1 or not COMMIT_RE.fullmatch(args[0]):
+        raise UnexpectedArgs()
+    try:
+        with open(os.path.join(DEPLOY_DIR, "diff-" + args[0] + ".txt"), errors="replace") as f:
+            text = f.read(512 * 1024)
+    except OSError:
+        raise Refused("that package is not staged; prepare it again")
+    return {"diff": text, "cut": len(text) >= 512 * 1024}
+
+
+def heph_deploy(args):
+    """Background job, the documented process: back up the source, dump the
+    database, keep the live image as pre-<live version>, copy the package in
+    (keeping .env and docker-compose.vps.yml), build, start, wait for
+    health (putting the previous version back if it does not come up), run
+    the server checks, record the version."""
+    if len(args) != 1 or not COMMIT_RE.fullmatch(args[0]):
+        raise UnexpectedArgs()
+    commit = args[0]
+    src = staged_dir(commit)
+    if not os.path.isfile(os.path.join(src, "Cargo.toml")):
+        raise Refused("that package is not staged; prepare it again")
+    live = hephaestus()["version"] or "unknown"
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    # The tag that keeps the live version. Never re-point an existing tag at a
+    # different image: that would lose the real rollback copy.
+    keep = "pre-" + live if re.fullmatch(r"[0-9a-f]{7,40}", live) else "pre-argus-" + stamp
+    ids = {r[0]: r[1] for r in heph_images()[1]}
+    if keep in ids and ids.get(keep) != ids.get("local"):
+        keep = keep + "-" + stamp
+    srcbak = "/root/config-backups-argus/hephaestus-pre-" + commit + "-" + stamp
+    dump = "/root/heph-pre-" + commit + "-" + stamp + ".dump"
+    excl = "--exclude /deploy/.env --exclude '/deploy/.env.*' --exclude /deploy/docker-compose.vps.yml --exclude target"
+    script = (
+        "set -eE -o pipefail; cd " + HEPH_DIR + "; COMMITTED=0; "
+        # one way back, used by every failure after the live image was set aside
+        "revert() { echo 'Something failed. Putting the previous version back.'; "
+        "rsync -a --delete " + excl + " " + srcbak + "/ " + HEPH_DIR + "/; "
+        "docker tag hephaestus:" + keep + " hephaestus:local; "
+        "(cd " + HEPH_DIR + "/deploy && docker compose up -d --no-deps --no-build app) || echo 'Could not restart the previous version; check Hephaestus now.'; "
+        "echo 'The previous version (" + live + ") is back. Any new database columns stay; they do no harm.'; }; "
+        "trap 'rc=$?; trap - ERR; if [ $COMMITTED = 0 ] && [ -n \"$KEPT\" ]; then revert; fi; exit $rc' ERR; "
+        "KEPT=; "
+        "echo '1/8 Backing up the current source to " + srcbak + "'; "
+        "mkdir -p /root/config-backups-argus; chmod 700 /root/config-backups-argus; "
+        "rsync -a --exclude '/deploy/.env*' --exclude target " + HEPH_DIR + "/ " + srcbak + "/; "
+        "echo '2/8 Saving the database to " + dump + "'; "
+        "docker exec hephaestus-prod-db-1 pg_dump -U heph_owner -d heph -Fc > " + dump + ".part; "
+        "mv " + dump + ".part " + dump + "; chmod 600 " + dump + "; "
+        "echo '3/8 Keeping the live version as hephaestus:" + keep + "'; "
+        "docker tag hephaestus:local hephaestus:" + keep + "; KEPT=1; "
+        "echo '4/8 Copying the new source in (.env and docker-compose.vps.yml are kept)'; "
+        "cp " + src + "/Cargo.toml " + src + "/Cargo.lock " + HEPH_DIR + "/; "
+        "rsync -a --delete " + src + "/crates/ " + HEPH_DIR + "/crates/; "
+        "rsync -a --delete " + src + "/migrations/ " + HEPH_DIR + "/migrations/; "
+        "mkdir -p " + HEPH_DIR + "/tools/test; if [ -f " + src + "/tools/test/rls_invariants.sql ]; then cp " + src + "/tools/test/rls_invariants.sql " + HEPH_DIR + "/tools/test/; fi; "
+        "rsync -a --delete --exclude /.env --exclude '/.env.*' --exclude /docker-compose.vps.yml " + src + "/deploy/ " + HEPH_DIR + "/deploy/; "
+        "cd " + HEPH_DIR + "/deploy; docker compose config --quiet; "
+        "echo '5/8 Building (several minutes; the live app keeps running)'; "
+        "docker compose build app; "
+        "echo '6/8 Applying database migrations'; "
+        "docker compose run --rm migrate; "
+        "echo '7/8 Starting the new version'; "
+        "docker compose up -d; "
+        "ok=0; for i in $(seq 1 24); do sleep 5; "
+        "h=$(docker inspect -f '{{.State.Health.Status}}' hephaestus-prod-app-1 2>/dev/null || true); "
+        "echo \"health: $h\"; if [ \"$h\" = healthy ]; then ok=1; break; fi; done; "
+        "if [ $ok != 1 ]; then echo 'Not healthy after two minutes.'; false; fi; "
+        "COMMITTED=1; "
+        "printf '%s\\n' '" + commit + "' > " + HEPH_VERSION_FILE + "; "
+        "rm -rf " + src + " " + DEPLOY_DIR + "/diff-" + commit + ".txt; "
+        "echo '8/8 Running the server checks'; "
+        "out=$(HEPH_RESOLVE=desk.blksheepltd.com:443:127.0.0.1 bash scripts/verify.sh </dev/null 2>&1 || true); "
+        "echo \"$out\" | tail -6; "
+        "if echo \"$out\" | grep -Eq '[0-9]+ passed, 0 failed'; then echo 'Hephaestus " + commit + " is live and the server checks passed.'; "
+        "else echo 'Hephaestus " + commit + " IS LIVE, but the server checks did not all pass (see above). Roll back from this page if needed.'; exit 3; fi"
+    )
+    NOTED.append(["deploy", commit, "previous " + live + " kept as hephaestus:" + keep])
+    return start_job("heph-deploy", script)
+
+
+# ---------- mail (mailcow API, from the server itself only) ----------
+# The API key stays in mailcow.conf (root, 0600) and is read here when needed;
+# it is never printed or logged. Passwords arrive on stdin, never on the
+# command line, and are never logged.
+
+import urllib.request as _urlreq
+import urllib.error as _urlerr
+import secrets as _secrets
+import string as _string
+
+MAILCOW_CONF = "/opt/mailcow-dockerized/mailcow.conf"
+MAILCOW_API = "http://127.0.0.1:8080/api/v1/"
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$")
+LOCAL_RE = re.compile(r"^[A-Za-z0-9._%+-]{1,64}$")
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$")
+ID_RE = re.compile(r"^[0-9]{1,12}$")
+QID_RE = re.compile(r"^[A-Za-z0-9]{6,40}$")
+
+
+def mailcow_key():
+    with open(MAILCOW_CONF) as f:
+        for line in f:
+            if line.startswith("API_KEY="):
+                k = line.split("=", 1)[1].strip()
+                if k:
+                    return k
+    raise Refused("the mail API is not switched on")
+
+
+def mc(method, path, body=None, timeout=25):
+    req = _urlreq.Request(MAILCOW_API + path, method=method,
+                          data=None if body is None else json.dumps(body).encode(),
+                          headers={"X-API-Key": mailcow_key(), "Content-Type": "application/json",
+                                   "Accept": "application/json"})
+    try:
+        with _urlreq.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode() or "null")
+    except _urlerr.HTTPError as e:
+        raise Refused("mailcow answered %s" % e.code)
+    except (_urlerr.URLError, OSError, ValueError):
+        raise Refused("could not reach mailcow (it may be restarting)")
+    return data
+
+
+def mc_change(path, body):
+    """A change through the API. mailcow answers with a list of messages;
+    any 'danger' or 'error' message means it was refused."""
+    res = mc("POST", path, body)
+    msgs = res if isinstance(res, list) else [res]
+    bad = [m for m in msgs if isinstance(m, dict) and m.get("type") in ("danger", "error")]
+    if bad:
+        m = bad[0].get("msg")
+        raise Refused("mailcow refused it: " + (json.dumps(m) if not isinstance(m, str) else m)[:200])
+    # Only an explicit success counts: an empty or odd answer is not "done".
+    if not any(isinstance(m, dict) and m.get("type") == "success" for m in msgs):
+        raise Refused("mailcow did not confirm the change; look again before retrying")
+    return msgs
+
+
+def gen_password(n=20):
+    alphabet = _string.ascii_letters + _string.digits
+    while True:
+        p = "".join(_secrets.choice(alphabet) for _ in range(n))
+        if any(c.isdigit() for c in p) and any(c.islower() for c in p) and any(c.isupper() for c in p):
+            return p
+
+
+def stdin_password():
+    """The password Matt typed, from stdin; "generate" asks for a new one."""
+    data = sys.stdin.read(4096).strip("\n")
+    if data == "generate":
+        return gen_password(), True
+    if len(data) < 12 or len(data) > 200 or any(ord(c) < 32 for c in data):
+        raise Refused("the password must be 12 to 200 characters")
+    return data, False
+
+
+def hx_email(h):
+    v = unhex(h, 320)
+    if not EMAIL_RE.fullmatch(v) or v.startswith("-"):
+        raise Refused("not an email address")
+    return v.lower()
+
+
+def mailcow_hostname():
+    try:
+        with open(MAILCOW_CONF) as f:
+            for line in f:
+                if line.startswith("MAILCOW_HOSTNAME="):
+                    return line.split("=", 1)[1].strip().lower()
+    except OSError:
+        pass
+    return None
+
+
+def tfa_status():
+    """Who has two-factor on, read straight from mailcow's database (read only).
+    The database password stays inside the database container."""
+    out = run(["docker", "exec", "mailcowdockerized-mysql-mailcow-1", "sh", "-c",
+               'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -N -B "$MYSQL_DATABASE" '
+               '-e "SELECT username, authmech, active FROM tfa"'], timeout=15)
+    if out is None:
+        return None
+    res = {}
+    for line in out.splitlines():
+        f = line.split("\t")
+        if len(f) == 3 and f[2] == "1":
+            res.setdefault(f[0].lower(), []).append(f[1])
+    return res
+
+
+def mail_overview(args):
+    no_args(args)
+    def safe_call(fn):
+        try:
+            return fn()
+        except Refused:
+            return None
+    mailboxes = safe_call(lambda: mc("GET", "get/mailbox/all"))
+    aliases = safe_call(lambda: mc("GET", "get/alias/all"))
+    domains = safe_call(lambda: mc("GET", "get/domain/all"))
+    queue = safe_call(lambda: mc("GET", "get/mailq/all"))
+    quarantine = safe_call(lambda: mc("GET", "get/quarantine/all"))
+    tfa = safe(tfa_status)
+    apps = {}
+    out = {"mailboxes": None, "aliases": None, "domains": None, "queue": None, "quarantine": None,
+           "tfa_known": tfa is not None, "hostname": mailcow_hostname()}
+    if isinstance(mailboxes, list):
+        rows = []
+        for m in mailboxes:
+            u = m.get("username", "")
+            ap = safe_call(lambda: mc("GET", "get/app-passwd/all/" + _urlreq.quote(u, safe="")))
+            # mailcow answers {} when there are none, and a single object for one
+            if isinstance(ap, dict):
+                ap = [ap] if ap.get("id") is not None else []
+            rows.append({
+                "username": u, "name": m.get("name") or "", "active": str(m.get("active_int", m.get("active"))) == "1",
+                "quota_b": int(m.get("quota") or 0), "used_b": int(m.get("quota_used") or 0),
+                "messages": int(m.get("messages") or 0),
+                "last_login": max([int(m.get(k) or 0) for k in ("last_imap_login", "last_smtp_login", "last_pop3_login", "last_sso_login")] or [0]),
+                "tfa": (tfa or {}).get(u.lower(), []) if tfa is not None else None,
+                "app_passwords": [{"id": a.get("id"), "name": a.get("name"), "active": str(a.get("active")) == "1",
+                                   "created": a.get("created")} for a in ap] if isinstance(ap, list) else None,
+            })
+        out["mailboxes"] = sorted(rows, key=lambda r: r["username"])
+    if isinstance(aliases, list):
+        out["aliases"] = sorted([{"id": a.get("id"), "address": a.get("address"), "goto": a.get("goto"),
+                                  "active": str(a.get("active_int", a.get("active"))) == "1"} for a in aliases],
+                                key=lambda a: a["address"] or "")
+    if isinstance(domains, list):
+        out["domains"] = sorted([{"domain": d.get("domain_name"), "active": str(d.get("active_int", d.get("active"))) == "1",
+                                  "mailboxes": int(d.get("mboxes_in_domain") or 0), "aliases": int(d.get("aliases_in_domain") or 0)}
+                                 for d in domains], key=lambda d: d["domain"] or "")
+    if isinstance(queue, list):
+        out["queue"] = [{"id": q.get("queue_id"), "queue": q.get("queue_name"), "sender": q.get("sender"),
+                         "recipients": [r.get("address") if isinstance(r, dict) else r for r in (q.get("recipients") or [])][:5],
+                         "arrived": q.get("arrival_time"), "size": q.get("message_size")} for q in queue][:200]
+    if isinstance(quarantine, list):
+        out["quarantine"] = [{"id": q.get("id"), "sender": q.get("sender"), "rcpt": q.get("rcpt"), "subject": q.get("subject"),
+                              "score": q.get("score"), "action": q.get("action"), "created": q.get("created")} for q in quarantine][:200]
+    return out
+
+
+def mail_dkim(args):
+    if len(args) != 1:
+        raise UnexpectedArgs()
+    d = unhex(args[0], 253).lower()
+    if not DOMAIN_RE.fullmatch(d):
+        raise Refused("not a domain")
+    r = mc("GET", "get/dkim/" + d)
+    if not isinstance(r, dict) or not r.get("dkim_txt"):
+        return {"domain": d, "selector": None, "txt": None}
+    return {"domain": d, "selector": r.get("dkim_selector"), "txt": r.get("dkim_txt")}
+
+
+def mailbox_add(args):
+    if len(args) != 4 or not re.fullmatch(r"[0-9]{1,7}", args[2]):
+        raise UnexpectedArgs()
+    local, domain, name = unhex(args[0], 64), unhex(args[1], 253).lower(), unhex(args[3], 120) if args[3] != "00" else ""
+    if not LOCAL_RE.fullmatch(local) or not DOMAIN_RE.fullmatch(domain):
+        raise Refused("not a valid address")
+    NOTED.append(["mailbox-add", local + "@" + domain, args[2] + " MB"])
+    pw, generated = stdin_password()
+    mc_change("add/mailbox", {"local_part": local, "domain": domain, "name": name, "quota": args[2],
+                              "password": pw, "password2": pw, "active": "1", "force_pw_update": "0",
+                              "tls_enforce_in": "1", "tls_enforce_out": "1"})
+    return {"mailbox": local + "@" + domain, "password": pw if generated else None}
+
+
+def mailbox_set(args):
+    if len(args) not in (2, 3):
+        raise UnexpectedArgs()
+    mb = hx_email(args[0])
+    if args[1] == "active" and len(args) == 2:
+        attr = {"active": "1"}
+    elif args[1] == "inactive" and len(args) == 2:
+        attr = {"active": "0"}
+    elif args[1] == "quota" and len(args) == 3 and re.fullmatch(r"[0-9]{1,7}", args[2]):
+        attr = {"quota": args[2]}
+    else:
+        raise UnexpectedArgs()
+    NOTED.append(["mailbox-set", mb] + args[1:])
+    mc_change("edit/mailbox", {"items": [mb], "attr": attr})
+    return {"mailbox": mb, "changed": attr}
+
+
+def mailbox_password(args):
+    if len(args) != 1:
+        raise UnexpectedArgs()
+    mb = hx_email(args[0])
+    NOTED.append(["mailbox-password", mb])
+    pw, generated = stdin_password()
+    mc_change("edit/mailbox", {"items": [mb], "attr": {"password": pw, "password2": pw}})
+    return {"mailbox": mb, "password": pw if generated else None}
+
+
+def mailbox_delete(args):
+    if len(args) != 1:
+        raise UnexpectedArgs()
+    mb = hx_email(args[0])
+    NOTED.append(["mailbox-delete", mb])
+    mc_change("delete/mailbox", [mb])
+    return {"deleted": mb}
+
+
+def app_passwd_add(args):
+    if len(args) != 2:
+        raise UnexpectedArgs()
+    mb = hx_email(args[0])
+    name = unhex(args[1], 60)
+    if not re.fullmatch(r"[A-Za-z0-9 ._'-]{1,60}", name):
+        raise Refused("use letters, numbers and spaces for the device name")
+    NOTED.append(["app-passwd-add", mb, name])
+    pw = gen_password(24)
+    mc_change("add/app-passwd", {"username": mb, "app_name": name, "app_passwd": pw, "app_passwd2": pw, "active": "1",
+                                 "protocols": ["imap_access", "dav_access", "smtp_access", "eas_access", "pop3_access", "sieve_access"]})
+    return {"mailbox": mb, "name": name, "password": pw}
+
+
+def by_id(path, label):
+    def f(args):
+        if len(args) != 1 or not ID_RE.fullmatch(args[0]):
+            raise UnexpectedArgs()
+        NOTED.append([label, args[0]])
+        mc_change(path, [args[0]])
+        return {"done": label, "id": args[0]}
+    return f
+
+
+def alias_add(args):
+    if len(args) != 2:
+        raise UnexpectedArgs()
+    addr = unhex(args[0], 320).lower()
+    goto = [g.strip().lower() for g in unhex(args[1], 2000).replace(";", ",").split(",") if g.strip()]
+    if not (EMAIL_RE.fullmatch(addr) or re.fullmatch(r"@" + DOMAIN_RE.pattern[1:], addr)) or not goto or not all(EMAIL_RE.fullmatch(g) for g in goto):
+        raise Refused("check the addresses")
+    NOTED.append(["alias-add", addr, ",".join(goto)[:250]])
+    mc_change("add/alias", {"address": addr, "goto": ",".join(goto), "active": "1"})
+    return {"alias": addr, "goto": goto}
+
+
+def mailq_flush(args):
+    no_args(args)
+    NOTED.append(["mailq-flush"])
+    mc_change("edit/mailq", {"action": "flush"})
+    return {"flushed": True}
+
+
+def mailq_delete(args):
+    """Delete one message (mailcow: a plain list of queue ids)."""
+    if len(args) != 1 or not QID_RE.fullmatch(args[0]):
+        raise UnexpectedArgs()
+    NOTED.append(["mailq-delete", args[0]])
+    mc_change("delete/mailq", [args[0]])
+    return {"deleted": args[0]}
+
+
+def mailq_deliver(args):
+    """Try one message again now."""
+    if len(args) != 1 or not QID_RE.fullmatch(args[0]):
+        raise UnexpectedArgs()
+    NOTED.append(["mailq-deliver", args[0]])
+    mc_change("edit/mailq", {"items": [args[0]], "attr": {"action": "deliver"}})
+    return {"retried": args[0]}
+
+
+def quarantine_release(args):
+    if len(args) != 1 or not ID_RE.fullmatch(args[0]):
+        raise UnexpectedArgs()
+    NOTED.append(["quarantine-release", args[0]])
+    mc_change("edit/qitem", {"items": [args[0]], "attr": {"action": "release"}})
+    return {"released": args[0]}
+
+
+# ---------- websites (Caddy, /opt/web) ----------
+# The admin API is off, so a change means a restart (every site blips for a
+# second or two). The files that make up the configuration are snapshotted
+# after every successful apply, so a later one can be undone.
+
+WEB_DIR = "/opt/web"
+WEB_FILES = ("Caddyfile", "site-rules.caddy", "docker-compose.yml")      # plus sites/*.caddy
+CADDY = "bss-caddy"
+CADDY_HISTORY = "/var/lib/argus/caddy-history"
+SERVER_IP = "129.121.98.1"
+STAMP_RE = re.compile(r"^\d{8}-\d{6}$")
+
+
+def site_blocks():
+    """[(names, body)] for each site block in the Caddyfile."""
+    blocks, cur, depth = [], None, 0
+    with open(os.path.join(WEB_DIR, "Caddyfile")) as f:
+        for line in f:
+            stripped = line.strip()
+            if depth == 0:
+                m = re.match(r"^([a-z0-9.,: *-]+)\{\s*$", line)
+                if m:
+                    cur = ([n for n in re.split(r"[,\s]+", m.group(1)) if n], [])
+                    depth = 1
+                continue
+            depth += line.count("{") - line.count("}")
+            if depth <= 0:
+                blocks.append((cur[0], "".join(cur[1])))
+                depth, cur = 0, None
+            else:
+                cur[1].append(line)
+    return blocks
+
+
+def block_kind(body):
+    if re.search(r"^\s*redir\s", body, re.M) and not re.search(r"^\s*(root|reverse_proxy|import)\s", body, re.M):
+        return "redirect"
+    if re.search(r"reverse_proxy\s+(127\.0\.0\.1|localhost):", body):
+        return "app"
+    if re.search(r"^\s*(root|import /etc/caddy/(sites|site-rules))", body, re.M):
+        return "site"
+    return "other"
+
+
+def http_code(name):
+    try:
+        p = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "8",
+                            "--resolve", name + ":443:127.0.0.1", "https://" + name + "/"],
+                           capture_output=True, text=True, timeout=12)
+        return int(p.stdout or 0)
+    except Exception:
+        return 0
+
+
+def all_codes(names):
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        return dict(zip(names, ex.map(http_code, names)))
+
+
+def sites_list(args):
+    no_args(args)
+    blocks = site_blocks()
+    names = [n for ns, _ in blocks for n in ns if re.fullmatch(r"[a-z0-9.-]+", n)]
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        days = dict(zip(names, ex.map(cert_days, names)))
+    codes = all_codes(names)
+    out = []
+    for ns, body in blocks:
+        kind = block_kind(body)
+        target = None
+        m = re.search(r"redir\s+(\S+)", body) if kind == "redirect" else re.search(r"reverse_proxy\s+(\S+)", body) if kind == "app" else re.search(r"root \* (\S+)", body)
+        if m:
+            target = m.group(1)
+        else:
+            m = re.search(r"import /etc/caddy/sites/(\S+)", body)
+            if m:
+                try:
+                    with open(os.path.join(WEB_DIR, "sites", os.path.basename(m.group(1)))) as f:
+                        r = re.search(r"root \* (\S+)", f.read())
+                        target = r.group(1) if r else None
+                except OSError:
+                    pass
+        for n in ns:
+            if re.fullmatch(r"[a-z0-9.-]+", n):
+                out.append({"name": n, "kind": kind, "target": target, "http": codes.get(n), "cert_days": days.get(n)})
+    hist = caddy_history([])
+    return {"sites": out, "changed_since_apply": config_differs(hist[0]["stamp"]) if hist else None,
+            "last_applied": hist[0]["stamp"] if hist else None}
+
+
+def config_paths():
+    paths = [os.path.join(WEB_DIR, f) for f in WEB_FILES]
+    sd = os.path.join(WEB_DIR, "sites")
+    if os.path.isdir(sd):
+        paths += sorted(os.path.join(sd, f) for f in os.listdir(sd) if f.endswith(".caddy"))
+    return paths
+
+
+def caddy_show(args):
+    """The configuration files, read only. caddy.env (a secret) and the agent
+    allow-list (Matt's home address) are never shown."""
+    no_args(args)
+    out = []
+    for p in config_paths():
+        try:
+            with open(p, errors="replace") as f:
+                out.append({"file": os.path.relpath(p, WEB_DIR), "text": f.read(200000)})
+        except OSError:
+            pass
+    return out
+
+
+def caddy_image_and_mounts():
+    out = run(["docker", "inspect", "-f", "{{.Config.Image}}\t{{json .Mounts}}", CADDY])
+    if not out:
+        raise Refused("the web server container is not there")
+    image, mounts = out.strip().split("\t", 1)
+    vols = []
+    for m in json.loads(mounts):
+        src = m.get("Source") if m.get("Type") == "bind" else m.get("Name")
+        if src and m.get("Destination"):
+            vols += ["-v", src + ":" + m["Destination"] + ":ro"]
+    return image, vols
+
+
+def caddy_data_dir():
+    out = run(["docker", "inspect", "-f", "{{json .Mounts}}", CADDY])
+    for m in json.loads(out or "[]"):
+        if m.get("Destination") == "/data" and m.get("Type") == "bind":
+            return m["Source"]
+    raise Refused("could not find the web server's data folder")
+
+
+def caddy_validate():
+    """Validate in a throwaway copy of the web server: same image, same files
+    (read only), no network. Nothing live is touched."""
+    image, vols = caddy_image_and_mounts()
+    try:
+        # Caddy opens its log files while validating: give it an empty, temporary
+        # log folder so the live logs are never touched.
+        p = subprocess.run(["docker", "run", "--rm", "--network", "none", "--env-file", os.path.join(WEB_DIR, "caddy.env"),
+                            *vols, "--tmpfs", "/data/logs", image, "caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"],
+                           capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, "the check took too long"
+    return p.returncode == 0, mask_secrets((p.stdout + p.stderr).strip())
+
+
+def mask_secrets(text):
+    """Caddy can echo substituted values in its errors. Hide every value from
+    caddy.env and everything in the agent allow-list (Matt's home address)."""
+    secrets_ = []
+    try:
+        with open(os.path.join(WEB_DIR, "caddy.env")) as f:
+            for line in f:
+                if "=" in line and not line.lstrip().startswith("#"):
+                    v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if len(v) >= 4:
+                        secrets_.append(v)
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(WEB_DIR, "agent-allow", "allow.caddy")) as f:
+            allow = f.read()
+            secrets_ += re.findall(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?:/[0-9]{1,2})?", allow)
+            secrets_ += [m for m in re.findall(r"[0-9A-Fa-f:]{3,}(?:/[0-9]{1,3})?", allow) if m.count(":") >= 2]
+    except OSError:
+        pass
+    for v in sorted(set(secrets_), key=len, reverse=True):
+        text = text.replace(v, "[hidden]")
+        if "/" in v:
+            text = text.replace(v.split("/")[0], "[hidden]")
+    lines = [l for l in text.splitlines() if "HEPH_PROXY_SECRET" not in l and "allow.caddy" not in l]
+    return "\n".join(lines[-25:])
+
+
+def caddy_check(args):
+    no_args(args)
+    ok, msg = caddy_validate()
+    return {"valid": ok, "message": msg}
+
+
+def snapshot_config(dest):
+    _shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(os.path.join(dest, "sites"), mode=0o700, exist_ok=True)
+    for p in config_paths():
+        rel = os.path.relpath(p, WEB_DIR)
+        _shutil.copy2(p, os.path.join(dest, rel))
+
+
+def config_differs(stamp):
+    d = os.path.join(CADDY_HISTORY, stamp)
+    for p in config_paths():
+        q = os.path.join(d, os.path.relpath(p, WEB_DIR))
+        try:
+            if open(p, "rb").read() != open(q, "rb").read():
+                return True
+        except OSError:
+            return True
+    kept = set(os.listdir(os.path.join(d, "sites"))) if os.path.isdir(os.path.join(d, "sites")) else set()
+    now = set(os.path.basename(p) for p in config_paths() if "/sites/" in p)
+    return kept != now
+
+
+def caddy_history(args):
+    no_args(args)
+    try:
+        stamps = sorted((e for e in os.listdir(CADDY_HISTORY) if STAMP_RE.fullmatch(e)), reverse=True)
+    except OSError:
+        stamps = []
+    return [{"stamp": s_} for s_ in stamps[:20]]
+
+
+def web_job_script(restore_from, label, extra_prep="", test_names=None, extra_undo="", after=""):
+    """Shared shape of every web server change, run as a background job:
+    remember how each site answers, (make Argus's own change,) check,
+    restart, test again, and put the last good configuration back if a site
+    that answered before now fails.
+    Matt's own edits that fail the check are left as they are (nothing was
+    restarted). Whenever something is put back, the files as they were are
+    kept first in caddy-history/failed-<stamp>, so no edit is ever lost."""
+    names = test_names if test_names is not None else [n for ns, _ in site_blocks() for n in ns if re.fullmatch(r"[a-z0-9.-]+", n)]
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    H = "/usr/local/sbin/argus-helper --session job-web-" + stamp[-6:]
+    keepdir = CADDY_HISTORY + "/failed-" + stamp
+    snap = CADDY_HISTORY + "/" + stamp
+    return (
+        "set -eE -o pipefail; cd " + WEB_DIR + "; RESTORED=0; UNDO=0; "
+        "copyset() { rm -rf \"$2\"; mkdir -p \"$2/sites\"; cp -a \"$1\"/Caddyfile \"$1\"/site-rules.caddy \"$1\"/docker-compose.yml \"$2\"/; "
+        "if ls \"$1\"/sites/*.caddy >/dev/null 2>&1; then cp -a \"$1\"/sites/*.caddy \"$2\"/sites/; fi; }; "
+        "restore() { set +e; echo 'Keeping the files as they are now in " + keepdir + "'; copyset " + WEB_DIR + " " + keepdir + "; "
+        "echo 'Putting the last good configuration back.'; "
+        "cp -a " + restore_from + "/Caddyfile " + restore_from + "/site-rules.caddy " + restore_from + "/docker-compose.yml " + WEB_DIR + "/; "
+        "rm -f " + WEB_DIR + "/sites/*.caddy; cp -a " + restore_from + "/sites/. " + WEB_DIR + "/sites/; "
+        + extra_undo +
+        "docker compose up -d caddy >/dev/null 2>&1; docker restart " + CADDY + " >/dev/null; sleep 4; RESTORED=1; "
+        "echo 'The last good configuration is back.'; }; "
+        "trap 'rc=$?; trap - ERR; if [ $RESTORED = 0 ] && [ $UNDO = 1 ]; then restore; fi; exit $rc' ERR; "
+        "code() { curl -s -o /dev/null -w '%{http_code}' -m 8 --resolve \"$1:443:127.0.0.1\" \"https://$1/\" || true; }; "
+        "echo '1. How each site answers now'; declare -A BEFORE; "
+        "for n in " + " ".join(names) + "; do BEFORE[$n]=$(code $n); done; "
+        + ("UNDO=1; " + extra_prep if extra_prep else "") +
+        "echo '2. Checking the configuration'; "
+        "CHECK=$(" + H + " caddy-check); "
+        "if ! echo \"$CHECK\" | grep -q '\"valid\": true'; then echo \"$CHECK\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"message\"])'; "
+        "echo 'The configuration did not pass the check. The web server was not restarted.'; false; fi; "
+        "echo '3. Restarting the web server (every site blips for a second or two)'; UNDO=1; "
+        "docker compose up -d caddy; docker restart " + CADDY + " >/dev/null; sleep 5; "
+        "echo '4. Testing every site again'; BROKEN=0; "
+        "for n in " + " ".join(names) + "; do a=${BEFORE[$n]}; b=$(code $n); "
+        "if [ \"$a\" != 000 ] && [ \"$a\" -lt 400 ] && { [ \"$b\" = 000 ] || [ \"$b\" -ge 400 ]; }; then echo \"  $n broke: was $a, now $b\"; BROKEN=1; "
+        "elif [ \"$a\" != 000 ] && [ \"$a\" -lt 500 ] && { [ \"$b\" = 000 ] || [ \"$b\" -ge 500 ]; }; then echo \"  $n broke: was $a, now $b\"; BROKEN=1; fi; done; "
+        "if [ $BROKEN = 1 ]; then false; fi; "
+        + after +
+        "UNDO=0; copyset " + WEB_DIR + " " + snap + "; chmod 700 " + CADDY_HISTORY + "; "
+        "ls -1d " + CADDY_HISTORY + "/2*/ 2>/dev/null | sort -r | tail -n +21 | xargs -r rm -rf; "
+        "ls -1d " + CADDY_HISTORY + "/failed-*/ 2>/dev/null | sort -r | tail -n +11 | xargs -r rm -rf; "
+        "echo '" + label + "'"
+    )
+
+
+def last_good():
+    h = caddy_history([])
+    if not h:
+        raise Refused("no good configuration has been kept yet")
+    return os.path.join(CADDY_HISTORY, h[0]["stamp"])
+
+
+def ensure_history():
+    """The first time, keep the configuration that is live now as the first
+    good copy, but only if no file has changed since the web server last
+    started (otherwise the files on disk may hold edits that were never live)."""
+    if caddy_history([]):
+        return
+    started = run(["docker", "inspect", "-f", "{{.State.StartedAt}}", CADDY])
+    try:
+        # Docker gives UTC, e.g. 2026-10-26T04:21:33.123456789Z
+        t = datetime.datetime.strptime(started.strip()[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except Exception:
+        raise Refused("could not tell when the web server started, so no first good copy was kept")
+    newest = max(os.path.getmtime(p_) for p_ in config_paths())
+    if newest > t:
+        raise Refused("the files in /opt/web changed after the web server last started, so Argus cannot tell "
+                      "which configuration is live. Put the files back as they were (the Files page keeps copies) "
+                      "and try again, or ask for the first copy to be set up by hand")
+    os.makedirs(CADDY_HISTORY, mode=0o700, exist_ok=True)
+    snapshot_config(os.path.join(CADDY_HISTORY, datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))
+
+
+def no_unapplied_edits():
+    """Argus's own web changes (rollback, certificate, new site) restart the web
+    server with whatever is on disk; refuse while Matt has edits not yet applied."""
+    if config_differs(caddy_history([])[0]["stamp"]):
+        raise Refused("the files in /opt/web have edits that were never applied: Apply them (or undo them) first")
+
+
+def caddy_apply(args):
+    no_args(args)
+    NOTED.append(["caddy-apply"])
+    ensure_history()
+    if not config_differs(caddy_history([])[0]["stamp"]):
+        raise Refused("nothing has changed since the last apply")
+    return start_job("web", web_job_script(last_good(), "The new configuration is live and every site that answered before still does."))
+
+
+def caddy_rollback(args):
+    if len(args) != 1 or not STAMP_RE.fullmatch(args[0]):
+        raise UnexpectedArgs()
+    src = os.path.join(CADDY_HISTORY, args[0])
+    if not os.path.isdir(src):
+        raise Refused("that configuration is not kept")
+    NOTED.append(["caddy-rollback", args[0]])
+    ensure_history()
+    no_unapplied_edits()
+    now_names = set(n for ns, _ in site_blocks() for n in ns if re.fullmatch(r"[a-z0-9.-]+", n))
+    then_names = set()
+    for line in open(os.path.join(src, "Caddyfile")):
+        m = re.match(r"^([a-z0-9.,: -]+)\{\s*$", line)
+        if m:
+            then_names |= set(n for n in re.split(r"[,\s]+", m.group(1)) if n)
+    removed = sorted(now_names - then_names)
+    prep = ("echo 'Copying the configuration from " + args[0] + " in'; "
+            "cp -a " + src + "/Caddyfile " + src + "/site-rules.caddy " + src + "/docker-compose.yml " + WEB_DIR + "/; "
+            "rm -f " + WEB_DIR + "/sites/*.caddy; cp -a " + src + "/sites/. " + WEB_DIR + "/sites/; ")
+    label = "The configuration from " + args[0] + " is live." + (" Names no longer served: " + ", ".join(removed) + "." if removed else "")
+    return start_job("web", web_job_script(last_good(), label, prep, test_names=sorted(now_names & then_names)))
+
+
+def cert_renew(args):
+    """Set the certificate for one name aside so Caddy fetches a new one.
+    That name is left out of the normal test and waited for separately (up
+    to 90 seconds); if no new certificate arrives, the old one is put back."""
+    if len(args) != 1:
+        raise UnexpectedArgs()
+    name = unhex(args[0], 253).lower()
+    names = [n for ns, _ in site_blocks() for n in ns if re.fullmatch(r"[a-z0-9.-]+", n)]
+    if name not in names:
+        raise Refused("that name is not served here")
+    NOTED.append(["cert-renew", name])
+    ensure_history()
+    no_unapplied_edits()
+    base = os.path.join(caddy_data_dir(), "caddy", "certificates")
+    dirs = [os.path.join(base, issuer, name) for issuer in (os.listdir(base) if os.path.isdir(base) else [])
+            if os.path.isdir(os.path.join(base, issuer, name))]
+    if not dirs:
+        raise Refused("no certificate for " + name + " was found to renew")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    aside = "/root/config-backups-argus/cert-" + name + "-" + stamp
+    moves = "".join("mkdir -p " + aside + "/" + str(i) + "; mv " + d + " " + aside + "/" + str(i) + "/; " for i, d in enumerate(dirs))
+    putback = "".join("rm -rf " + d + "; mv " + aside + "/" + str(i) + "/" + name + " " + d + "; " for i, d in enumerate(dirs))
+    prep = "echo 'Setting the old certificate for " + name + " aside (kept in " + aside + ")'; mkdir -p /root/config-backups-argus; " + moves
+    after = ("echo '5. Waiting for the new certificate (up to 90 seconds)'; GOT=0; for i in $(seq 1 18); do "
+             "d=$(echo | openssl s_client -connect 127.0.0.1:443 -servername " + name + " 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null || true); "
+             "if [ -n \"$d\" ]; then GOT=1; echo \"  new certificate: $d\"; break; fi; sleep 5; done; "
+             "if [ $GOT = 0 ]; then echo 'No new certificate arrived.'; false; fi; ")
+    others = [n for n in names if n != name]
+    return start_job("web", web_job_script(last_good(), "A new certificate for " + name + " is in place.", prep,
+                                           test_names=others, extra_undo=putback, after=after))
+
+
+SITE_TEMPLATE = """# {domain}: added by Argus {date}.
+root * /srv/{domain}/public
+encode zstd gzip
+header {{
+\t-Server
+\tX-Content-Type-Options nosniff
+\tReferrer-Policy strict-origin-when-cross-origin
+\tX-Frame-Options SAMEORIGIN
+\tStrict-Transport-Security "max-age=31536000"
+}}
+@forbidden path_regexp forbid (?i)(^|/)\\.[^/]+
+respond @forbidden 404
+file_server
+"""
+
+
+def site_add(args):
+    if len(args) not in (2, 3) or args[0] not in ("static", "redirect", "proxy"):
+        raise UnexpectedArgs()
+    kind, domain = args[0], unhex(args[1], 253).lower()
+    if not DOMAIN_RE.fullmatch(domain) or domain.startswith("www."):
+        raise Refused("give the domain without www (for example example.com)")
+    existing = [n for ns, _ in site_blocks() for n in ns]
+    if domain in existing or "www." + domain in existing:
+        raise Refused(domain + " is already served here")
+    target = unhex(args[2], 300) if len(args) == 3 else None
+    date = datetime.date.today().isoformat()
+    if kind == "static":
+        block = ("\n# " + domain + " (added by Argus " + date + ")\n" + domain + " {\n\timport /etc/caddy/sites/" + domain + ".caddy\n}\n"
+                 "www." + domain + " {\n\tredir https://" + domain + "{uri} 308\n}\n")
+    elif kind == "redirect":
+        if not target or not re.fullmatch(r"https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?", target):
+            raise Refused("the redirect target must be an https:// address")
+        block = ("\n# " + domain + " (added by Argus " + date + ")\n" + domain + ", www." + domain + " {\n\tredir " + target.rstrip("/") + "{uri} 308\n}\n")
+    else:
+        if not target or not re.fullmatch(r"[0-9]{2,5}", target) or not (1024 <= int(target) <= 65535):
+            raise Refused("give the local port the app listens on (1024 to 65535)")
+        block = ("\n# " + domain + " (added by Argus " + date + ")\n" + domain + " {\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:" + target + "\n}\n"
+                 "www." + domain + " {\n\tredir https://" + domain + "{uri} 308\n}\n")
+    NOTED.append(["site-add", kind, domain, target or ""])
+    ensure_history()
+    no_unapplied_edits()
+    prep = "echo 'Adding " + domain + "'; "
+    if kind == "static":
+        site_file = SITE_TEMPLATE.format(domain=domain, date=date)
+        prep += ("mkdir -p /srv/" + domain + "/public; chmod 755 /srv/" + domain + " /srv/" + domain + "/public; "
+                 "[ -e /srv/" + domain + "/public/index.html ] || printf '%s\\n' '<!doctype html><title>" + domain + "</title><p>Coming soon.</p>' > /srv/" + domain + "/public/index.html; "
+                 "cat > " + WEB_DIR + "/sites/" + domain + ".caddy <<'ARGUS_EOF'\n" + site_file + "ARGUS_EOF\n"
+                 # mount the new folder into the web server, read only
+                 "python3 -I -c 'import sys,re; p=sys.argv[1]; s=open(p).read(); line=\"      - /srv/" + domain + "/public:/srv/" + domain + "/public:ro\\n\"; "
+                 "i=s.index(\"      - ./site-rules.caddy:/etc/caddy/site-rules.caddy:ro\\n\"); s=s[:i]+line+s[i:]; open(p,\"w\").write(s)' " + WEB_DIR + "/docker-compose.yml; ")
+    prep += "cat >> " + WEB_DIR + "/Caddyfile <<'ARGUS_EOF'\n" + block + "ARGUS_EOF\n"
+    out = start_job("web", web_job_script(last_good(), domain + " is set up on the server. Its certificate arrives once the DNS records point here.", prep))
+    out["dns"] = [{"type": "A", "name": domain, "value": SERVER_IP}, {"type": "A", "name": "www." + domain, "value": SERVER_IP}]
+    return out
+
+
+class UnexpectedArgs(Exception):
+    pass
+
+
+# ---------- accounts: upload accounts, SSH keys, Hephaestus users ----------
+# Upload accounts are SFTP-only (no links, no hard links), locked in
+# /srv/sftp/<name> (root-owned, as sshd's ChrootDirectory requires). They see
+# one folder at /files: either their own (/srv/sftp/<name>/files) or a folder
+# Matt shares from under /srv. A shared folder is bind-mounted by this helper,
+# through a handle opened without following links (never by path from
+# /etc/fstab), at creation and at every boot (argus-upload-mounts.service).
+# Keys live in /etc/ssh/argus-keys/<name> and authenticator secrets in
+# /var/lib/google-authenticator/<name>: root-owned and outside every jail.
+# sshd's rules for the argus-upload group are fixed in
+# /etc/ssh/sshd_config.d/60-argus-upload.conf; members of argus-disabled are
+# refused by 05-argus-deny.conf. Account numbers come from a counter and are
+# never reused, so a new account can never inherit an old one's files.
+import base64 as _b64
+import pwd as _pwd
+import grp as _grp
+import tempfile as _tempfile
+import urllib.parse as _urlparse
+import shlex as _shlex
+
+ADMIN_USER = "mattridge"
+ADMIN_KEYS = "/home/mattridge/.ssh/authorized_keys"
+UPLOAD_GROUP = "argus-upload"
+DISABLED_GROUP = "argus-disabled"
+JAIL_ROOT = "/srv/sftp"
+KEYS_DIR = "/etc/ssh/argus-keys"
+GA_DIR = "/var/lib/google-authenticator"
+PAM_SSHD = "/etc/pam.d/sshd"
+SSHD_UPLOAD_CONF = "/etc/ssh/sshd_config.d/60-argus-upload.conf"
+SSHD_DENY_CONF = "/etc/ssh/sshd_config.d/05-argus-deny.conf"
+UPLOAD_FORCE = "ForceCommand internal-sftp -d /files -u 0027 -P symlink,hardlink -l INFO -f AUTHPRIV"
+MOUNTS_FILE = "/var/lib/argus/upload-mounts.json"
+UID_FILE = "/var/lib/argus/upload-uid"
+UID_START = 30000
+UID_END = 59999
+INODE_LIMIT = "200000"
+SITE_ROOT = "/srv"
+NOT_SHAREABLE = ("sftp", "newsdesk-releases")
+ACCT_RE = re.compile(r"^[a-z][a-z0-9-]{2,30}$")
+SHARE_RE = re.compile(r"^/srv(/[A-Za-z0-9_][A-Za-z0-9._-]{0,63}){1,8}$")
+FP_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
+KEY_TYPES = {"ssh-ed25519", "sk-ssh-ed25519@openssh.com", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+             "ecdsa-sha2-nistp521", "sk-ecdsa-sha2-nistp256@openssh.com", "ssh-rsa"}
+PERSON_RE = re.compile(r"^[A-Za-z][A-Za-z' .-]{0,59}$")
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
+LABEL_RE = re.compile(r"^[A-Za-z0-9 ._'-]{0,60}$")
+
+
+def is_mount(path):
+    """True if something is mounted exactly at path. (os.path.ismount says no
+    for a bind mount from the same disk, which is what shares are.)"""
+    want = os.path.normpath(path)
+    try:
+        with open("/proc/self/mountinfo") as f:
+            for line in f:
+                mp = line.split(" ")[4]
+                mp = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), mp)
+                if mp == want:
+                    return True
+    except OSError:
+        return True          # can't tell: behave as if it is, so nothing is removed
+    return False
+
+
+def try_(fn, *a, **k):
+    """Run one clean-up step; a failure must not stop the next one."""
+    try:
+        fn(*a, **k)
+    except Exception:
+        pass
+
+
+def upload_members():
+    try:
+        return sorted(_grp.getgrnam(UPLOAD_GROUP).gr_mem)
+    except KeyError:
+        return []
+
+
+def disabled_members():
+    try:
+        return set(_grp.getgrnam(DISABLED_GROUP).gr_mem)
+    except KeyError:
+        return set()
+
+
+def upload_account(name):
+    """An existing upload account: in the group AND numbered from the upload
+    range (so never mattridge, root or a system user)."""
+    if not ACCT_RE.fullmatch(name) or name == ADMIN_USER or name not in upload_members():
+        raise Refused("no upload account by that name")
+    try:
+        pw = _pwd.getpwnam(name)
+    except KeyError:
+        raise Refused("no upload account by that name")
+    if not UID_START <= pw.pw_uid <= UID_END:
+        raise Refused(name + " is not an upload account")
+    return name
+
+
+def quotas_on():
+    # quotaon -p reports through its exit code the other way round (non-zero
+    # when quotas ARE on), so only its words are read.
+    try:
+        out = subprocess.run(["quotaon", "-p", "-u", "/"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return " is on" in out
+
+
+def upload_conf_ok():
+    try:
+        conf = open(SSHD_UPLOAD_CONF).read()
+    except OSError:
+        return False
+    return any(l.strip() == UPLOAD_FORCE for l in conf.splitlines()) and os.path.isfile(SSHD_DENY_CONF)
+
+
+def accounts_ready():
+    """What the one-time server setup has in place."""
+    try:
+        pam = open(PAM_SSHD).read()
+    except OSError:
+        pam = ""
+    return {
+        "quotas": quotas_on(),
+        "authenticator_folder": bool(re.search(r"^auth\s+required\s+pam_google_authenticator\.so\s+secret=" + re.escape(GA_DIR) + r"/\$\{USER\}\s+user=root\s*$", pam, re.M)),
+        "ssh_settings": upload_conf_ok(),
+        "boot_mounts": os.path.isfile("/etc/systemd/system/argus-upload-mounts.service"),
+    }
+
+
+def need_ready():
+    r = accounts_ready()
+    missing = [k for k, v in r.items() if not v]
+    if missing:
+        raise Refused("the server's one-time setup for upload accounts is not finished (" + ", ".join(missing) + ")")
+
+
+# --- shared folders
+
+def served_paths():
+    """Every /srv path a website serves or a container is set up to reach,
+    from the configuration files: Caddy `root` lines in /opt/web, and any /srv
+    path written anywhere in a compose file under /opt (one or two levels
+    down). A file that can't be read stops the check rather than count as
+    "nothing served"."""
+    import glob as _glob
+    out = set()
+    for p in config_paths():
+        if not os.path.exists(p):
+            continue
+        try:
+            text = open(p).read()
+        except OSError:
+            raise Refused("could not read " + p + " to check what the websites serve")
+        out.update(m.rstrip("/") for m in re.findall(r"^\s*root\s+(?:[*@]\S*\s+)?['\"]?(/srv/[^\s'\"}]+)", text, re.M))
+    for p in sorted(set(_glob.glob("/opt/*/docker-compose*.y*ml") + _glob.glob("/opt/*/*/docker-compose*.y*ml")
+                           + _glob.glob("/opt/*/compose.y*ml") + _glob.glob("/opt/*/*/compose.y*ml"))):
+        try:
+            text = open(p).read()
+        except OSError:
+            raise Refused("could not read " + p + " to check what the containers can reach")
+        out.update(m.rstrip("/") for m in re.findall(r"(/srv(?=[\s:'\"/]|$)(?:/[A-Za-z0-9_.@-]+)*)", text, re.M))
+    return out
+
+
+def container_mount_sources():
+    """What every container on the server (running or stopped, however it was
+    started) actually has mounted. If Docker can't answer, nothing is shared."""
+    ids = run(["docker", "ps", "-aq"], timeout=30)
+    if ids is None:
+        raise Refused("Docker did not answer, so it can't be checked that no container uses the folder")
+    ids = ids.split()
+    if not ids:
+        return set()
+    out = run(["docker", "inspect", "--format", "{{range .Mounts}}{{.Source}}\n{{end}}"] + ids, timeout=60)
+    if out is None:
+        raise Refused("Docker did not answer, so it can't be checked that no container uses the folder")
+    srcs = {l.strip().rstrip("/") or "/" for l in out.splitlines() if l.strip()}
+    return {x for x in srcs if x in ("/", "/srv") or x.startswith("/srv/")}
+
+
+def all_served():
+    return served_paths() | container_mount_sources()
+
+
+def walk_no_links(path):
+    """Open a folder one part at a time, never following a link. Returns the
+    handle and the (uid, mode) of each folder above it from /srv down."""
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    above = []
+    try:
+        parts = [p for p in path.split("/") if p]
+        for i, part in enumerate(parts):
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                raise Refused(path + " is not a folder (or goes through a link)")
+            os.close(fd)
+            fd = nfd
+            if i < len(parts) - 1:               # /srv, /srv/<site> ... parent of the target
+                st = os.fstat(fd)
+                above.append(("/" + "/".join(parts[:i + 1]), st.st_uid, st.st_mode))
+        return fd, above
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def acl_has_write_for_others(path):
+    out = run(["getfacl", "-c", "-p", "-E", path]) or ""
+    for l in out.splitlines():
+        kind, _, rest = l.partition(":")
+        who, _, perm = rest.partition(":")
+        if kind in ("user", "group") and who and "w" in perm:
+            return True
+    return False
+
+
+def share_problem(path, served=None):
+    """Why a folder can't be shared, or None. Only plain folders under a site's
+    folder that no website serves, reached without links, with every folder
+    above it owned by root and writable by nobody else."""
+    if not SHARE_RE.fullmatch(path) or path != os.path.normpath(path):
+        return "only plain folder names (letters, digits, . _ -) under /srv can be shared"
+    top = path.split("/")[2]
+    if top in NOT_SHAREABLE or len(path.split("/")) < 4:
+        return "choose a folder inside one of the site folders under /srv"
+    served = served_paths() if served is None else served
+    for s in served:
+        if s in ("/", "/srv") or path == s or path.startswith(s + "/") or s.startswith(path + "/"):
+            return "that folder is (or holds) part of a live website or app; uploads there would go live"
+    try:
+        fd, above = walk_no_links(path)
+    except Refused as e:
+        return str(e)
+    try:
+        st = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if st.st_uid != 0:
+        return "the folder must be owned by root (make it with Files, New Folder)"
+    for p, uid, mode in above:
+        if uid != 0 or mode & 0o022 or acl_has_write_for_others(p):
+            return p + " can be changed by someone other than root, so folders under it can't be shared"
+    return None
+
+
+def acct_folders(args):
+    """Folders that could be shared with an upload account, and why others can't."""
+    no_args(args)
+    served = all_served()
+    ok = []
+    for top in sorted(os.listdir(SITE_ROOT)):
+        p = os.path.join(SITE_ROOT, top)
+        if top in NOT_SHAREABLE or not os.path.isdir(p) or os.path.islink(p):
+            continue
+        for dirpath, dirs, _files in os.walk(p):
+            dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(dirpath, d)))
+            if dirpath.count("/") >= 4:
+                dirs[:] = []
+            if dirpath != p and share_problem(dirpath, served) is None:
+                ok.append(dirpath)
+            if len(ok) >= 200:
+                break
+    return {"folders": ok}
+
+
+def read_mounts():
+    try:
+        with open(MOUNTS_FILE) as f:
+            m = json.load(f)
+        return {k: v for k, v in m.items() if ACCT_RE.fullmatch(k) and isinstance(v, str)}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_mounts(m):
+    os.makedirs(os.path.dirname(MOUNTS_FILE), mode=0o700, exist_ok=True)
+    fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(MOUNTS_FILE), prefix=".upload-mounts-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(m, f, indent=1, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.rename(tmp, MOUNTS_FILE)
+
+
+def mount_root(target):
+    out = run(["findmnt", "-n", "-o", "FSROOT", "--mountpoint", target])
+    return out.strip() if out else None
+
+
+def mount_share(n, src):
+    """Bind src at the account's /files through a handle, never by path."""
+    target = os.path.join(JAIL_ROOT, n, "files")
+    why = share_problem(src)
+    if why:
+        raise Refused(why)
+    fd, _ = walk_no_links(src)
+    try:
+        # --no-canonicalize: mount(2) gets /proc/self/fd/N, which the kernel
+        # resolves to the opened folder itself, not to a path looked up again.
+        must(["mount", "--no-canonicalize", "--bind", "/proc/self/fd/%d" % fd, target], pass_fds=(fd,))
+    finally:
+        os.close(fd)
+    try:
+        must(["mount", "-o", "remount,bind,nosuid,nodev,noexec", target])
+    except BaseException:
+        try_(must, ["umount", target])
+        raise
+    # FSROOT is the path within its filesystem; /srv is on / here, so it equals
+    # src. (If /srv ever moves to its own disk, every share is refused: safe.)
+    if mount_root(target) != src:
+        try_(must, ["umount", target])
+        raise Refused("the folder could not be connected safely; nothing was shared")
+
+
+def acct_mount_all(args):
+    """At boot: connect every shared folder again (checks repeated each time)."""
+    no_args(args)
+    done, failed = [], []
+    for n, src in sorted(read_mounts().items()):
+        target = os.path.join(JAIL_ROOT, n, "files")
+        if is_mount(target):
+            done.append(n)
+            continue
+        try:
+            upload_account(n)
+            mount_share(n, src)
+            done.append(n)
+        except Exception as e:
+            failed.append(n + ": " + (str(e) if isinstance(e, Refused) else type(e).__name__))
+    NOTED.append(["acct-mount-all", "%d connected" % len(done), "; ".join(failed)[:300]])
+    return {"connected": done, "failed": failed}
+
+
+# --- quota, keys, codes
+
+def quota_report():
+    """{user: (used_kb, limit_kb)} from repquota's csv; the header row is found by content."""
+    txt = run(["repquota", "-u", "-O", "csv", "/"]) or ""
+    rows = [[c.strip().strip('"') for c in r.split(",")] for r in txt.strip().splitlines()]
+    head_i = next((i for i, r in enumerate(rows) if "blockused" in [c.lower() for c in r]), None)
+    if head_i is None:
+        return {}
+    head = [c.lower() for c in rows[head_i]]
+    iu = head.index("user") if "user" in head else 0
+    iused, ihard = head.index("blockused"), head.index("blockhardlimit") if "blockhardlimit" in head else None
+    out = {}
+    for r in rows[head_i + 1:]:
+        try:
+            out[r[iu].lstrip("#")] = (int(r[iused]), int(r[ihard]) if ihard is not None else None)
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def set_quota_mb(n, mb):
+    kb = str(mb * 1024)
+    must(["setquota", "-u", n, kb, kb, INODE_LIMIT, INODE_LIMIT, "/"])
+
+
+def raw_key_file(account):
+    path = ADMIN_KEYS if account == ADMIN_USER else os.path.join(KEYS_DIR, account)
+    try:
+        with open(path) as f:
+            return path, f.read().splitlines()
+    except FileNotFoundError:
+        return path, []
+
+
+def is_key_line(l):
+    return l.strip() and not l.lstrip().startswith("#")
+
+
+def key_info(line):
+    """Fingerprint, type, size and comment of one authorized key line."""
+    with _tempfile.NamedTemporaryFile("w", dir="/run", delete=True) as t:
+        t.write(line + "\n")
+        t.flush()
+        out = run(["ssh-keygen", "-l", "-E", "sha256", "-f", t.name])
+    if not out:
+        return None
+    m = re.match(r"^(\d+)\s+(SHA256:[A-Za-z0-9+/]{43})\s+(.*?)\s+\(([A-Z0-9-]+)\)\s*$", out.strip())
+    if not m:
+        return None
+    return {"bits": int(m.group(1)), "fingerprint": m.group(2), "comment": m.group(3)[:80], "type": m.group(4)}
+
+
+def list_keys(account):
+    out = []
+    for l in raw_key_file(account)[1]:
+        if is_key_line(l):
+            i = key_info(l)
+            out.append(i if i else {"fingerprint": None, "type": "unreadable", "bits": 0, "comment": ""})
+    return out
+
+
+def key_account(name):
+    return name if name == ADMIN_USER else upload_account(name)
+
+
+def write_key_file(account, lines):
+    """Replace a keys file in one step (comment lines kept), owner and mode kept."""
+    path = ADMIN_KEYS if account == ADMIN_USER else os.path.join(KEYS_DIR, account)
+    if account == ADMIN_USER:
+        pw = _pwd.getpwnam(ADMIN_USER)
+        uid, gid, mode = pw.pw_uid, pw.pw_gid, 0o600
+    else:
+        uid, gid, mode = 0, 0, 0o644
+    fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(path), prefix=".argus-keys-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("".join(l + "\n" for l in lines))
+        os.chown(tmp, uid, gid)
+        os.chmod(tmp, mode)
+        os.rename(tmp, path)
+    except BaseException:
+        try_(os.unlink, tmp)
+        raise
+
+
+def new_totp_file(path):
+    """A google-authenticator secret file like the one Matt's own code uses.
+    Returns the secret and five one-time emergency codes."""
+    secret = _b64.b32encode(_secrets.token_bytes(20)).decode().rstrip("=")
+    scratch = [str(10000000 + _secrets.randbelow(90000000)) for _ in range(5)]
+    body = secret + "\n\" RATE_LIMIT 3 30\n\" WINDOW_SIZE 3\n\" DISALLOW_REUSE\n\" TOTP_AUTH\n" + "".join(s + "\n" for s in scratch)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "w") as f:
+        f.write(body)
+    return secret, scratch
+
+
+def totp_uri(account, secret):
+    label = _urlparse.quote("Black Sheep server:" + account)
+    return "otpauth://totp/" + label + "?secret=" + secret + "&issuer=" + _urlparse.quote("Black Sheep server")
+
+
+# --- folder rights
+
+def tree(folder):
+    """Every folder and plain file under folder (same disk only), as handles
+    opened without following links. Yields ("dir", fd) once per folder, then
+    ("files", [O_PATH fds]) in batches of 200, closed after each batch. Links
+    are never touched; a file that vanishes meanwhile is skipped, any other
+    error stops the action."""
+    import stat as _st
+    top, _ = walk_no_links(folder)
+    try:
+        dev = os.fstat(top).st_dev
+        for _root, dirs, files, rfd in os.fwalk(".", dir_fd=top, follow_symlinks=False):
+            if os.fstat(rfd).st_dev != dev:
+                dirs[:] = []
+                continue
+            yield "dir", rfd
+            for i in range(0, len(files), 200):
+                fds = []
+                try:
+                    for name in files[i:i + 200]:
+                        try:
+                            f = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=rfd)
+                        except FileNotFoundError:
+                            continue
+                        if _st.S_ISREG(os.fstat(f).st_mode):
+                            fds.append(f)
+                        else:
+                            os.close(f)
+                    yield "files", fds
+                finally:
+                    for f in fds:
+                        try_(os.close, f)
+    finally:
+        os.close(top)
+
+
+def setfacl_fds(opts, fds):
+    """setfacl on handles (as /proc/self/fd/N), a batch at a time."""
+    for i in range(0, len(fds), 200):
+        part = fds[i:i + 200]
+        must(["setfacl"] + opts + ["/proc/self/fd/%d" % f for f in part], timeout=120, pass_fds=tuple(part))
+
+
+def acl_grant(folder, n):
+    """Read everything already there; add new files and folders anywhere in it.
+    The sticky bit stops the account renaming or deleting anyone else's files,
+    and files others add later are only readable to it (so it can't grow
+    root-owned files past its size limit)."""
+    import stat as _st
+    for kind, h in tree(folder):
+        if kind == "dir":
+            grant_keeping_mask(h, n, "rwx", ",d:u:" + n + ":rx")
+            os.fchmod(h, _st.S_IMODE(os.fstat(h).st_mode) | _st.S_ISVTX)
+        else:
+            for f in h:
+                grant_keeping_mask(f, n, "r")
+
+
+def grant_keeping_mask(fd, n, perm, extra=""):
+    """Add u:<n>:<perm> without letting setfacl recompute the mask from every
+    entry: the mask only gains the bits this account needs, so a deliberately
+    narrow mask stays as narrow as it can (and stays so after the account is
+    removed, since removal keeps masks too)."""
+    out = subprocess.run(["getfacl", "-c", "-p", "/proc/self/fd/%d" % fd], capture_output=True, text=True,
+                         timeout=30, pass_fds=(fd,))
+    if out.returncode != 0:
+        raise Refused("could not read a file's permissions")
+    mask = group = None
+    for line in out.stdout.splitlines():
+        if line.startswith("mask::"):
+            mask = line.split("::", 1)[1][:3]
+        elif line.startswith("group::"):
+            group = line.split("::", 1)[1][:3]
+    base = mask if mask is not None else (group or "---")
+    new = "".join(c if (c in base or c in perm) else "-" for c in "rwx")
+    setfacl_fds(["-n", "-m", "u:" + n + ":" + perm + ",m::" + new + extra], [fd])
+
+
+def acl_revoke(folder, n, uid=None, gid=None):
+    """Take the account's entries off the folder and everything under it, and
+    hand anything it owned (by user or group) to root."""
+    for kind, h in tree(folder):
+        fds = [h] if kind == "dir" else h
+        # -n: leave each mask as it is, so removing the entry widens nobody else.
+        setfacl_fds(["-n", "-x", "u:" + n], fds)
+        if kind == "dir":
+            setfacl_fds(["-n", "-d", "-x", "u:" + n], fds)
+        if uid is not None:
+            for f in fds:
+                st = os.fstat(f)
+                if st.st_uid == uid or st.st_gid == gid:
+                    if kind == "dir":
+                        os.fchown(f, 0, 0)
+                    else:
+                        os.chown("/proc/self/fd/%d" % f, 0, 0)
+
+
+def next_uid():
+    """The next unused upload account number; numbers are never reused."""
+    os.makedirs(os.path.dirname(UID_FILE), mode=0o700, exist_ok=True)
+    try:
+        n = int(open(UID_FILE).read().strip())
+    except (OSError, ValueError):
+        n = UID_START
+    while n <= UID_END:
+        try:
+            _pwd.getpwuid(n)
+        except KeyError:
+            try:
+                _grp.getgrgid(n)
+            except KeyError:
+                with open(UID_FILE + ".new", "w") as f:
+                    f.write(str(n + 1) + "\n")
+                os.rename(UID_FILE + ".new", UID_FILE)
+                return n
+        n += 1
+    raise Refused("no upload account numbers are left")
+
+
+def end_sessions(n):
+    """Cut the account off and wait (up to 5 s) for its processes to go."""
+    run(["pkill", "-KILL", "-u", n])
+    for _ in range(25):
+        if run(["pgrep", "-u", n]) is None:      # pgrep exits 1 when nothing matches
+            return
+        time.sleep(0.2)
+
+
+# --- actions
+
+def acct_list(args):
+    no_args(args)
+    mounts = read_mounts()
+    quotas = quota_report()
+    off = disabled_members()
+    accounts = []
+    for n in upload_members():
+        try:
+            upload_account(n)
+            pw = _pwd.getpwnam(n)
+        except (Refused, KeyError):
+            continue
+        used, limit = quotas.get(n, (None, None))
+        src = mounts.get(n)
+        target = os.path.join(JAIL_ROOT, n, "files")
+        accounts.append({
+            "name": n, "label": pw.pw_gecos.split(",")[0][:60],
+            "folder": src or None, "own_folder": src is None,
+            "used_kb": used, "limit_kb": limit, "disabled": n in off,
+            "keys": list_keys(n),
+            "authenticator": os.path.isfile(os.path.join(GA_DIR, n)),
+            "mounted": (mount_root(target) == src) if src else None,
+        })
+    return {"ready": accounts_ready(), "accounts": accounts,
+            "admin": {"name": ADMIN_USER, "keys": list_keys(ADMIN_USER)}}
+
+
+def acct_add(args):
+    """acct-add <name> <hexlabel|none> <quotaMB> own|<hexfolder>"""
+    if len(args) != 4:
+        raise UnexpectedArgs()
+    n, mb, where = args[0], args[2], args[3]
+    label = unhex(args[1], 60) if args[1] != "none" else ""
+    if not ACCT_RE.fullmatch(n):
+        raise Refused("use 3 to 31 lowercase letters, digits or hyphens, starting with a letter")
+    if not LABEL_RE.fullmatch(label):
+        raise Refused("use letters, numbers and spaces for the description")
+    if not re.fullmatch(r"[1-9][0-9]{0,6}", mb) or int(mb) > 102400:
+        raise Refused("the size limit is 1 to 102400 MB")
+    src = None if where == "own" else unhex(where, 1024)
+    NOTED.append(["acct-add", n, src or "own folder", mb + " MB"])
+    need_ready()
+    if src is not None:
+        why = share_problem(src, all_served())
+        if why:
+            raise Refused(why)
+    for look in (_pwd.getpwnam, _grp.getgrnam):
+        try:
+            look(n)
+            raise Refused("a server account or group called " + n + " already exists")
+        except KeyError:
+            pass
+    jail = os.path.join(JAIL_ROOT, n)
+    files = os.path.join(jail, "files")
+    done = []
+    with change_lock():
+        try:
+            uid = next_uid()
+            must(["groupadd", "--gid", str(uid), n])
+            done.append("group")
+            must(["useradd", "--no-create-home", "--home-dir", jail, "--shell", "/usr/sbin/nologin",
+                  "--uid", str(uid), "--gid", str(uid), "--groups", UPLOAD_GROUP, "--comment", label or n, n])
+            done.append("user")
+            os.mkdir(jail, 0o755)
+            os.chown(jail, 0, 0)
+            done.append("jail")
+            os.mkdir(files, 0o750)
+            done.append("files")
+            if src is None:
+                os.chown(files, uid, uid)
+            else:
+                os.chown(files, 0, 0)
+                done.append("acl")
+                acl_grant(src, n)
+                mount_share(n, src)
+                done.append("mount")
+                m = read_mounts()
+                m[n] = src
+                write_mounts(m)
+                done.append("record")
+            set_quota_mb(n, int(mb))
+            done.append("quota")
+            write_key_file(n, [])
+            done.append("keys")
+            secret, scratch = new_totp_file(os.path.join(GA_DIR, n))
+            done.append("totp")
+        except BaseException:
+            # Put back only what this call made, each step on its own.
+            if "record" in done:
+                def drop():
+                    m = read_mounts()
+                    m.pop(n, None)
+                    write_mounts(m)
+                try_(drop)
+            if "mount" in done:
+                try_(must, ["umount", files])
+            if "acl" in done:
+                try_(acl_revoke, src, n)
+            if "quota" in done:
+                try_(run, ["setquota", "-u", n, "0", "0", "0", "0", "/"])
+            if "keys" in done:
+                try_(os.unlink, os.path.join(KEYS_DIR, n))
+            if "totp" in done:
+                try_(os.unlink, os.path.join(GA_DIR, n))
+            # Never recurse: a folder that is still a mount is left for a person.
+            if "files" in done and not is_mount(files):
+                try_(os.rmdir, files)
+            if "jail" in done and not is_mount(files):
+                try_(os.rmdir, jail)
+            if "user" in done:
+                try_(run, ["userdel", n])
+            if "group" in done:
+                try_(run, ["groupdel", n])
+            raise
+    return {"name": n, "folder": src, "otpauth": totp_uri(n, secret), "secret": secret, "emergency_codes": scratch}
+
+
+def acct_set(args):
+    """acct-set <name> enable|disable | quota <MB> | label <hex|none> | new-code"""
+    if len(args) < 2:
+        raise UnexpectedArgs()
+    n, op = upload_account(args[0]), args[1]
+    if op in ("enable", "disable") and len(args) == 2:
+        NOTED.append(["acct-set", n, op])
+        with change_lock():
+            if op == "disable":
+                must(["gpasswd", "-a", n, DISABLED_GROUP])
+                end_sessions(n)
+            elif n in disabled_members():
+                must(["gpasswd", "-d", n, DISABLED_GROUP])
+        return {"name": n, "done": op}
+    if op == "quota" and len(args) == 3:
+        if not re.fullmatch(r"[1-9][0-9]{0,6}", args[2]) or int(args[2]) > 102400:
+            raise Refused("the size limit is 1 to 102400 MB")
+        NOTED.append(["acct-set", n, "quota", args[2] + " MB"])
+        set_quota_mb(n, int(args[2]))
+        return {"name": n, "done": "quota"}
+    if op == "label" and len(args) == 3:
+        label = unhex(args[2], 60) if args[2] != "none" else ""
+        if not LABEL_RE.fullmatch(label):
+            raise Refused("use letters, numbers and spaces for the description")
+        NOTED.append(["acct-set", n, "label", label])
+        must(["usermod", "--comment", label or n, n])
+        return {"name": n, "done": "label"}
+    if op == "new-code" and len(args) == 2:
+        # A lost phone: a new secret replaces the old one; the old code stops working.
+        NOTED.append(["acct-set", n, "new-code"])
+        need_ready()
+        path = os.path.join(GA_DIR, n)
+        tmp = path + ".new"
+        try_(os.unlink, tmp)
+        secret, scratch = new_totp_file(tmp)
+        os.rename(tmp, path)
+        end_sessions(n)
+        return {"name": n, "otpauth": totp_uri(n, secret), "secret": secret, "emergency_codes": scratch}
+    raise UnexpectedArgs()
+
+
+def acct_delete(args):
+    """acct-delete <name>: the account goes; files it uploaded are kept.
+    Its own folder is moved to /var/backups/argus, which the server's
+    /etc/tmpfiles.d/argus.conf (`d /var/backups/argus 0700 root root 30d`)
+    empties of anything untouched for 30 days; the chown below refreshes the
+    folder's change time, so the 30 days start at deletion. Files it put in a
+    shared folder stay, handed to root. Sticky bits set on shared folders stay."""
+    n = upload_account(one_arg(args))
+    NOTED.append(["acct-delete", n])
+    jail = os.path.join(JAIL_ROOT, n)
+    files = os.path.join(jail, "files")
+    src = read_mounts().get(n)
+    kept = None
+    with change_lock():
+        pw = _pwd.getpwnam(n)
+        must(["gpasswd", "-a", n, DISABLED_GROUP])
+        end_sessions(n)
+        if src:
+            if is_mount(files):
+                must(["umount", files])
+            if os.path.isdir(src) and share_problem(src) is None:
+                acl_revoke(src, n, pw.pw_uid, pw.pw_gid)
+            # Only now forget the share, so a failed clean-up is repeated by a retry.
+            m = read_mounts()
+            m.pop(n, None)
+            write_mounts(m)
+            if os.path.isdir(files) and not is_mount(files):
+                os.rmdir(files)
+        elif os.path.isdir(files) and not os.path.islink(files):
+            if is_mount(files):
+                raise Refused(files + " is unexpectedly a mount; nothing was deleted")
+            os.makedirs(OVERWRITE_BACKUPS, mode=0o700, exist_ok=True)
+            kept = os.path.join(OVERWRITE_BACKUPS, "account-" + n + "-" + time.strftime("%Y%m%d-%H%M%S"))
+            os.rename(files, kept)                 # /srv and /var/backups are on the same disk
+            must(["chown", "-R", "-h", "root:root", kept], timeout=600)   # also restarts its 30 days
+        run(["setquota", "-u", n, "0", "0", "0", "0", "/"])
+        for p in (os.path.join(KEYS_DIR, n), os.path.join(GA_DIR, n)):
+            try_(os.unlink, p)
+        must(["userdel", n])
+        try:
+            _grp.getgrnam(n)
+            run(["groupdel", n])
+        except KeyError:
+            pass
+        if not is_mount(files):
+            try_(os.rmdir, files)
+            try_(os.rmdir, jail)
+    return {"name": n, "deleted": True, "kept": kept}
+
+
+def key_add(args):
+    """key-add <account> <hexkey>: one public key line, no options."""
+    if len(args) != 2:
+        raise UnexpectedArgs()
+    acct = key_account(args[0])
+    line = " ".join(unhex(args[1], 1000).strip().split())
+    parts = line.split(" ")
+    if len(parts) < 2 or parts[0] not in KEY_TYPES or not re.fullmatch(r"[A-Za-z0-9+/]+={0,3}", parts[1]):
+        raise Refused("that is not a public key line (it should start with ssh-ed25519, ecdsa-... or ssh-rsa)")
+    comment = " ".join(parts[2:])
+    if not re.fullmatch(r"[A-Za-z0-9@._ +-]{0,80}", comment):
+        raise Refused("the key's comment has characters that aren't accepted")
+    line = parts[0] + " " + parts[1] + (" " + comment if comment else "")
+    info = key_info(line)
+    if not info:
+        raise Refused("that key could not be read")
+    if info["type"] == "RSA" and info["bits"] < 3072:
+        raise Refused("RSA keys must be at least 3072 bits; an ed25519 key is better")
+    NOTED.append(["key-add", acct, info["fingerprint"], info["comment"]])
+    _, lines = raw_key_file(acct)
+    if any(is_key_line(l) and (key_info(l) or {}).get("fingerprint") == info["fingerprint"] for l in lines):
+        raise Refused("that key is already there")
+    write_key_file(acct, lines + [line])
+    return {"account": acct, "added": info}
+
+
+def key_remove(args):
+    """key-remove <account> <hexfingerprint>"""
+    if len(args) != 2:
+        raise UnexpectedArgs()
+    fp = unhex(args[1], 60)
+    if not FP_RE.fullmatch(fp):
+        raise UnexpectedArgs()
+    acct = key_account(args[0])
+    NOTED.append(["key-remove", acct, fp])
+    _, lines = raw_key_file(acct)
+    keep = [l for l in lines if not (is_key_line(l) and (key_info(l) or {}).get("fingerprint") == fp)]
+    if len(keep) == len(lines):
+        raise Refused("that key is not there")
+    if acct == ADMIN_USER and not any(is_key_line(l) for l in keep):
+        raise Refused("that is your last key; add another one first, or you could not sign in")
+    write_key_file(acct, keep)
+    if acct != ADMIN_USER:
+        end_sessions(acct)
+    return {"account": acct, "removed": fp}
+
+
+# Hephaestus users, through heph-admin inside the running app container.
+def heph_admin(argv, stdin_text=None, timeout=60):
+    if any(a.startswith("-") and a not in ("--admin", "--role", "--password") for a in argv):
+        raise Refused("a value can't start with -")
+    try:
+        p = subprocess.run(["docker", "compose", "exec", "-T", "app", "heph-admin"] + argv, cwd=HEPH_DEPLOY_DIR,
+                           input=(stdin_text + "\n") if stdin_text is not None else "", capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Refused("Hephaestus took too long to answer")
+    if p.returncode != 0:
+        msg = [l for l in (p.stderr or "").splitlines() if l.strip() and not l.lower().startswith(("new password", "password ("))]
+        raise Refused("Hephaestus refused it: " + (msg[-1].strip()[:200] if msg else "is it running?"))
+    return p.stdout
+
+
+def heph_people(args):
+    no_args(args)
+    staff = []
+    for l in heph_admin(["list-staff"]).splitlines():
+        p = l.split()
+        if len(p) >= 4 and EMAIL_RE.fullmatch(p[0]):
+            staff.append({"email": p[0], "role": p[1], "active": p[2] == "active", "two_factor": " ".join(p[3:5]) == "2fa on"})
+    tenants = []
+    for l in heph_admin(["list-tenants"]).splitlines():
+        p = l.split(None, 1)
+        if len(p) == 2 and SLUG_RE.fullmatch(p[0]):
+            tenants.append({"slug": p[0], "name": p[1].strip()})
+    return {"staff": staff, "companies": tenants}
+
+
+def hx_names(h):
+    """First and last name, sent together as hex of "first<TAB>last"."""
+    parts = unhex(h, 130).split("\t")
+    if len(parts) != 2 or not all(PERSON_RE.fullmatch(p.strip()) for p in parts):
+        raise Refused("use letters for the first and last name")
+    return parts[0].strip(), parts[1].strip()
+
+
+def heph_staff_add(args):
+    """heph-staff-add <hexemail> <hexnames> admin|technician; password on stdin"""
+    if len(args) != 3 or args[2] not in ("admin", "technician"):
+        raise UnexpectedArgs()
+    email, (first, last) = hx_email(args[0]), hx_names(args[1])
+    NOTED.append(["heph-staff-add", email, args[2]])
+    # create-staff also re-passwords an existing account; refuse that here.
+    if any(s["email"].lower() == email for s in heph_people([])["staff"]):
+        raise Refused(email + " already has a Hephaestus staff account")
+    pw, generated = stdin_password()
+    heph_admin(["create-staff", email, first, last] + (["--admin"] if args[2] == "admin" else []), stdin_text=pw)
+    return {"email": email, "password": pw if generated else None}
+
+
+def heph_company_add(args):
+    """heph-company-add <slug> <hexname>"""
+    if len(args) != 2 or not SLUG_RE.fullmatch(args[0]):
+        raise Refused("the short name is 2 to 40 lowercase letters, digits or hyphens")
+    name = " ".join(unhex(args[1], 100).split())
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 &.,'()-]{0,99}", name) or any(w.startswith("-") for w in name.split()):
+        raise Refused("use letters, numbers and spaces for the company name")
+    NOTED.append(["heph-company-add", args[0], name])
+    if any(t["slug"] == args[0] for t in heph_people([])["companies"]):
+        raise Refused("a company with that short name already exists")
+    heph_admin(["new-tenant", args[0]] + name.split())
+    return {"slug": args[0], "name": name}
+
+
+def heph_user_add(args):
+    """heph-user-add <slug> <hexemail> <hexnames> tenant_user|tenant_tech|tenant_admin; password on stdin"""
+    if len(args) != 4 or not SLUG_RE.fullmatch(args[0]) or args[3] not in ("tenant_user", "tenant_tech", "tenant_admin"):
+        raise UnexpectedArgs()
+    email, (first, last) = hx_email(args[1]), hx_names(args[2])
+    NOTED.append(["heph-user-add", args[0], email, args[3]])
+    if not any(t["slug"] == args[0] for t in heph_people([])["companies"]):
+        raise Refused("there is no company with that short name")
+    pw, generated = stdin_password()
+    heph_admin(["new-user", args[0], email, first, last, "--role", args[3], "--password"], stdin_text=pw)
+    return {"email": email, "company": args[0], "password": pw if generated else None}
+
+
+def heph_user_op(args):
+    """heph-user <hexemail> reset-totp|sign-out|set-password|reset-link"""
+    if len(args) != 2 or args[1] not in ("reset-totp", "sign-out", "set-password", "reset-link"):
+        raise UnexpectedArgs()
+    email, op = hx_email(args[0]), args[1]
+    NOTED.append(["heph-user", email, op])
+    if op == "reset-totp":
+        heph_admin(["reset-totp", email])
+        return {"email": email, "done": op}
+    if op == "sign-out":
+        out = heph_admin(["revoke-sessions", email])
+        return {"email": email, "done": op, "message": out.strip().splitlines()[-1][:120] if out.strip() else ""}
+    if op == "set-password":
+        pw, generated = stdin_password()
+        heph_admin(["set-password", email], stdin_text=pw)
+        return {"email": email, "done": op, "password": pw if generated else None}
+    out = heph_admin(["reset-link", email, "4"])
+    links = re.findall(r"https://\S+/reset/\S+", out)
+    if not links:
+        raise Refused("Hephaestus did not give a link")
+    return {"email": email, "done": op, "link": links[0], "hours": 4}
+
+
+# ---------- service versions and updates ----------
+# Three kinds of service, updated three ways:
+#   mailcow  - its containers move together with a mailcow release (update.sh)
+#   image    - a ready-made image pinned to a tag: a patched build of the same
+#              tag can be pulled; a newer version means editing the compose file
+#   built    - built on this server from a Dockerfile: a patched base image
+#              means rebuilding; Hephaestus has its own Deploy page
+# Registry checks reach Docker Hub / ghcr.io from the server, so their result
+# is kept in SVC_CACHE and refreshed every 6 hours or when Matt asks.
+SVC_CACHE = "/var/lib/argus/service-updates.json"
+SVC_MAX_AGE_S = 6 * 3600
+MAILCOW_DIR = "/opt/mailcow-dockerized"
+COMPOSE_ROOTS = ("/opt/",)
+# Images built by hand (docker build) rather than by a compose "build:" line.
+# Several compose projects use bss-php; a rebuild restarts all of them.
+LOCAL_BUILDS = {"bss-php:8.5": "/opt/web/php"}
+REG_ACCEPT = ("application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, "
+              "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json")
+
+
+def split_ref(ref):
+    """(registry, repository, tag) for an image reference. A pinned digest
+    (name:tag@sha256:...) is ignored here; see pinned_digest()."""
+    ref = ref.split("@", 1)[0]
+    name, _, tag = ref.rpartition(":") if ":" in ref.split("/")[-1] else (ref, "", "latest")
+    tag = tag or "latest"
+    parts = name.split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0]):
+        reg, repo = parts[0], "/".join(parts[1:])
+    else:
+        reg, repo = "docker.io", name if "/" in name else "library/" + name
+    return reg, repo, tag
+
+
+def reg_get(reg, repo, path, method="GET", accept=None):
+    if reg == "docker.io":
+        tok_url = "https://auth.docker.io/token?service=registry.docker.io&scope=repository:%s:pull" % repo
+        base = "https://registry-1.docker.io"
+    elif reg == "ghcr.io":
+        tok_url, base = "https://ghcr.io/token?scope=repository:%s:pull" % repo, "https://ghcr.io"
+    else:
+        raise ValueError("registry not supported")
+    with _urlreq.urlopen(tok_url, timeout=10) as r:
+        tok = json.loads(r.read().decode())["token"]
+    req = _urlreq.Request(base + "/v2/" + repo + path, method=method,
+                          headers={"Authorization": "Bearer " + tok, "Accept": accept or "application/json"})
+    return _urlreq.urlopen(req, timeout=15)
+
+
+def remote_digest(ref):
+    reg, repo, tag = split_ref(ref)
+    with reg_get(reg, repo, "/manifests/" + tag, "HEAD", REG_ACCEPT) as r:
+        d = r.headers.get("Docker-Content-Digest") or ""
+    return d if DIGEST_RE.fullmatch(d) else None
+
+
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def pinned_digest(ref):
+    d = ref.split("@", 1)[1] if "@" in ref else None
+    return d if d and DIGEST_RE.fullmatch(d) else None
+
+
+def local_digests(ref):
+    out = run(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", ref])
+    try:
+        return [d.split("@", 1)[1] for d in json.loads(out or "[]") if "@" in d]
+    except ValueError:
+        return []
+
+
+def tag_shape(tag):
+    """'2.11.7' -> (r'^(\\d+)\\.(\\d+)\\.(\\d+)$', (2,11,7)); '17-bookworm' -> ... ; None if no version."""
+    m = re.fullmatch(r"v?(\d+(?:\.\d+)*)(-[a-z0-9.-]+)?", tag)
+    if not m:
+        return None
+    nums = tuple(int(x) for x in m.group(1).split("."))
+    suffix = m.group(2) or ""
+    pat = r"^v?" + r"\.".join([r"(\d+)"] * len(nums)) + re.escape(suffix) + "$"
+    return pat, nums
+
+
+def newest_tag(ref):
+    """The highest tag of the same shape as the one in use (same suffix, same
+    number of parts), e.g. caddy 2.11.7 -> 2.12.0; postgres 17-bookworm -> 18-bookworm."""
+    reg, repo, tag = split_ref(ref)
+    shape = tag_shape(tag)
+    if not shape:
+        return None
+    pat, cur = shape
+    tags, path = [], "/tags/list?n=10000"
+    for _ in range(10):
+        with reg_get(reg, repo, path) as r:
+            tags += json.loads(r.read().decode()).get("tags") or []
+            link = r.headers.get("Link")
+        m = re.search(r"<([^>]+)>", link or "")
+        if not m:
+            break
+        path = m.group(1).split("/v2/" + repo, 1)[-1]
+    # Only the same major version, or the very next one: registries carry odd
+    # tags (dates, build numbers) that would otherwise look like huge versions.
+    best = cur
+    for t in tags:
+        m = re.fullmatch(pat, t)
+        if m:
+            v = tuple(int(x) for x in m.groups())
+            if v > best and v[0] in (cur[0], cur[0] + 1):
+                best = v
+    if best == cur:
+        return None
+    suffix = re.fullmatch(r"v?\d+(?:\.\d+)*(-[a-z0-9.-]+)?", tag).group(1) or ""
+    return ".".join(map(str, best)) + suffix, best[0] > cur[0]
+
+
+_COMPOSE_CFG = {}
+
+
+def compose_cfg(workdir):
+    if workdir not in _COMPOSE_CFG:
+        try:
+            p = subprocess.run(["docker", "compose", "config", "--format", "json"], cwd=workdir, capture_output=True, text=True, timeout=30)
+            _COMPOSE_CFG[workdir] = json.loads(p.stdout) if p.returncode == 0 else {}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            _COMPOSE_CFG[workdir] = {}
+    return _COMPOSE_CFG[workdir]
+
+
+def compose_build(workdir, service):
+    return ((compose_cfg(workdir).get("services") or {}).get(service) or {}).get("build")
+
+
+def compose_dockerfile(workdir, service):
+    b = compose_build(workdir, service)
+    if not b:
+        return None
+    ctx = b.get("context") if isinstance(b, dict) else b
+    return os.path.join(ctx, (b.get("dockerfile") if isinstance(b, dict) else None) or "Dockerfile")
+
+
+def compose_base_images(workdir, service, image=None):
+    """FROM images of a service built from a Dockerfile (its compose project's,
+    or LOCAL_BUILDS for images built by hand)."""
+    if image in LOCAL_BUILDS:
+        df = os.path.join(LOCAL_BUILDS[image], "Dockerfile")
+    else:
+        b = compose_build(workdir, service)
+        if not b:
+            return None
+        ctx = b.get("context") if isinstance(b, dict) else b
+        df = os.path.join(ctx, (b.get("dockerfile") if isinstance(b, dict) else None) or "Dockerfile")
+    bases = []
+    try:
+        with open(df) as f:
+            for line in f:
+                m = re.match(r"\s*FROM\s+(?:--platform=\S+\s+)?(\S+)", line, re.I)
+                if m and "$" not in m.group(1) and m.group(1).lower() != "scratch":
+                    bases.append(m.group(1))
+    except OSError:
+        return None
+    stages = set()
+    try:
+        with open(df) as f:
+            for line in f:
+                m = re.match(r"\s*FROM\s+.*\s+AS\s+(\S+)\s*$", line, re.I)
+                if m:
+                    stages.add(m.group(1).lower())
+    except OSError:
+        return None
+    return [x for x in bases if x.lower() not in stages]
+
+
+def mailcow_versions():
+    cur = None
+    try:
+        p = subprocess.run(["git", "-C", MAILCOW_DIR, "describe", "--tags", "--abbrev=0"], capture_output=True, text=True, timeout=15)
+        cur = p.stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    latest = None
+    try:
+        req = _urlreq.Request("https://api.github.com/repos/mailcow/mailcow-dockerized/releases/latest",
+                              headers={"User-Agent": "argus-helper", "Accept": "application/vnd.github+json"})
+        with _urlreq.urlopen(req, timeout=15) as r:
+            latest = json.loads(r.read().decode()).get("tag_name")
+    except Exception:
+        pass
+    return cur, latest
+
+
+def heph_deployed():
+    try:
+        return open(HEPH_VERSION_FILE).read().strip()[:12] or None
+    except OSError:
+        return None
+
+
+DB_IMAGES = ("postgres", "mysql", "mariadb")
+
+
+def compose_dir_ok(wd):
+    """A compose folder Argus may act in: a real folder under /opt (not
+    mailcow's), owned by root and writable by nobody else. Returns the
+    resolved path or None."""
+    if not wd:
+        return None
+    rp = os.path.realpath(wd)
+    if not re.fullmatch(r"/opt/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*", rp) or rp == MAILCOW_DIR or rp.startswith(MAILCOW_DIR + "/"):
+        return None
+    try:
+        st = os.stat(rp)
+    except OSError:
+        return None
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        return None
+    return rp
+
+
+SVC_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# What uses each database, so a by-hand upgrade stops it first.
+DB_USERS = {"hephaestus-prod-db-1": "the Hephaestus app (cd /opt/hephaestus/deploy && docker compose stop app)",
+            "folio-db": "the Folio site (cd /opt/sites && docker compose stop php)",
+            "nds-db": "the NewsDesk API (cd /opt/newsdesk && docker compose stop api)"}
+
+
+def how_to(kind, c, newer=None, major=False):
+    """The steps to do it by hand (shown to Matt, never run). Commands are only
+    built from checked folder and service names, each one quoted."""
+    q = _shlex.quote
+    wd = compose_dir_ok(c.get("workdir"))
+    svc = c.get("service") if SVC_NAME_RE.fullmatch(c.get("service") or "") else None
+    name = c.get("name") if CONTAINER_RE.fullmatch(c.get("name") or "") else None
+    if kind == "mailcow":
+        return ["Argus does this with Update Mail System: it takes a mail backup, then runs mailcow's own updater (twice, if the updater first updates itself).",
+                "By hand: cd " + MAILCOW_DIR + " && ./update.sh --check, then ./update.sh (answer its questions).",
+                "Mail is unavailable for a few minutes while the containers are replaced."]
+    if kind == "heph":
+        return ["Hephaestus is updated from your code on the Hephaestus page (Deploy), which checks, builds and rolls back by itself if needed."]
+    if kind == "rebuild-image":
+        img, src = c["image"], LOCAL_BUILDS[c["image"]]
+        users = image_users(img)
+        recreate = " ; ".join("(cd " + q(w) + " && docker compose up -d --no-deps --force-recreate " + q(sv) + ")" for w, sv, _ in users)
+        return ["Argus does this with Update: it keeps the current build as " + img.split(":")[0] + ":before-update, rebuilds " + img
+                + " from " + src + " on the newest base image, then restarts every container that uses it.",
+                "By hand: docker tag " + q(img) + " " + q(img.split(":")[0] + ":before-update") + " && docker build --pull -t " + q(img) + " " + q(src)
+                + (" && " + recreate if recreate else ""),
+                "To undo: docker tag " + q(img.split(":")[0] + ":before-update") + " " + q(img) + (" && " + recreate if recreate else "")]
+    if not (wd and svc):
+        return ["This service's folder can't be used safely from here (it must be a root-owned folder under /opt), so no commands are given. Ask the server chat."]
+    if kind == "repin":
+        old = c["image"]
+        new = old.split("@", 1)[0] + "@" + newer
+        return ["This service is pinned to an exact build in " + wd + "'s compose file, on purpose: it can only change when the file says so.",
+                "1. In " + wd + "'s compose file, change the image line for " + svc + " from " + old + " to " + new,
+                "2. cd " + q(wd) + " && docker compose pull " + q(svc) + " && docker compose up -d --no-deps " + q(svc),
+                "3. Check the service works. To undo, put the old line back and run step 2 again."]
+    if kind == "recreate":
+        return ["Argus does this with Update: it restarts this container onto the image that is already downloaded.",
+                "By hand: cd " + q(wd) + " && docker compose up -d --no-deps --force-recreate " + q(svc)]
+    if kind == "patched":
+        return ["Argus does this with Update: it keeps the current image as argus-rollback/" + (name or "?").lower() + ":before-update, downloads the patched build of the same version and restarts only this service.",
+                "By hand: cd " + q(wd) + " && docker compose pull " + q(svc) + " && docker compose up -d --no-deps " + q(svc)]
+    if kind == "rebuild":
+        return ["Argus does this with Update: it rebuilds this service on the newest build of its base image, then restarts it.",
+                "By hand: cd " + q(wd) + " && docker compose build --pull " + q(svc) + " && docker compose up -d --no-deps " + q(svc)]
+    if kind == "newer-base":
+        df = c.get("dockerfile") or "its Dockerfile"
+        rebuild = ("docker build --pull -t " + q(c["image"]) + " " + q(LOCAL_BUILDS[c["image"]]) + ", then restart its containers (see the Update steps above)"
+                   if c["image"] in LOCAL_BUILDS else "cd " + q(wd) + " && docker compose build --pull " + q(svc) + " && docker compose up -d --no-deps " + q(svc))
+        return ["1. Read the release notes for " + newer + " (for PHP: the migration guide for the new version).",
+                "2. In " + df + ", change the FROM line to the new tag (" + newer + ").",
+                "3. Rebuild: " + rebuild,
+                "4. Check the sites or apps that use it. To undo, put the old FROM line back and rebuild the same way."] + (
+                ["Note: the image is called " + c["image"] + "; after this it holds the new version, so consider renaming the tag."] if c["image"] in LOCAL_BUILDS else [])
+    repo = split_ref(c["image"])[1].split("/")[-1]
+    stop = DB_USERS.get(name, "the apps that use it")
+    dump = "/root/" + (name or "db") + "-dump.sql"
+    if repo == "postgres" and major:
+        return ["1. Read the release notes for PostgreSQL " + newer + ".",
+                "2. Stop " + stop + " so nothing is written after the dump.",
+                "3. Dump everything: docker exec " + q(name) + " sh -c 'pg_dumpall -U \"$POSTGRES_USER\"' > " + q(dump),
+                "4. A new major PostgreSQL can't read the old data files. In " + wd + "'s compose file change the tag to " + newer
+                + " and give it a new, empty data volume. (From version 18 the volume is mounted at /var/lib/postgresql, not /var/lib/postgresql/data.)",
+                "5. Start it: cd " + q(wd) + " && docker compose up -d --no-deps " + q(svc),
+                "6. Load the dump: docker exec -i " + q(name) + " sh -c 'psql -U \"$POSTGRES_USER\" -d postgres' < " + q(dump),
+                "7. Start the apps again and check them. Keep the old volume and the dump until you're sure; to undo, put the old tag and volume back.",
+                "The server chat can do this with you; it isn't a one-button job because a failed migration can lose data."]
+    if repo in ("mysql", "mariadb") and major:
+        tool, pw = ("mariadb-dump", "$MARIADB_ROOT_PASSWORD") if repo == "mariadb" else ("mysqldump", "$MYSQL_ROOT_PASSWORD")
+        steps = ["1. Read the release notes for " + repo + " " + newer + "."]
+        if repo == "mysql":
+            steps.append("Note: MySQL 9.x releases are short-lived Innovation releases; 8.4 is the long-term (LTS) line, which Argus keeps patched. Staying on 8.4 is the normal choice.")
+        steps += ["2. Stop " + stop + ".",
+                  "3. This database isn't on the Backups page, so dump its own databases first (not the built-in mysql schema): docker exec " + q(name)
+                  + " sh -c '" + tool + " -uroot -p\"" + pw + "\" --single-transaction --routines --triggers --events --databases <your databases>' > " + q(dump),
+                  "4. " + repo + " upgrades its data files in place when the new version first starts, but can't go back afterwards. In " + wd + "'s compose file change the tag to " + newer + ".",
+                  "5. cd " + q(wd) + " && docker compose pull " + q(svc) + " && docker compose up -d --no-deps " + q(svc) + ", then watch docker logs " + q(name) + " until the upgrade finishes.",
+                  "6. Start the apps again and check them. To undo: the old version can't read the upgraded files; restore the dump into a fresh volume on the old tag."]
+        return steps
+    pinned = pinned_digest(c["image"])
+    base_ref = c["image"].split("@", 1)[0].rsplit(":", 1)[0]
+    change = ("3. This service is pinned to an exact build, and Docker ignores the tag when a build is pinned. In " + wd + "'s compose file replace the whole image "
+              + c["image"] + " with " + base_ref + ":" + newer + "@<its build id>, which docker buildx imagetools inspect " + q(base_ref + ":" + newer)
+              + " shows as Digest (or drop the @sha256:... part to stop pinning)."
+              if pinned else "3. In " + wd + "'s compose file change the image tag for " + svc + " to " + newer + ".")
+    return ["1. Read the release notes for " + repo + " " + newer + " for anything that changed in how it is set up.",
+            "2. Back up anything that uses this service" + (" (it isn't on the Backups page: dump it first)" if repo in DB_IMAGES else "") + ".",
+            change,
+            "4. cd " + q(wd) + " && docker compose pull " + q(svc) + " && docker compose up -d --no-deps " + q(svc),
+            "5. Check the service works; to undo, put the old " + ("image line" if pinned else "tag") + " back and run step 4 again."]
+
+
+def check_services():
+    """The slow part: every container, its version, and what update (if any) exists."""
+    rows = container_table()
+    mc_cur, mc_latest = mailcow_versions()
+    images = {r["image"] for r in rows if r["project"] != "mailcowdockerized"}
+    built = {}
+    for r in rows:
+        if r["image"] in LOCAL_BUILDS or (r["project"] != "mailcowdockerized" and r["workdir"] and os.path.isdir(r["workdir"])
+                                          and (r["image"] == "hephaestus:local" or compose_build(r["workdir"], r["service"]))):
+            built.setdefault(r["image"], r)
+    remote, newer, bases = {}, {}, {}
+
+    def look(ref):
+        try:
+            remote[ref] = remote_digest(ref)
+        except Exception:
+            remote[ref] = None
+        try:
+            newer[ref] = newest_tag(ref)
+        except Exception:
+            newer[ref] = "unknown"
+
+    targets = set(i for i in images if i not in built)
+    for img, r in built.items():
+        bl = compose_base_images(r["workdir"], r["service"], img) or []
+        bases[img] = bl
+        targets.update(bl)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(look, sorted(targets)))
+
+    ids = {}
+    out_rows = []
+    for r in sorted(rows, key=lambda x: (x["project"] != "mailcowdockerized", x["name"])):
+        tag = split_ref(r["image"])[2]
+        item = {"name": r["name"], "image": r["image"], "version": tag, "kind": "image", "status": "unknown",
+                "detail": "", "can_update": False, "how": []}
+        if r["image"] not in ids:
+            ids[r["image"]] = image_id(r["image"])
+        stale_copy = ids[r["image"]] and r["image_id"] and ids[r["image"]] != r["image_id"] and r["project"] != "mailcowdockerized" \
+            and r["image"] != "hephaestus:local"
+        if stale_copy:
+            # The tag already points at a newer image (another project pulled it,
+            # or a rebuild missed this one): only a restart onto it is needed.
+            item.update(status="update", detail="running an older copy of " + r["image"] + "; restart it onto the current one",
+                        can_update=True, action="recreate", how=how_to("recreate", r))
+            out_rows.append(item)
+            continue
+        if r["project"] == "mailcowdockerized":
+            item["kind"] = "mailcow"
+            item["version"] = tag + (" · mailcow " + mc_cur if mc_cur else "")
+            if mc_cur and mc_latest:
+                if mc_latest != mc_cur:
+                    item.update(status="update", detail="mailcow " + mc_latest + " is out (you have " + mc_cur + ")", can_update=True,
+                                action="mailcow", how=how_to("mailcow", r))
+                else:
+                    item.update(status="current", detail="mailcow " + mc_cur + " is the latest release")
+            else:
+                item["detail"] = "could not reach mailcow's release list"
+        elif r["image"] == "hephaestus:local":
+            item.update(kind="built", version=heph_deployed() or "local", status="own",
+                        detail="your code; deploy new versions from the Hephaestus page", how=how_to("heph", r))
+        elif r["image"] in built:
+            item["kind"] = "built"
+            item["version"] = tag + " · built here"
+            bl = bases.get(r["image"]) or []
+            stale = [b for b in bl if remote.get(b) and remote[b] not in local_digests(b)]
+            newer_base = [(b, newer.get(b)) for b in bl if isinstance(newer.get(b), tuple)]
+            if not bl:
+                item.update(status="unknown", detail="its Dockerfile could not be read")
+            elif stale:
+                shared = [u_[2] for u_ in image_users(r["image"])] if r["image"] in LOCAL_BUILDS else [r["name"]]
+                item.update(status="update", detail="patched base image: " + ", ".join(stale)
+                            + ("; rebuilding restarts " + ", ".join(shared) if len(shared) > 1 else ""), can_update=True,
+                            action="rebuild-image" if r["image"] in LOCAL_BUILDS else "rebuild",
+                            how=how_to("rebuild-image" if r["image"] in LOCAL_BUILDS else "rebuild", r))
+            elif any(remote.get(b) is None for b in bl):
+                item.update(status="unknown", detail="could not check its base image")
+            else:
+                item.update(status="current", detail="base image " + ", ".join(bl) + " is current")
+            if newer_base:
+                b, (nv, maj) = newer_base[0]
+                df = os.path.join(LOCAL_BUILDS[r["image"]], "Dockerfile") if r["image"] in LOCAL_BUILDS else compose_dockerfile(r["workdir"], r["service"])
+                item["newer"] = {"version": nv, "major": maj, "how": how_to("newer-base", dict(r, dockerfile=df), split_ref(b)[1].split("/")[-1] + ":" + nv, maj)}
+                item["detail"] += "; base " + split_ref(b)[1].split("/")[-1] + " " + nv + " exists"
+        else:
+            pin = pinned_digest(r["image"])
+            item["version"] = tag + (" · pinned" if pin else "")
+            dig, loc = remote.get(r["image"]), ([pin] if pin else local_digests(r["image"]))
+            if dig is None:
+                item.update(status="unknown", detail="could not reach its registry")
+            elif pin and dig != pin:
+                # Pinned to an exact build on purpose, so a pull can't move it:
+                # the compose file has to name the new build.
+                item.update(status="update", detail="a patched build of " + tag + " is out; this service is pinned to an exact build, so the pin is changed by hand",
+                            how=how_to("repin", r, dig))
+            elif dig not in loc:
+                item.update(status="update", detail="a patched build of " + tag + " is out", can_update=True,
+                            action="pull", how=how_to("patched", r))
+            else:
+                item.update(status="current", detail=tag + " is the newest build of this version")
+            nt = newer.get(r["image"])
+            if isinstance(nt, tuple):
+                nv, maj = nt
+                item["newer"] = {"version": nv, "major": maj, "how": how_to("newer", r, nv, maj)}
+                if item["status"] == "current":
+                    item["status"] = "newer"
+                    item["detail"] = ("new major version " if maj else "newer version ") + nv + " exists (manual)"
+        out_rows.append(item)
+    return {"checked": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "mailcow": {"current": mc_cur, "latest": mc_latest}, "services": out_rows}
+
+
+def container_table():
+    """Every container: the image name it was created from (.Config.Image keeps
+    the name even after the tag has moved on to a newer image), the image it
+    actually runs, and its compose labels."""
+    ids = run(["docker", "ps", "-aq"], timeout=30)
+    if ids is None:
+        raise Refused("Docker did not answer")
+    if not ids.split():
+        return []
+    fmt = ("{{.Name}}\t{{.Config.Image}}\t{{.Image}}\t{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+           "{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}\t{{index .Config.Labels \"com.docker.compose.service\"}}")
+    out = run(["docker", "inspect", "--format", fmt] + ids.split(), timeout=60) or ""
+    rows = []
+    for line in out.splitlines():
+        p = line.split("\t")
+        if len(p) == 6 and CONTAINER_RE.fullmatch(p[0].lstrip("/")):
+            rows.append({"name": p[0].lstrip("/"), "image": p[1], "image_id": p[2], "project": p[3], "workdir": p[4], "service": p[5]})
+    return rows
+
+
+def image_id(ref):
+    out = run(["docker", "image", "inspect", "--format", "{{.Id}}", ref])
+    return out.strip() if out else None
+
+
+def image_users(image):
+    """(compose dir, service, container) of every container created from an
+    image name, whether or not it runs the newest copy; only safe folders."""
+    users = []
+    for r in container_table():
+        wd = compose_dir_ok(r["workdir"])
+        if r["image"] == image and wd and SVC_NAME_RE.fullmatch(r["service"]) and (wd, r["service"], r["name"]) not in users:
+            users.append((wd, r["service"], r["name"]))
+    return users
+
+
+def service_updates(args):
+    """service-updates [refresh]: cached unless older than 6 h or asked to refresh."""
+    if args not in ([], ["refresh"]):
+        raise UnexpectedArgs()
+    try:
+        age = time.time() - os.stat(SVC_CACHE).st_mtime
+        cached = json.load(open(SVC_CACHE))
+    except (OSError, ValueError):
+        age, cached = None, None
+    if cached and not args and age is not None and age < SVC_MAX_AGE_S:
+        return cached
+    data = check_services()
+    os.makedirs(os.path.dirname(SVC_CACHE), mode=0o700, exist_ok=True)
+    fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(SVC_CACHE), prefix=".svc-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o600)
+    os.rename(tmp, SVC_CACHE)
+    return data
+
+
+def service_update(args):
+    """service-update <container>|mailcow: apply an update Argus can make (background job)."""
+    target = one_arg(args)
+    if target == "mailcow":
+        NOTED.append(["service-update", "mailcow"])
+        script = ("set -eE -o pipefail; trap 'echo FAILED at line $LINENO' ERR; "
+                  "echo '1/3 Mail backup first (it can be restored if the update goes wrong)'; "
+                  "systemctl start mailcow-backup.service || { echo 'The backup failed; nothing was updated.'; exit 1; }; "
+                  "echo '2/3 mailcow update (mail is unavailable for a few minutes)'; "
+                  "cd " + MAILCOW_DIR + "; "
+                  # update.sh exits 2 after updating itself and asks to be run again.
+                  "rc=0; ./update.sh --force || rc=$?; "
+                  "if [ \"$rc\" = 2 ]; then echo 'mailcow updated its updater first; running it again'; ./update.sh --force; "
+                  "elif [ \"$rc\" != 0 ]; then echo \"mailcow's updater stopped (code $rc)\"; exit \"$rc\"; fi; "
+                  "echo '3/3 Checking every mail container is running'; sleep 20; "
+                  "bad=$(docker ps -a --filter label=com.docker.compose.project=mailcowdockerized --format '{{.Names}} {{.State}}' | grep -v ' running$' || true); "
+                  "if [ -n \"$bad\" ]; then echo \"Not running: $bad\"; exit 1; fi; "
+                  "rm -f " + SVC_CACHE + "; echo 'mailcow updated.'")
+        return start_job("svc-update", script, max_s=4 * 3600)
+    if not CONTAINER_RE.fullmatch(target):
+        raise UnexpectedArgs()
+    try:
+        cached = json.load(open(SVC_CACHE))
+    except (OSError, ValueError):
+        raise Refused("check for updates first")
+    item = next((x for x in cached.get("services", []) if x["name"] == target), None)
+    if not item or not item.get("can_update") or item.get("action") not in ("pull", "rebuild", "rebuild-image", "recreate"):
+        raise Refused("Argus has no update to apply for " + target + "; see How to Update")
+    row = next((r for r in container_table() if r["name"] == target), None)
+    wd = compose_dir_ok(row and row["workdir"])
+    svc = row and row["service"]
+    if not row or not wd or not SVC_NAME_RE.fullmatch(svc or ""):
+        raise Refused("that service can't be updated from here (its folder must be a root-owned folder under /opt)")
+    NOTED.append(["service-update", target, item["action"]])
+    q = _shlex.quote
+    if item["action"] == "rebuild-image":
+        img = row["image"]
+        if img not in LOCAL_BUILDS:
+            raise Refused("that image is not one Argus builds")
+        users = image_users(img)
+        keep = img.split(":")[0] + ":before-update"
+        restarts = "".join("(cd " + q(w) + " && docker compose up -d --no-deps --force-recreate " + q(sv) + "); " for w, sv, _ in users)
+        names = " ".join(q(n) for _, _, n in users)
+        script = ("set -eE -o pipefail; trap 'echo FAILED at line $LINENO; echo \"To undo: docker tag " + keep + " " + img + ", then restart the same containers\"' ERR; "
+                  "echo '1/3 Rebuilding " + img + " on the newest base image (the current build is kept as " + keep + ")'; "
+                  "docker tag " + q(img) + " " + q(keep) + "; echo \"before: $(docker image inspect --format '{{.Id}}' " + q(img) + ")\"; "
+                  "docker build --pull -t " + q(img) + " " + q(LOCAL_BUILDS[img]) + "; "
+                  "echo \"after: $(docker image inspect --format '{{.Id}}' " + q(img) + ")\"; "
+                  "echo '2/3 Restarting every container that uses it'; " + restarts +
+                  "echo '3/3 Checking they are running'; sleep 8; bad=''; "
+                  "for c in " + names + "; do [ \"$(docker inspect --format '{{.State.Running}}' \"$c\")\" = true ] || bad=\"$bad $c\"; done; "
+                  "if [ -n \"$bad\" ]; then echo \"Not running:$bad\"; false; fi; "
+                  "rm -f " + SVC_CACHE + "; echo 'Updated.'")
+        return start_job("svc-update", script, max_s=4 * 3600)
+    keep = "argus-rollback/" + target.lower() + ":before-update"
+    if item["action"] == "recreate":
+        step = ("echo '1/3 Nothing to download: the current image is already here (the running one is kept as " + keep + ")'; "
+                "docker tag \"$(docker inspect --format '{{.Image}}' " + q(target) + ")\" " + q(keep) + "; ")
+    elif item["action"] == "pull":
+        step = ("echo '1/3 Getting the patched image (the current one is kept as " + keep + ")'; "
+                "docker tag \"$(docker inspect --format '{{.Image}}' " + q(target) + ")\" " + q(keep) + "; "
+                "docker compose pull " + q(svc) + "; ")
+    else:
+        step = ("echo '1/3 Rebuilding on the newest base image (the current one is kept as " + keep + ")'; "
+                "docker tag \"$(docker inspect --format '{{.Image}}' " + q(target) + ")\" " + q(keep) + "; "
+                "docker compose build --pull " + q(svc) + "; ")
+    script = ("set -eE -o pipefail; trap 'echo FAILED at line $LINENO' ERR; cd " + q(wd) + "; "
+              "echo \"before: $(docker inspect --format '{{.Image}}' " + q(target) + ")\"; " + step +
+              "echo '2/3 Restarting " + svc + " on it'; docker compose up -d --no-deps --force-recreate " + q(svc) + "; "
+              "echo \"after: $(docker inspect --format '{{.Image}}' " + q(target) + ")\"; "
+              "echo '3/3 Checking it is running'; sleep 8; "
+              "[ \"$(docker inspect --format '{{.State.Running}}' " + q(target) + ")\" = true ] || { echo 'It is not running; see the log above.'; false; }; "
+              "rm -f " + SVC_CACHE + "; echo 'Updated.'")
+    return start_job("svc-update", script, max_s=4 * 3600)
+
+def status(args):
+    if args:
+        raise UnexpectedArgs()
+    ex = ThreadPoolExecutor(max_workers=len(SECTIONS))
+    futs = {k: ex.submit(safe, fn) for k, fn in SECTIONS.items()}
+    wait(futs.values(), timeout=DEADLINE_S)
+    out = {"generated": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+    for k, f in futs.items():
+        out[k] = f.result() if f.done() else None
+    ex.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
+ACTIONS = {
+    "status": status,
+    "activity": activity,
+    "updates-list": updates_list,
+    "backup-list": backup_list,
+    "rollback-list": rollback_list,
+    "job-status": job_status,
+    "service-restart": service_restart,
+    "backup-run": backup_run,
+    "updates-apply": updates_apply,
+    "reboot": reboot,
+    "reboot-cancel": reboot_cancel,
+    "heph-rollback": heph_rollback,
+    "note-file": note_file,
+    "file-commit": file_commit,
+    "file-discard": file_discard,
+    "file-mkdir": file_mkdir,
+    "heph-stage": heph_stage,
+    "heph-diff": heph_diff,
+    "heph-deploy": heph_deploy,
+    "mail-overview": mail_overview,
+    "mail-dkim": mail_dkim,
+    "mailbox-add": mailbox_add,
+    "mailbox-set": mailbox_set,
+    "mailbox-password": mailbox_password,
+    "mailbox-delete": mailbox_delete,
+    "app-passwd-add": app_passwd_add,
+    "app-passwd-delete": by_id("delete/app-passwd", "app-passwd-delete"),
+    "alias-add": alias_add,
+    "alias-delete": by_id("delete/alias", "alias-delete"),
+    "mailq-flush": mailq_flush,
+    "mailq-delete": mailq_delete,
+    "mailq-deliver": mailq_deliver,
+    "quarantine-release": quarantine_release,
+    "quarantine-delete": by_id("delete/qitem", "quarantine-delete"),
+    "sites-list": sites_list,
+    "caddy-show": caddy_show,
+    "caddy-check": caddy_check,
+    "caddy-apply": caddy_apply,
+    "caddy-history": caddy_history,
+    "caddy-rollback": caddy_rollback,
+    "cert-renew": cert_renew,
+    "site-add": site_add,
+    "acct-list": acct_list,
+    "acct-folders": acct_folders,
+    "acct-mount-all": acct_mount_all,
+    "acct-add": acct_add,
+    "acct-set": acct_set,
+    "acct-delete": acct_delete,
+    "key-add": key_add,
+    "key-remove": key_remove,
+    "heph-people": heph_people,
+    "heph-staff-add": heph_staff_add,
+    "heph-company-add": heph_company_add,
+    "heph-user-add": heph_user_add,
+    "heph-user": heph_user_op,
+    "service-updates": service_updates,
+    "service-update": service_update,
+}
+
+
+def log(session, action, args, result):
+    os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+    ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as f:
+        f.write(json.dumps({"time": ts, "session": session, "action": action,
+                            "args": [a[:64] if i == 0 or not action.startswith(("note-file", "file-", "mail", "app-", "alias", "quarantine")) else a[:330] for i, a in enumerate(args[:8])], "result": result}) + "\n")
+
+
+def main(argv):
+    if os.geteuid() != 0:
+        print("argus-helper must run through sudo", file=sys.stderr)
+        return 2
+    if len(argv) < 3 or argv[0] != "--session" or not SESSION_RE.fullmatch(argv[1]):
+        print("usage: argus-helper --session <id> <action> [args]", file=sys.stderr)
+        return 2
+    session, action, args = argv[1], argv[2], argv[3:]
+    if action not in ACTIONS:
+        log(session, action[:40], [], "refused: unknown action")
+        print("unknown action", file=sys.stderr)
+        return 2
+    try:
+        out = ACTIONS[action](args)
+    except UnexpectedArgs:
+        log(session, action, [], "refused: unexpected args")
+        print("unexpected arguments", file=sys.stderr)
+        return 2
+    except Refused as e:
+        log(session, action, NOTED[0] if NOTED else args, "refused: " + str(e)[:200])
+        print(str(e), file=sys.stderr)
+        return 3
+    except Exception as e:
+        log(session, action, NOTED[0] if NOTED else args, "failed: " + type(e).__name__ + (": " + str(e)[:120] if isinstance(e, OSError) else ""))
+        print("action failed", file=sys.stderr)
+        return 1
+    log(session, action, NOTED[0] if NOTED else args, "ok")
+    json.dump(out, sys.stdout)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    # Leave now rather than wait for any section still running past the deadline.
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1494,3 +1494,92 @@ sort (3663); plus the new test. The tests pass (34 passed). This was a code revi
 - The dashboard tile still adds up tries only, so a key-only row adds 0 there (R-H1h, unchanged).
 
 Result: CLEAR (no Critical, High or Medium; R-H1c, R-H1d, R-H1e and R-H1g are resolved in code; unfinished: the deploy re-apply and the R-H1f wording)
+
+## Sorting across all addresses and blocking by hand (attacks sort, blockByHand) - Sentinel, 2026-11-01
+
+Scope: argus-helper `_ip_sort_key`, `ATTACK_SORTS`, `attacks()`; app.js `blockByHand` and `blockIt`'s new `from`
+parameter. Also read the call path these rely on: main.js `argus:helper` (strings only, at most 4 args),
+native/src/lib.rs (each arg limited to `[A-Za-z0-9._-]`), `unhex`, `ip_info`, `block_add`. Tests: 35 passed. This
+was a code review; nothing was run on the server.
+
+| Item | Status | Evidence |
+|---|---|---|
+| attacks args | Sound | Exactly 0, 1 or 3 args; days in {1,7,30}; column must be a key of `ATTACK_SORTS`, direction in {asc, desc}. Unknown values raise UnexpectedArgs before any log is read. No arg reaches a command line. |
+| Sort keys | Sound | Each key returns one type per column (str, int or tuple), so the sort can't raise on mixed types. `blocked` is still marked on the 400 sent, after sorting. Cost is one extra sort of rows already built. |
+| blockByHand input | Sound | Shape check in the renderer, hex-encoded, then `ip_info` (plain_ip: public only, own addresses refused) and `block_add` (all server checks unchanged and still authoritative). Dialog text is set with textContent. The note is filtered in the renderer and again by NOTE_RE. |
+| Typed confirmation | Sound | Unchanged: BLOCK must be typed for any network, and again for an address where a mailbox signed in. |
+
+### S-M1. Medium - Detection visibility - argus-helper attacks() (sort branch); app.js loadSignins
+Description and impact: Re-audit 5 recorded that a "Used Your SSH Key" row (`key_ok`, Matt's key accepted from an
+address that never finished signing in) can't fall outside the 400 shown. With a sort column, `rows` is ordered only
+by that column, so on a 7 or 30 day view with more than 400 addresses a `key_ok` row (and signed-in rows) can be cut
+from the response. Nothing else shows it: the dashboard tile counts tries only (R-H1h). The one sign that Matt's key
+is out can vanish from the page just because he sorted by IP, place or last seen.
+Remediation (server; keep the guarantee whatever the sort):
+```python
+    if sort:
+        key = ATTACK_SORTS[sort[0]]
+        filled = [r for r in rows if key(r) != ""]
+        filled.sort(key=key, reverse=sort[1] == "desc")
+        rows = filled + [r for r in rows if key(r) == ""]
+        # Rows that must always be seen go into the 400 sent, whatever the sort.
+        must = [r for r in rows if r["key_ok"]]
+        rest = [r for r in rows if not r["key_ok"]]
+        rows = must + rest
+    total["key_ok"] = sum(1 for r in rows if r["key_ok"])
+```
+(The renderer sorts the rows it gets again, so pinned rows still show in sorted position; they are just never left
+out.) In app.js, when `d.total.key_ok` is non-zero, say so in `si-summary`, e.g. "N addresses used your SSH key",
+so the count is visible even before scrolling. Doing the same for `signed_in` rows is optional; `key_ok` is required.
+Verification: add a test with 450 rows where one `key_ok` row sorts last by `ip asc` and by `last desc`; assert it is
+in `rows` (length 400) for every column and direction, and that `total.key_ok == 1`. Check that the 35 tests still
+pass.
+
+### S-L1. Low - Input validation / false sense of protection - block_add (reached by blockByHand)
+Description and impact: the by-hand path is the first one that lets Matt type any address. `::ffff:203.0.113.7`
+passes the renderer's shape check. `ip_info` normalises it to 203.0.113.7 and shows that address's owner and place,
+and `block_add` accepts `::ffff:203.0.113.7/128` (Python 3.13 says it is global). The block goes in the IPv6 set,
+but IPv4 traffic from 203.0.113.7 arrives as IPv4 and is never matched, so the list says it is blocked when nothing
+is. The server, gateway and own-network checks compare `version == 6` entries only, so they are skipped for it too.
+That is harmless only because the entry matches nothing.
+Remediation (server, in block_add after `ip_network`):
+```python
+    MAPPED = _ipaddress.ip_network("::ffff:0:0/96")
+    if net.version == 6 and net.overlaps(MAPPED):
+        raise Refused("type the IPv4 address itself (for example 203.0.113.7), not its ::ffff: form")
+```
+Optional, in blockByHand: refuse `/^::ffff:/i` before calling ip-info, with the same message.
+Verification: test that block-add refuses `::ffff:8.8.8.8/128` and `::ffff:8.8.0.0/112`, and that `8.8.8.8/32` is
+still accepted. By hand in Argus: typing `::ffff:8.8.8.8` gives the refusal and adds nothing.
+
+### S-I1. Informational - Accuracy of the confirmation - app.js blockByHand / blockIt
+- For a typed network, the owner and place shown come from `ip-info` on the typed address. A /16 typed by hand can
+  span several registry allocations, so the dialog may name only one owner. Suggest calling ip-info on the network
+  address and, when `who.registry.networks` holds no network that contains the requested one, adding "this range
+  is wider than one owner's network" to the dialog.
+- `1.2.3.4/24` is confirmed and reported as typed, while the server stores `1.2.3.0/24` (non-strict). It is the same
+  set of addresses, but the success message should use `res.blocked` rather than the typed string.
+
+### S-I2. Informational - Attacker-influenced ordering - ATTACK_SORTS users/place/network
+Usernames (USER_RE-filtered) and volume are attacker-chosen, so under the `users` sort an attacker can pick names
+that put them first or push other rows past the 400. This is the same kind of thing as the default "busiest" order,
+and the label already says "First 400 of N by ...". No action beyond S-M1.
+
+Result: ISSUES FOUND (Medium: S-M1; Low: S-L1; Informational: S-I1, S-I2)
+
+## Re-audit (S-M1, S-L1, S-I1 fixes, cycle 1) - Sentinel, 2026-11-01
+
+I read the changed lines: the attacks() sort branch and `total["key_ok"]`, block_add's mapped-address refusal,
+blockByHand and the blockIt success message, and the app.js summary line. Tests: server 37 passed, screen 7 passed.
+This was a code review; nothing was run on the server.
+
+| Item | Status | Evidence |
+|---|---|---|
+| S-M1 key_ok rows always sent | Fixed | After the sort, every `key_ok` row is kept, the rest is cut to `400 - flagged`, and the kept rows go first in their sorted order. The `rows[:400]` cut afterwards therefore always holds them. If there were more than 400 `key_ok` rows, the cut would drop some, but `total.key_ok` would still count them all. The default order already put them first, so it is unchanged. |
+| S-M1 count shown | Fixed | `total["key_ok"]` counts every row, not only the 400 sent. The summary names the count and points to the pill. |
+| S-L1 mapped IPv6 | Fixed | block_add refuses any v6 network overlapping `::ffff:0:0/96`. The check comes after parsing and before the is_global and own-network checks, so nothing slips past it. Tested with `::ffff:46.3.3.3`. |
+| S-I1 stored network shown | Fixed | The success message uses `res.blocked`. The IPv4 network address is worked out in the renderer for the confirm. Badly formed octets such as `1.2.3.300/24` can't reach that maths: ip-info refuses them first ("not a public address") and blockByHand stops there. Other ip-info failures (registry down) carry on, and block_add parses the value itself. |
+| S-I1 owner for a wide range | Open (Informational) | The confirm still names the owner of the typed address only. This was a suggestion, not required. |
+| ip-info refusal stops early | Sound | A private address, or one of Matt's own, stops before any confirm (screen test). |
+
+Result: CLEAR (S-M1 and S-L1 fixed. Still open: S-I1, the owner wording for a range wider than one owner's network (Informational), and S-I2 (Informational, no action). Unfinished from earlier: the deploy re-apply and the R-H1f wording.)

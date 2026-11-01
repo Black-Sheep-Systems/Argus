@@ -187,3 +187,11 @@ table.plain td:last-child { text-align: left; }
 #si-timeline .axis { stroke: var(--line); stroke-width: 1; }
 #si-timeline .tick { font-size: 7px; fill: var(--muted); }
 #si-timeline .tick.end { text-anchor: end; }
+
+/* Sortable column headings (Sign-In Attempts > Addresses) */
+.th-sort { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: inherit; color: inherit; }
+.th-sort:hover { color: var(--text, inherit); text-decoration: underline; }
+.th-sort:focus-visible { outline: 3px solid var(--link); outline-offset: 2px; border-radius: 2px; }
+th[aria-sort="ascending"] .sort-mark::after { content: "▲"; font-size: 10px; }
+th[aria-sort="descending"] .sort-mark::after { content: "▼"; font-size: 10px; }
+th[aria-sort="ascending"], th[aria-sort="descending"] { color: var(--text, inherit); }

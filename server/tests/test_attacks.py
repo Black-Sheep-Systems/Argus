@@ -112,6 +112,37 @@ class Attacks(unittest.TestCase):
         self.assertEqual(len(rows), 400)
         self.assertEqual(rows[0]["ip"], "45.33.8.2")
 
+    def test_sorting_picks_the_400_shown_from_every_address(self):
+        lines = [f"{T + i}.000001 host sshd-session[{i}]: Invalid user a from 45.{34 + i // 250}.{i % 250}.1 port {i}" for i in range(450)]
+        lines += [f"{T + 999 + k}.000001 host sshd-session[9]: Invalid user b from 45.40.0.9 port {k}" for k in range(61)]
+        big = "\n".join(lines)
+        h.run = lambda cmd, timeout=20, stderr_too=False: big if cmd[:1] == ["journalctl"] else ""
+        top = h.attacks(["30", "tries", "desc"])
+        self.assertEqual(top["rows"][0]["ip"], "45.40.0.9")
+        self.assertEqual(top["sort"], {"key": "tries", "dir": "desc"})
+        ips = [r["ip"] for r in h.attacks(["30", "ip", "asc"])["rows"]]
+        self.assertEqual(ips[:2], ["45.34.0.1", "45.34.1.1"])
+        self.assertEqual(len(ips), 400)
+        for bad in (["30", "tries"], ["30", "rm", "asc"], ["30", "tries", "up"]):
+            with self.assertRaises(h.UnexpectedArgs):
+                h.attacks(bad)
+
+    def test_your_key_row_is_kept_under_every_sort(self):
+        lines = [f"{T + i}.000001 host sshd-session[{i}]: Invalid user a from 45.{34 + i // 250}.{i % 250}.1 port {i}" for i in range(450)
+                 for _ in (0, 1)]
+        lines.append(f"{T + 999}.000001 host sshd-session[9]: Partial publickey for mattridge from 99.1.1.1 port 22 ssh2")
+        big = "\n".join(lines)
+        h.run = lambda cmd, timeout=20, stderr_too=False: big if cmd[:1] == ["journalctl"] else ""
+        for col in h.ATTACK_SORTS:
+            for d in ("asc", "desc"):
+                res = h.attacks(["30", col, d])
+                ips = [r["ip"] for r in res["rows"]]
+                self.assertIn("99.1.1.1", ips, (col, d))
+                self.assertEqual(len(ips), 400)
+                self.assertEqual(res["total"]["key_ok"], 1)
+        ips = [r["ip"] for r in h.attacks(["30", "ip", "asc"])["rows"]]
+        self.assertEqual(ips[-1], "99.1.1.1")                     # kept, and still in IP order (last)
+
     def test_signed_in_address_with_refused_tries_is_listed_and_marked(self):
         rows = self.result()
         self.assertTrue(rows["45.33.1.90"]["signed_in"])
@@ -370,6 +401,11 @@ class Intel(unittest.TestCase):
         self.assertIn(h.SIGNED_IN_REFUSAL, str(cm.exception))
         r, _ = self._block_with({}, "46.5.9.0/24", confirm=True, other=other)
         self.assertEqual(r["blocked"], "46.5.9.0/24")
+
+    def test_ipv4_written_as_ipv6_is_refused(self):
+        with self.assertRaises(h.Refused) as cm:
+            self._block_with({}, "::ffff:46.3.3.3")
+        self.assertIn("plain IPv4", str(cm.exception))
 
     def test_block_inside_an_existing_block_is_refused(self):
         with self.assertRaises(h.Refused) as cm:

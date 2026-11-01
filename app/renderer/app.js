@@ -1185,29 +1185,111 @@ function drawMap(rows, server, route) {
   svg.replaceChildren(...parts);
 }
 
-async function loadSignins() {
+// resort: the same period again in a new order. Details, a route being traced
+// and the block list stay as they are.
+async function loadSignins({ resort = false } = {}) {
   const days = $('si-days').value;
   const my = ++siSeq;
-  trSeq++;                                   // a route still being traced belongs to the old view
-  $('si-detail').hidden = true;
+  if (!resort) {
+    siData = null;                           // nothing old to re-sort while this period loads
+    trSeq++;                                 // a route still being traced belongs to the old view
+    $('si-detail').hidden = true;
+    loadBlocked();
+  }
   $('si-summary').textContent = 'Reading the server logs…';
   $('si-rows').replaceChildren(row([el('span', 'Loading…', 'muted'), '', '', '', '', '', '', '']));
-  loadBlocked();
   let d;
-  try { d = await call('attacks', [days]); }
-  catch (err) { if (my === siSeq) { $('si-summary').textContent = 'Could not read the sign-in logs: ' + errText(err); $('si-rows').replaceChildren(); } return; }
+  try { d = await call('attacks', siSort ? [days, siSort.key, siSort.dir === 1 ? 'asc' : 'desc'] : [days]); }
+  catch (err) { if (my === siSeq) { siData = null; $('si-summary').textContent = 'Could not read the sign-in logs: ' + errText(err); $('si-rows').replaceChildren(); } return; }
   if (my !== siSeq) return;                  // a newer request has been made since
   siData = d;
   const t = d.total;
   const span = { 1: 'the last 24 hours', 7: 'the last 7 days', 30: 'the last 30 days' }[d.days];
   $('si-summary').textContent = `In ${span}: ${t.addresses.toLocaleString()} addresses made ${t.ssh.toLocaleString()} SSH attempts`
     + (t.mail ? ` and ${t.mail.toLocaleString()} mail login failures` : '') + (t.probes ? `, plus ${t.probes.toLocaleString()} scans that never got as far as a sign-in` : '')
-    + `. All refused.${t.returning ? ` ${t.returning.toLocaleString()} of them came back on more than one day.` : ''}${t.bans ? ` mailcow banned ${t.bans} ${t.bans === 1 ? 'address' : 'addresses'} for repeated mail failures.` : ''}`;
+    + `. All refused.${t.key_ok ? ` ${t.key_ok} ${t.key_ok === 1 ? 'address' : 'addresses'} used your SSH key without the code: see Used Your SSH Key below.` : ''}${t.returning ? ` ${t.returning.toLocaleString()} of them came back on more than one day.` : ''}${t.bans ? ` mailcow banned ${t.bans} ${t.bans === 1 ? 'address' : 'addresses'} for repeated mail failures.` : ''}`;
   $('si-countries').textContent = d.countries.length ? 'Most attempts from: ' + d.countries.slice(0, 8).map(([c, n]) => `${c} (${n.toLocaleString()})`).join(', ') : '';
   $('si-credit').textContent = (d.geo?.credit || '') + (d.geo?.updated ? ` · updated ${d.geo.updated}` : ' · location data not downloaded yet') + ' · Map: Natural Earth.';
-  $('si-count').textContent = d.rows.length < t.addresses ? `Top ${d.rows.length} of ${t.addresses.toLocaleString()} shown here and on the map (your key used and signed-in addresses first, then the busiest)` : `${t.addresses.toLocaleString()}`;
+  const sortName = d.sort && document.querySelector(`#si-table th[data-sort="${d.sort.key}"] .th-sort`)?.textContent;
+  $('si-count').textContent = d.rows.length >= t.addresses ? `${t.addresses.toLocaleString()} ${t.addresses === 1 ? 'address' : 'addresses'}`
+    : d.sort ? `First ${d.rows.length} of ${t.addresses.toLocaleString()} by ${sortName} (${d.sort.dir === 'asc' ? 'ascending' : 'descending'})${t.key_ok ? ', plus any that used your key' : ''}, shown here and on the map`
+    : `Top ${d.rows.length} of ${t.addresses.toLocaleString()} shown here and on the map (your key used and signed-in addresses first, then the busiest)`;
   drawMap(d.rows, d.server, null);
-  $('si-rows').replaceChildren(...d.rows.map((r) => {
+  renderSiRows();
+}
+
+// Sorting the Addresses list. When every address fits on the page, sorting
+// happens here; when the server had more than the 400 it sends, it is asked
+// again for the first 400 in the chosen order, so sorting covers them all.
+let siSort = null;                           // { key, dir: 1 | -1 } or null for the server's order
+function ipKey(ip) {
+  ip = String(ip).toLowerCase();
+  if (!ip.includes(':')) return '4' + ip.split('.').map((p) => p.padStart(3, '0')).join('.');
+  const [a, b = ''] = ip.split('::');
+  const head = a ? a.split(':') : [], tail = b ? b.split(':') : [];
+  const full = ip.includes('::') ? [...head, ...Array(Math.max(0, 8 - head.length - tail.length)).fill('0'), ...tail] : head;
+  return '6' + full.map((p) => p.padStart(4, '0')).join(':');
+}
+const SI_SORTS = {
+  ip: { first: 1, val: (r) => ipKey(r.ip) },
+  place: { first: 1, val: (r) => [r.city, r.country].filter(Boolean).join(', ').toLowerCase() },
+  network: { first: 1, val: (r) => (r.network || '').toLowerCase() },
+  tries: { first: -1, val: (r) => [r.tries || 0, r.probes || 0] },
+  visits: { first: -1, val: (r) => [r.visits || 0, r.days || 0] },
+  users: { first: 1, val: (r) => (r.users?.[0] || '').toLowerCase() },
+  last: { first: -1, val: (r) => r.last || 0 },
+};
+function cmp(a, b) {
+  if (Array.isArray(a)) { for (let i = 0; i < a.length; i++) { const c = cmp(a[i], b[i]); if (c) return c; } return 0; }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+function sortedSiRows() {
+  const rows = siData?.rows || [];
+  const rank = (r, i) => (Number.isInteger(r.rank) ? r.rank : i);   // the server's default order
+  if (!siSort) return rows.map((r, i) => [rank(r, i), r]).sort((x, y) => x[0] - y[0]).map((x) => x[1]);
+  const { val } = SI_SORTS[siSort.key];
+  const empty = (v) => v === '';             // empty names and places go last either way
+  return rows.map((r, i) => [val(r), rank(r, i), r]).sort((x, y) => {
+    if (empty(x[0]) !== empty(y[0])) return empty(x[0]) ? 1 : -1;
+    return cmp(x[0], y[0]) * siSort.dir || x[1] - y[1];
+  }).map((x) => x[2]);
+}
+function setSiSort(key) {
+  const first = SI_SORTS[key].first;
+  if (!siSort || siSort.key !== key) siSort = { key, dir: first };
+  else if (siSort.dir === first) siSort = { key, dir: -first };
+  else siSort = null;                        // third click: back to the server's order
+  sayHowSorted();
+  showSortState();
+  if (!siData || siData.rows.length < siData.total.addresses) loadSignins({ resort: true });
+  else renderSiRows();
+}
+function sayHowSorted() {
+  const label = siSort && document.querySelector(`#si-table th[data-sort="${siSort.key}"] .th-sort`)?.textContent;
+  $('si-sort-say').textContent = siSort ? `Sorted by ${label}, ${siSort.dir === 1 ? 'ascending' : 'descending'}` : 'Default order';
+}
+function showSortState() {
+  document.querySelectorAll('#si-table th[data-sort]').forEach((th) => {
+    th.setAttribute('aria-sort', siSort?.key === th.dataset.sort ? (siSort.dir === 1 ? 'ascending' : 'descending') : 'none');
+  });
+  $('si-sort-reset').hidden = !siSort;
+}
+document.querySelectorAll('#si-table th[data-sort] .th-sort').forEach((b) => {
+  b.addEventListener('click', () => setSiSort(b.parentElement.dataset.sort));
+});
+$('si-sort-reset').addEventListener('click', () => {
+  const refetch = !siData || siData.rows.length < siData.total.addresses;
+  siSort = null; sayHowSorted();
+  if (refetch) loadSignins({ resort: true }); else renderSiRows();
+  showSortState();
+  document.querySelector('#si-table .th-sort')?.focus();   // this button hides itself
+});
+
+function renderSiRows() {
+  showSortState();
+  const d = siData;
+  if (!d) return;
+  $('si-rows').replaceChildren(...sortedSiRows().map((r) => {
     const tries = el('div');
     tries.append(el('span', String(r.tries || 0), 'mono'));
     const bits = [r.ssh && `${r.ssh} SSH`, r.mail && `${r.mail} mail`, r.probes && `${r.probes} scans`, r.banned && 'banned'].filter(Boolean);
@@ -1296,14 +1378,15 @@ function drawTimeline(days) {
   svg.replaceChildren(...parts);
 }
 
-async function blockIt(network, r, reg) {
+async function blockIt(network, r, reg, from = 'From Sign-In Attempts') {
   const owner = reg.org || reg.name || r.network || 'unknown owner';
-  const wide = !/\/(32|128)$/.test(network);
+  const bits = network.split('/')[1];
+  const wide = network.includes(':') ? bits !== '128' : bits !== '32';   // an IPv6 /32 is a whole network
   if (!await confirmAction({ title: `Block ${network}?`,
     text: wide ? `Every address in ${network} (${owner}) is cut off from the whole server: SSH, mail and websites. Use this when one network keeps sending attackers; anyone legitimate on it is blocked too. The server can still reach out to it (sending mail, updates); only connections that network starts are dropped, so mail sent from it is refused too. Addresses you sign in from over SSH are never blocked, but if you later sign in from a new address inside this network you'd be locked out. The way back in is the Oracle Cloud console: run sudo nft destroy table inet argus && sudo systemctl disable argus-blocklist.service, unblock the network in Argus, then run sudo systemctl enable argus-blocklist.service.`
       : `${r.ip} (${owner}, ${placeText(r)}) is cut off from the whole server: SSH, mail and websites. You can unblock it at any time below.`,
     ok: 'Block', word: wide ? 'BLOCK' : undefined })) return;
-  const note = hex(`From Sign-In Attempts: ${owner}`.replace(/[^A-Za-z0-9 .,:;()'/@_+-]/g, '').slice(0, 120));
+  const note = hex(`${from}: ${owner}`.replace(/[^A-Za-z0-9 .,:;()'/@_+-]/g, '').slice(0, 120));
   try {
     let res;
     try { res = await call('block-add', [hex(network), note]); }
@@ -1318,10 +1401,36 @@ async function blockIt(network, r, reg) {
       res = await call('block-add', [hex(network), note, 'confirm-signed-in']);
     }
     const rep = res?.replaced?.length ? ` It replaces the narrower ${res.replaced.length === 1 ? 'block' : 'blocks'} on ${res.replaced.join(', ')}.` : '';
-    say(`${network} is blocked.${rep}`);
+    say(`${res?.blocked || network} is blocked.${rep}`);
   } catch (err) { say('It was not blocked: ' + errText(err)); return; }
   await loadBlocked();
-  showAddress(r);
+  if (from === 'From Sign-In Attempts') showAddress(r);    // back to the Details it came from
+  else if (detailRow && !$('si-detail').hidden) showAddress(detailRow);
+}
+
+// Block an address or network typed in by hand (Blocked Addresses card).
+async function blockByHand() {
+  const v = await ask({ title: 'Block an Address', label: 'Address or Network (for example 203.0.113.7 or 203.0.113.0/24)', ok: 'Next' });
+  if (!v) return;
+  const m = /^([0-9A-Fa-f:.]{3,45})(?:\/(\d{1,3}))?$/.exec(v);
+  if (!m || (!m[1].includes(':') && m[2] && +m[2] > 32) || (m[2] && +m[2] > 128)) { say('That is not an address or network.'); return; }
+  const ip = m[1];
+  let info = {};
+  try { info = await call('ip-info', [hex(ip)]); }
+  catch (err) {
+    const why = errText(err);
+    if (/not a public address|one of yours/.test(why)) { say(`It was not blocked: ${why}.`); return; }
+    // otherwise (the registry didn't answer, say) carry on; block-add checks everything again
+  }
+  const single = !m[2] || (ip.includes(':') ? m[2] === '128' : m[2] === '32');
+  let network = single ? ip + (ip.includes(':') ? '/128' : '/32') : v;
+  if (!single && !ip.includes(':')) {        // show the network the server will block: 203.0.113.7/24 is 203.0.113.0/24
+    const n = ip.split('.').reduce((a, p) => a * 256 + (+p & 255), 0), bits = +m[2];
+    const base = bits === 0 ? 0 : (n - (n % 2 ** (32 - bits)));
+    network = [24, 16, 8, 0].map((sh) => Math.floor(base / 2 ** sh) % 256).join('.') + '/' + bits;
+  }
+  const r = { ip, ...(info.geo || {}), network: info.geo?.network };
+  await blockIt(network, r, info.who?.registry || {}, 'Added by hand');
 }
 
 async function unblock(network) {
@@ -1340,7 +1449,7 @@ async function loadBlocked() {
   $('bl-rows').replaceChildren(...d.blocked.map((b) => row([el('span', b.network, 'mono'), [b.place, b.owner].filter(Boolean).join(' · '), el('span', b.note, 'small'),
     el('span', new Date(b.added * 1000).toLocaleString(), 'small'), el('span', b.dropped == null ? '' : `${b.dropped.toLocaleString()} packets`, 'mono small'),
     button('Unblock', '', () => unblock(b.network))])));
-  if (!d.blocked.length) $('bl-rows').replaceChildren(row([el('span', 'Nothing is blocked. Open an address’s Details to block it.', 'muted'), '', '', '', '', '']));
+  if (!d.blocked.length) $('bl-rows').replaceChildren(row([el('span', 'Nothing is blocked. Open an address’s Details to block it, or use Block an Address.', 'muted'), '', '', '', '', '']));
 }
 
 async function traceTo(r) {
@@ -1373,6 +1482,7 @@ async function traceRoute(r, my) {
 }
 $('si-days').addEventListener('change', () => loadSignins());
 $('si-refresh').addEventListener('click', () => loadSignins());
+$('bl-add').addEventListener('click', () => blockByHand());
 
 // ---------- collapsible sections (remembered on this PC) ----------
 for (const sec of document.querySelectorAll('[data-collapse]')) {

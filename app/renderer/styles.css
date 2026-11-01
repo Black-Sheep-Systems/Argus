@@ -177,3 +177,13 @@ table.plain td:last-child { text-align: left; }
 .map-legend .dot.ssh { background: #D9822B; } .map-legend .dot.mail { background: #7B6CD9; } .map-legend .dot.here { background: #2A9D8F; }
 .inline-label { display: inline-flex; flex-direction: row; align-items: center; gap: 6px; font-size: 13px; }
 .tile > .btn { align-self: flex-start; margin-top: 4px; }
+.detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+@media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 6px 0 0; }
+.facts dt { color: var(--muted); font-size: 13px; }
+.facts dd { margin: 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; overflow-wrap: anywhere; }
+#si-timeline { width: 100%; height: auto; display: block; margin-top: 6px; }
+#si-timeline .bar { fill: #D9822B; }
+#si-timeline .axis { stroke: var(--line); stroke-width: 1; }
+#si-timeline .tick { font-size: 7px; fill: var(--muted); }
+#si-timeline .tick.end { text-anchor: end; }

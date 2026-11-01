@@ -62,6 +62,8 @@ Actions:
   attacks [1|7|30]            refused sign-ins by address, with locations
   trace <hexip>               traceroute from the server to an address
   geo-update                  refresh the DB-IP location databases (monthly timer)
+  ip-info <hexip>             reverse name, registry owner and abuse contact, 30-day visit timeline
+  block-list | block-add <hexnet> <hexnote|none> | block-remove <hexnet>   the server's block list
 """
 import datetime
 import json
@@ -3515,7 +3517,8 @@ def refused_rows(days, mine):
         ip = plain_ip(ip)
         if not ip:
             return
-        e = seen.setdefault(ip, {"ssh": set(), "probes": set(), "mail": 0, "banned": 0, "users": {}, "first": ts, "last": ts})
+        e = seen.setdefault(ip, {"ssh": set(), "probes": set(), "mail": 0, "banned": 0, "users": {}, "first": ts, "last": ts, "times": []})
+        e["times"].append(ts)
         e["first"], e["last"] = min(e["first"], ts), max(e["last"], ts)
         if kind == "ssh":
             new = conn not in e["ssh"]
@@ -3570,9 +3573,11 @@ def refused_rows(days, mine):
         if any(a in n for n in mine):
             left_out += 1
             continue
+        vis = visits_of(e["times"])
         rows.append({"ip": ip, "ssh": len(e["ssh"]), "mail": e["mail"], "banned": e["banned"], "probes": len(e["probes"]),
                      "tries": len(e["ssh"]) + e["mail"], "users": [u for u in users if USER_RE.fullmatch(u)][:8],
-                     "first": e["first"], "last": e["last"]})
+                     "first": e["first"], "last": e["last"], "visits": len(vis),
+                     "days": len({datetime.date.fromtimestamp(t) for t in e["times"]})})
     rows.sort(key=lambda r: (-r["tries"], -r["probes"], -r["last"]))
     return rows, left_out, accepted
 
@@ -3591,42 +3596,114 @@ def attacks(args):
     total = {"addresses": len(rows), "ssh": sum(r["ssh"] for r in rows), "mail": sum(r["mail"] for r in rows),
              "probes": sum(r["probes"] for r in rows), "bans": sum(r["banned"] for r in rows), "left_out": left_out}
     here = locate(SERVER_IP)
+    blocked = [_ipaddress.ip_network(k) for k in read_blocked()]
+    for r in rows[:400]:
+        a = _ipaddress.ip_address(r["ip"])
+        hit = next((str(n) for n in blocked if a in n), None)
+        if hit:
+            r["blocked"] = hit
     NOTED.append(["attacks", days + "d", "own from " + ", ".join("%s %d" % kv for kv in sorted(OWN_COUNTS.items()))])
+    total["returning"] = sum(1 for r in rows if r["days"] > 1)
     return {"days": int(days), "total": total, "rows": rows[:400], "shown": min(400, len(rows)),
             "countries": sorted(countries.items(), key=lambda x: -x[1])[:10],
             "server": {"lat": here.get("lat"), "lon": here.get("lon"), "city": here.get("city")}, "geo": geo_info()}
 
 
+TRACE_MODES = [
+    # (name, extra args, needs raw sockets). Each later mode gets past firewalls
+    # that drop the one before; the trace stops at the first mode that reaches
+    # the address. Three probes per hop for steadier times and fewer gaps.
+    ("UDP", [], False),
+    ("ICMP", ["-I"], True),
+    ("TCP to port 22", ["-T", "-p", "22"], True),
+]
+TRACE_DEADLINE_S = 120  # all modes together
+
+
+def parse_trace(out, target):
+    hops = []
+    for line in out.splitlines():
+        m = re.match(r"^\s*(\d+)\s+(.*)$", line)
+        if not m:
+            continue
+        hop, rest = int(m.group(1)), m.group(2)
+        first, times, seen_any = None, [], False
+        for tok in re.findall(r"\*|[\d.]+ ms|!\S*|[0-9a-fA-F:.]{3,45}(?=\s|$)", rest):
+            if tok == "*":
+                continue
+            if tok.endswith(" ms"):
+                try:
+                    times.append(float(tok[:-3]))
+                except ValueError:
+                    pass
+                continue
+            if tok.startswith("!"):
+                continue
+            try:
+                _ipaddress.ip_address(tok)
+            except ValueError:
+                continue
+            seen_any = True
+            if first is None:
+                first = tok
+        if not seen_any:
+            hops.append({"hop": hop, "ip": None, "ms": None})
+            continue
+        pub = plain_ip(first)
+        h = {"hop": hop, "ip": pub if pub else "private",
+             "ms": round(sorted(times)[len(times) // 2], 1) if times else None}
+        if pub:
+            h.update(locate(pub))
+        hops.append(h)
+    return hops, any(h.get("ip") == target for h in hops)
+
+
 def trace(args):
-    """trace <hexip>: the route from this server to an address (traceroute,
-    run as nobody; one at a time)."""
+    """trace <hexip>: the route from this server to an address. Runs as nobody
+    (ICMP and TCP probes get only the raw-socket permission), one at a time,
+    trying UDP, then ICMP, then TCP to port 22 until one reaches the address."""
+    deadline = time.time() + TRACE_DEADLINE_S
     ip = plain_ip(unhex(one_arg(args), 45))
     if not ip:
         raise Refused("that is not a public address")
+    # Only addresses that have tried this server (or are blocked): TCP probes to
+    # port 22 of an arbitrary address would look like a scan from here.
+    if not blocked_match(ip) and not address_events(ip, 30, timeout=20):
+        raise Refused("only addresses that have tried to sign in here can be traced")
     NOTED.append(["trace", ip])
     lockfd = os.open("/run/argus-trace.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    tried, best = [], None
     try:
         try:
             fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise Refused("another route is being traced; try again when it finishes")
-        out = run(["setpriv", "--reuid=nobody", "--regid=nogroup", "--clear-groups", "--no-new-privs", "--inh-caps=-all",
-                   "traceroute", "-6" if ":" in ip else "-4", "-n", "-q", "1", "-w", "2", "-m", "24", ip], timeout=75)
+        for name, extra, raw in TRACE_MODES:
+            left = int(deadline - time.time())
+            if left < 10:
+                tried.append(name + ": not tried (out of time)")
+                continue
+            caps = (["--bounding-set=-all,+net_raw", "--inh-caps=+net_raw", "--ambient-caps=+net_raw"] if raw
+                    else ["--bounding-set=-all", "--inh-caps=-all"])
+            out = run(["setpriv", "--reuid=nobody", "--regid=nogroup", "--clear-groups", "--no-new-privs"] + caps +
+                      ["traceroute", "-6" if ":" in ip else "-4", "-n", "-q", "3", "-w", "2", "-m", "24", "-N", "24"] + extra + [ip],
+                      timeout=min(80, left))
+            if out is None:
+                tried.append(name + ": did not run")
+                continue
+            hops, reached = parse_trace(out, ip)
+            answered = sum(1 for h in hops if h["ip"])
+            tried.append(name + (": reached it" if reached else ": %d of %d hops answered" % (answered, len(hops))))
+            if best is None or reached or answered > best[2]:
+                best = (name, hops, answered, reached)
+            if reached:
+                break
     finally:
         os.close(lockfd)
-    if out is None:
+    if best is None:
         raise Refused("the route could not be traced")
-    hops = []
-    for line in out.splitlines():
-        m = re.match(r"^\s*(\d+)\s+(?:(\S+)\s+([\d.]+) ms(?:\s+!\S*)?|\*)\s*$", line)
-        if not m:
-            continue
-        hip = plain_ip(m.group(2)) if m.group(2) else None
-        h = {"hop": int(m.group(1)), "ip": hip if hip else (None if not m.group(2) else "private"), "ms": float(m.group(3)) if m.group(3) else None}
-        if hip:
-            h.update(locate(hip))
-        hops.append(h)
-    return {"target": ip, "hops": hops, "target_geo": locate(ip), "server": locate(SERVER_IP), "geo": geo_info()}
+    return {"target": ip, "hops": best[1], "mode": best[0], "reached": best[3], "tried": tried,
+            "target_geo": locate(ip), "server": locate(SERVER_IP), "geo": geo_info()}
 
 
 class _HttpsOnly(_urlreq.HTTPRedirectHandler):
@@ -3706,6 +3783,505 @@ def geo_update(args):
         os.close(lockfd)
 
 
+# ---------- attackers: who they are, when they come back, and blocking them ----------
+# ip-info: reverse name (PTR), the registry record (RDAP: owner, network, abuse
+# contact; found through IANA's bootstrap files, so the right registry answers),
+# and the address's own timeline: every attempt over 30 days, grouped into visits.
+# Registry answers are cached for 7 days in INFO_CACHE.
+#
+# Blocking: an nftables table of Argus's own ("inet argus"), dropping blocked
+# sources at prerouting before anything else sees them (Docker's published ports
+# included). The list is kept in BLOCKED_FILE; BLOCK_NFT is regenerated from it
+# and loaded atomically (checked with nft -c first), and argus-blocklist.service
+# loads it again at boot. Matt's own networks, this server and anything not a
+# public address can't be blocked.
+RDAP_BOOT = {4: "https://data.iana.org/rdap/ipv4.json", 6: "https://data.iana.org/rdap/ipv6.json"}
+RDAP_BOOT_FILE = "/var/lib/argus/rdap-bootstrap-%d.json"
+INFO_CACHE = "/var/lib/argus/ipinfo-cache.json"
+INFO_KEEP_S = 7 * 86400
+BLOCKED_FILE = "/var/lib/argus/blocked.json"
+BLOCK_NFT = "/var/lib/argus/blocklist.nft"
+BLOCK_MAX = 5000
+VISIT_GAP_S = 30 * 60
+NOTE_RE = re.compile(r"^[A-Za-z0-9 .,:;()'/@_+-]{0,120}$")
+EMAIL_SHAPE = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}$")
+
+
+def _fetch_json(url, limit=2 * 1024 * 1024, accept="application/json"):
+    opener = _urlreq.build_opener(_HttpsOnly())
+    req = _urlreq.Request(url, headers={"Accept": accept, "User-Agent": "argus-helper/1.0 (server admin tool)"})
+    with opener.open(req, timeout=15) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("reply too large")
+    return json.loads(data.decode("utf-8", "replace"))
+
+
+def rdap_base(ip):
+    v = _ipaddress.ip_address(ip).version
+    path = RDAP_BOOT_FILE % v
+    try:
+        if time.time() - os.stat(path).st_mtime > 30 * 86400:
+            raise OSError
+        boot = json.load(open(path))
+    except (OSError, ValueError):
+        boot = _fetch_json(RDAP_BOOT[v])
+        fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(path), prefix=".rdap-")
+        with os.fdopen(fd, "w") as f:
+            json.dump(boot, f)
+        os.chmod(tmp, 0o644)
+        os.rename(tmp, path)
+    a = _ipaddress.ip_address(ip)
+    best = None
+    for prefixes, urls in boot.get("services", []):
+        for p in prefixes:
+            try:
+                n = _ipaddress.ip_network(p, strict=False)
+            except ValueError:
+                continue
+            if a in n and (best is None or n.prefixlen > best[0].prefixlen):
+                url = next((u for u in urls if u.startswith("https://")), None)
+                if url:
+                    best = (n, url)
+    if not best:
+        raise ValueError("no registry for this address")
+    return best[1] if best[1].endswith("/") else best[1] + "/"
+
+
+def _vcard(entity, key):
+    try:
+        for item in entity.get("vcardArray", [None, []])[1]:
+            if item[0] == key and isinstance(item[3], str):
+                return item[3]
+    except (TypeError, IndexError, AttributeError):
+        pass
+    return None
+
+
+def rdap_lookup(ip):
+    d = _fetch_json(rdap_base(ip) + "ip/" + ip, accept="application/rdap+json")
+    out = {"name": _name(d.get("name")), "handle": _name(d.get("handle")), "country": _name(d.get("country"), 3),
+           "type": _name(d.get("type"))}
+    if isinstance(d.get("startAddress"), str) and isinstance(d.get("endAddress"), str):
+        out["range"] = (d["startAddress"] + " – " + d["endAddress"])[:100]
+    cidrs = []
+    for c in d.get("cidr0_cidrs") or []:
+        pfx = c.get("v4prefix") or c.get("v6prefix")
+        if isinstance(pfx, str) and isinstance(c.get("length"), int):
+            try:
+                cidrs.append(str(_ipaddress.ip_network("%s/%d" % (pfx, c["length"]), strict=False)))
+            except ValueError:
+                pass
+    if not cidrs and out.get("range"):
+        try:
+            a, b = (x.strip() for x in out["range"].split("–"))
+            cidrs = [str(n) for n in _ipaddress.summarize_address_range(_ipaddress.ip_address(a), _ipaddress.ip_address(b))][:4]
+        except ValueError:
+            pass
+    out["networks"] = cidrs[:4]
+    abuse, org = None, None
+
+    def walk(ents, depth=0):
+        nonlocal abuse, org
+        for e in ents or []:
+            if not isinstance(e, dict) or depth > 4:
+                continue
+            roles = e.get("roles") or []
+            if "abuse" in roles and not abuse:
+                em = _vcard(e, "email")
+                if em and EMAIL_SHAPE.fullmatch(em):
+                    abuse = em
+            if ("registrant" in roles or "administrative" in roles) and not org:
+                org = _name(_vcard(e, "fn"), 80)
+            walk(e.get("entities"), depth + 1)
+
+    walk(d.get("entities"))
+    out["abuse"], out["org"] = abuse, org
+    return {k: v for k, v in out.items() if v not in (None, [], "")}
+
+
+def reverse_name(ip):
+    out = run(["host", "-W", "3", ip], timeout=8)
+    m = re.search(r"domain name pointer ([A-Za-z0-9][A-Za-z0-9._-]{0,252})\.?$", (out or "").strip().splitlines()[-1] if out and out.strip() else "")
+    return m.group(1).rstrip(".") if m else None
+
+
+def name_confirmed(name, ip):
+    """True when the name's own address records include the address. The reverse
+    name is set by whoever owns the address, so on its own it proves nothing."""
+    out = run(["host", "-W", "3", "-t", "AAAA" if ":" in ip else "A", name], timeout=8) or ""
+    want = _ipaddress.ip_address(ip)
+    for tok in re.findall(r"has (?:IPv6 )?address (\S+)", out):
+        try:
+            if _ipaddress.ip_address(tok) == want:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def address_events(ip, days=30, timeout=60):
+    """Every refused attempt by one address: [(ts, kind, user)], oldest first."""
+    a = _ipaddress.ip_address(ip)
+    esc = re.escape(ip)
+    j = run(["journalctl", "-u", "ssh", "--since", "-%dd" % days, "-o", "short-unix", "--no-pager",
+             "--grep", r"(^|[^0-9A-Fa-f:.])" + esc + r"([^0-9A-Fa-f:.]|$)"], timeout=timeout) or ""
+    ev, conns = [], set()
+    for line in j.splitlines():
+        m = re.match(r"^(\d+)\.\d+ \S+ \S+: (.*)$", line)
+        if not m:
+            continue
+        ts, msg = int(m.group(1)), m.group(2)
+        p = SSH_PROBE_RE.match(msg)
+        if p and plain_ip(p.group(1)) == ip:
+            ev.append((ts, "scan", None))
+            continue
+        t = SSH_TAIL_RE.match(msg)
+        if not t or plain_ip(t.group(2)) != ip:
+            continue
+        for kind, rx in SSH_HEADS:
+            h = rx.match(t.group(1))
+            if h:
+                key = (kind, t.group(3))
+                if key not in conns:
+                    conns.add(key)
+                    ev.append((ts, "ssh" if kind == "ssh" else "scan", h.group(1) if h.groups() else None))
+                break
+    nf = run(["docker", "logs", "-t", "--since", "%dh" % (days * 24), NETFILTER], timeout=timeout, stderr_too=True) or ""
+    for line in nf.splitlines():
+        for kind, rx in (("mail", NF_WARN_RE), ("ban", NF_BAN_RE)):
+            m = rx.match(line)
+            if m and plain_ip(m.group(2)) == ip:
+                try:
+                    ts = int(datetime.datetime.fromisoformat(m.group(1)).replace(tzinfo=datetime.timezone.utc).timestamp())
+                except ValueError:
+                    break
+                ev.append((ts, kind, None))
+                break
+    ev.sort()
+    return ev
+
+
+def visits_of(times):
+    """Group timestamps into visits: a gap of more than 30 minutes starts a new one."""
+    out = []
+    for ts in sorted(times):
+        if out and ts - out[-1][1] <= VISIT_GAP_S:
+            out[-1][1] = ts
+            out[-1][2] += 1
+        else:
+            out.append([ts, ts, 1])
+    return out
+
+
+def ip_info(args):
+    """ip-info <hexip>: reverse name, registry owner and abuse contact, and the
+    address's 30-day timeline grouped into visits."""
+    ip = plain_ip(unhex(one_arg(args), 45))
+    if not ip:
+        raise Refused("that is not a public address")
+    mine = known_own_networks()
+    if any(_ipaddress.ip_address(ip) in n for n in mine):
+        raise Refused("that address is one of yours")
+    NOTED.append(["ip-info", ip])
+    try:
+        cache = json.load(open(INFO_CACHE))
+        if not isinstance(cache, dict):
+            cache = {}
+    except (OSError, ValueError):
+        cache = {}
+    hit = cache.get(ip)
+    if isinstance(hit, dict) and isinstance(hit.get("t"), (int, float)) and time.time() - hit["t"] < INFO_KEEP_S:
+        who = hit.get("who") or {}
+    else:
+        who = {"ptr": reverse_name(ip)}
+        if who["ptr"]:
+            who["ptr_confirmed"] = name_confirmed(who["ptr"], ip)
+        try:
+            who["registry"] = rdap_lookup(ip)
+        except Exception as e:
+            who["registry_error"] = "the registry did not answer (" + type(e).__name__ + ")"
+        cache[ip] = {"t": int(time.time()), "who": who}
+        if len(cache) > 3000:
+            def age(k):
+                t = cache[k].get("t") if isinstance(cache[k], dict) else None
+                return t if isinstance(t, (int, float)) else 0
+            for k in sorted(cache, key=age)[:len(cache) - 3000]:
+                del cache[k]
+        try:
+            fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(INFO_CACHE), prefix=".info-")
+            with os.fdopen(fd, "w") as f:
+                json.dump(cache, f)
+            os.chmod(tmp, 0o600)
+            os.rename(tmp, INFO_CACHE)
+        except OSError:
+            pass
+    ev = address_events(ip)
+    visits = []
+    for start, end, n in visits_of([e[0] for e in ev]):
+        inside = [e for e in ev if start <= e[0] <= end]
+        users = []
+        for _, _, u in inside:
+            if u and USER_RE.fullmatch(u) and u not in users:
+                users.append(u)
+        kinds = sorted({k for _, k, _ in inside})
+        visits.append({"start": start, "end": end, "attempts": n, "users": users[:6], "kinds": kinds})
+    today = datetime.date.today()
+    per_day = {}
+    for ts, _, _ in ev:
+        d = datetime.date.fromtimestamp(ts).isoformat()
+        per_day[d] = per_day.get(d, 0) + 1
+    days = [((today - datetime.timedelta(days=i)).isoformat()) for i in range(29, -1, -1)]
+    return {"ip": ip, "who": who, "geo": locate(ip), "visits": visits[-60:], "visit_count": len(visits),
+            "days": [{"day": d, "attempts": per_day.get(d, 0)} for d in days],
+            "blocked": blocked_match(ip)}
+
+
+# --- blocking
+
+def read_blocked():
+    try:
+        d = json.load(open(BLOCKED_FILE))
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for k, v in (d.items() if isinstance(d, dict) else []):
+        try:
+            n = _ipaddress.ip_network(k, strict=True)
+        except ValueError:
+            continue
+        if isinstance(v, dict):
+            out[str(n)] = {"added": int(v.get("added", 0)), "note": str(v.get("note", ""))[:120]}
+    return out
+
+
+def blocked_match(ip):
+    a = _ipaddress.ip_address(ip)
+    for k in read_blocked():
+        if a in _ipaddress.ip_network(k):
+            return k
+    return None
+
+
+def _nets(xs):
+    return [_ipaddress.ip_network(x, strict=False) if not isinstance(x, (_ipaddress.IPv4Network, _ipaddress.IPv6Network)) else x
+            for x in xs]
+
+
+def apply_blocklist(entries, mine):
+    """Write the table from the list, check it, and load it in one step.
+
+    The chain runs after connection tracking (-200) and before Docker's port
+    forwarding (-100), so replies to connections this server opened are never
+    dropped, only traffic the blocked side starts. Matt's own networks are
+    accepted ahead of the drops, so a block can't cut off an address of his
+    that is already known."""
+    v4 = sorted((_ipaddress.ip_network(k) for k in entries if ":" not in k))
+    v6 = sorted((_ipaddress.ip_network(k) for k in entries if ":" in k))
+    own = _nets(mine)
+    o4 = list(_ipaddress.collapse_addresses(n for n in own if n.version == 4))
+    o6 = list(_ipaddress.collapse_addresses(n for n in own if n.version == 6))
+
+    def elems(xs):
+        return ("; elements = { " + ", ".join(str(x) for x in xs) + " }") if xs else ""
+    text = ("# Generated by argus-helper from " + BLOCKED_FILE + "; edits here are overwritten.\n"
+            "destroy table inet argus\n"
+            "table inet argus {\n"
+            "  set own4 { type ipv4_addr; flags interval" + elems(o4) + "; }\n"
+            "  set own6 { type ipv6_addr; flags interval" + elems(o6) + "; }\n"
+            "  set blocked4 { type ipv4_addr; flags interval; counter" + elems(v4) + "; }\n"
+            "  set blocked6 { type ipv6_addr; flags interval; counter" + elems(v6) + "; }\n"
+            "  chain pre {\n"
+            "    type filter hook prerouting priority -150; policy accept;\n"
+            "    ct direction reply accept\n"
+            "    ct state related accept\n"
+            "    ip saddr @own4 accept\n"
+            "    ip6 saddr @own6 accept\n"
+            "    ip saddr @blocked4 drop\n"
+            "    ip6 saddr @blocked6 drop\n"
+            "  }\n"
+            "}\n")
+    fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(BLOCK_NFT), prefix=".nft-")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)
+    try:
+        must(["nft", "-c", "-f", tmp], timeout=30)
+        must(["nft", "-f", tmp], timeout=30)
+        os.rename(tmp, BLOCK_NFT)
+    except BaseException:
+        try_(os.unlink, tmp)
+        raise
+
+
+def save_and_apply(entries, mine):
+    """Write the list to a temporary file, load the table, then swap the list in,
+    so a failure leaves the saved list and the live firewall in agreement."""
+    fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(BLOCKED_FILE), prefix=".blocked-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(entries, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        apply_blocklist(entries, mine)
+        os.rename(tmp, BLOCKED_FILE)
+    except BaseException:
+        try_(os.unlink, tmp)
+        raise
+
+
+def server_networks():
+    """This server's own addresses, its default gateways and its name servers:
+    blocking any of them would cut the server off."""
+    found = {_ipaddress.ip_network(SERVER_IP)}
+    try:
+        for i in json.loads(run(["ip", "-j", "addr", "show", "scope", "global"], timeout=10) or "[]"):
+            for ad in i.get("addr_info") or []:
+                try:
+                    found.add(_ipaddress.ip_network(ad["local"]))
+                except (KeyError, ValueError, TypeError):
+                    pass
+    except ValueError:
+        pass
+    for fam in ("-4", "-6"):
+        try:
+            for r in json.loads(run(["ip", fam, "-j", "route", "show", "default"], timeout=10) or "[]"):
+                try:
+                    found.add(_ipaddress.ip_network(r["gateway"]))
+                except (KeyError, ValueError, TypeError):
+                    pass
+        except ValueError:
+            pass
+    for path in ("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"):
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    try:
+                        found.add(_ipaddress.ip_network(parts[1].split("%")[0]))
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+    return found
+
+
+def own_for_table():
+    """Matt's networks for the accept set: the full list when the logs can be
+    read, the quick one otherwise."""
+    try:
+        return set(own_networks()) | set(known_own_networks())
+    except Refused:
+        return set(known_own_networks())
+
+
+def block_counters():
+    """{network: packets dropped since the table was last loaded}."""
+    out = {}
+    for s in ("blocked4", "blocked6"):
+        j = run(["nft", "-j", "list", "set", "inet", "argus", s], timeout=15)
+        try:
+            for item in json.loads(j or "{}").get("nftables", []):
+                for el in (item.get("set") or {}).get("elem", []):
+                    e = el.get("elem", el) if isinstance(el, dict) else el
+                    val, cnt = (e.get("val"), (e.get("counter") or {}).get("packets", 0)) if isinstance(e, dict) else (e, 0)
+                    if isinstance(val, dict) and "prefix" in val:
+                        key = "%s/%s" % (val["prefix"]["addr"], val["prefix"]["len"])
+                    elif isinstance(val, dict) and "range" in val:
+                        continue
+                    else:
+                        key = str(val) + ("/128" if ":" in str(val) else "/32")
+                    out[str(_ipaddress.ip_network(key, strict=False))] = int(cnt or 0)
+        except (ValueError, AttributeError, TypeError):
+            pass
+    return out
+
+
+def block_list(args):
+    no_args(args)
+    entries = read_blocked()
+    counts = block_counters()
+    live = run(["nft", "list", "table", "inet", "argus"], timeout=15) is not None
+    rows = []
+    for k, v in sorted(entries.items(), key=lambda kv: -kv[1]["added"]):
+        g = locate(k.split("/")[0])
+        rows.append({"network": k, "added": v["added"], "note": v["note"], "dropped": counts.get(k),
+                     "place": ", ".join(x for x in (g.get("city"), g.get("country")) if x), "owner": g.get("network")})
+    return {"blocked": rows, "active": live, "boot": os.path.isfile("/etc/systemd/system/argus-blocklist.service")}
+
+
+def block_add(args):
+    """block-add <hexnetwork> <hexnote|none>"""
+    if len(args) != 2:
+        raise UnexpectedArgs()
+    raw = unhex(args[0], 50)
+    note = unhex(args[1], 120) if args[1] != "none" else ""
+    if not NOTE_RE.fullmatch(note):
+        raise Refused("use plain letters and numbers for the note")
+    try:
+        net = _ipaddress.ip_network(raw, strict=False)
+    except ValueError:
+        raise Refused("that is not an address or network")
+    if net.version == 4 and net.prefixlen < 16 or net.version == 6 and net.prefixlen < 32:
+        raise Refused("that network is too wide to block in one go (IPv4 /16 or narrower, IPv6 /32 or narrower)")
+    if not net.network_address.is_global or not net.broadcast_address.is_global:
+        raise Refused("only public addresses can be blocked")
+    NOTED.append(["block-add", str(net), note])
+    for n in server_networks():
+        if n.version == net.version and n.overlaps(net):
+            raise Refused("that would cut this server off (it contains the server's own address, its gateway or its name server)")
+    mine = own_networks()
+    for n in mine:
+        if n.version == net.version and n.overlaps(net):
+            raise Refused("that overlaps one of your own addresses (" + ("a network you sign in from" if n.prefixlen < 64 or n.version == 4 else "your IPv6 network") + "); not blocked")
+    # A wider block on the provider you sign in from could catch your next
+    # address, which isn't known yet. Single addresses are still allowed.
+    if net.num_addresses > 1:
+        if geo_reader("asn") is None:
+            raise Refused("the provider database isn't available, so a network can't be checked against yours; block single addresses for now")
+        asn = locate(str(net.network_address)).get("asn")
+        if asn is None:
+            raise Refused("the provider of that network isn't known; block single addresses there instead")
+        if any(locate(str(n.network_address)).get("asn") == asn for n in mine):
+            raise Refused("that network belongs to the same provider you sign in from; block single addresses there instead")
+    with change_lock():
+        entries = read_blocked()
+        if str(net) in entries:
+            raise Refused(str(net) + " is already blocked")
+        nets = {k: _ipaddress.ip_network(k) for k in entries}
+        wider = next((k for k, n in nets.items() if n.version == net.version and net.subnet_of(n)), None)
+        if wider:
+            raise Refused(str(net) + " is already covered by the block on " + wider)
+        replaced = sorted(k for k, n in nets.items() if n.version == net.version and n.subnet_of(net))
+        for k in replaced:
+            del entries[k]
+        if len(entries) >= BLOCK_MAX:
+            raise Refused("the block list is full (%d)" % BLOCK_MAX)
+        entries[str(net)] = {"added": int(time.time()), "note": note}
+        save_and_apply(entries, mine | set(known_own_networks()))
+    return {"blocked": str(net), "replaced": replaced}
+
+
+def block_remove(args):
+    """block-remove <hexnetwork>"""
+    raw = unhex(one_arg(args), 50)
+    try:
+        net = str(_ipaddress.ip_network(raw, strict=True))
+    except ValueError:
+        raise UnexpectedArgs()
+    NOTED.append(["block-remove", net])
+    with change_lock():
+        entries = read_blocked()
+        if net not in entries:
+            raise Refused(net + " is not on the block list")
+        del entries[net]
+        save_and_apply(entries, own_for_table())
+    return {"unblocked": net}
+
+
 def status(args):
     if args:
         raise UnexpectedArgs()
@@ -3780,6 +4356,10 @@ ACTIONS = {
     "attacks": attacks,
     "trace": trace,
     "geo-update": geo_update,
+    "ip-info": ip_info,
+    "block-list": block_list,
+    "block-add": block_add,
+    "block-remove": block_remove,
 }
 
 

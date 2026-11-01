@@ -117,7 +117,7 @@ const ACTIONS: &[&str] = &[
     "alias-add", "alias-delete", "mailq-flush", "mailq-delete", "mailq-deliver",
     "sites-list", "caddy-show", "caddy-check", "caddy-apply", "caddy-history", "caddy-rollback", "cert-renew", "site-add", "quarantine-release", "quarantine-delete",
     "acct-list", "acct-folders", "acct-add", "acct-set", "acct-delete", "key-add", "key-remove",
-    "heph-people", "heph-company-add", "heph-user", "service-updates", "service-update", "attacks", "trace",
+    "heph-people", "heph-company-add", "heph-user", "service-updates", "service-update", "attacks", "trace", "ip-info", "block-list", "block-add", "block-remove",
 ];
 
 /// Arguments go onto the server's command line, so only plain names pass.

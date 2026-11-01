@@ -6,6 +6,7 @@ fixtures, so this checks the parsing, counting and exclusion rules only."""
 import importlib.machinery
 import importlib.util
 import os
+import shutil
 import sys
 import types
 import unittest
@@ -135,14 +136,179 @@ class Attacks(unittest.TestCase):
 
 
 class Trace(unittest.TestCase):
+    def test_trace_refuses_an_address_that_never_tried(self):
+        real = (h.blocked_match, h.address_events)
+        h.blocked_match = lambda ip: None
+        h.address_events = lambda ip, days=30, timeout=60: []
+        try:
+            with self.assertRaises(h.Refused):
+                h.trace([b"1.1.1.1".hex()])
+        finally:
+            h.blocked_match, h.address_events = real
+
     def test_hops(self):
         out = ("traceroute to 45.33.1.5 (45.33.1.5), 24 hops max, 60 byte packets\n"
                " 1  10.0.0.1  0.412 ms\n 2  *\n 3  45.33.2.1  1.200 ms\n 4  45.33.1.5  5.100 ms !H\n")
         h.run = lambda cmd, timeout=20, stderr_too=False: out
         h.locate = lambda ip: {}
+        h.blocked_match = lambda ip: None
+        h.address_events = lambda ip, days=30, timeout=60: [(1, "ssh", "root")]
         h.NOTED.clear()
         r = h.trace([b"45.33.1.5".hex()])
         self.assertEqual([x["ip"] for x in r["hops"]], ["private", None, "45.33.2.1", "45.33.1.5"])
+
+
+class Intel(unittest.TestCase):
+    def test_visits_split_on_a_30_minute_gap(self):
+        v = h.visits_of([0, 60, 1700, 1700 + 1801, 1700 + 1802, 86400 * 3])
+        self.assertEqual([x[2] for x in v], [3, 2, 1])
+
+    def test_three_probe_trace_lines(self):
+        out = ("traceroute to 45.33.1.5 (45.33.1.5), 24 hops max\n"
+               " 1  10.0.0.1  0.4 ms  0.5 ms  0.6 ms\n"
+               " 2  * * *\n"
+               " 3  45.33.2.1  1.2 ms 45.33.2.9  1.4 ms *\n"
+               " 4  45.33.1.5  5.1 ms !H  5.3 ms !H  5.2 ms !H\n")
+        h.locate = lambda ip: {}
+        hops, reached = h.parse_trace(out, "45.33.1.5")
+        self.assertEqual([x["ip"] for x in hops], ["private", None, "45.33.2.1", "45.33.1.5"])
+        self.assertEqual(hops[3]["ms"], 5.2)
+        self.assertTrue(reached)
+
+    def test_registry_record_owner_network_and_nested_abuse(self):
+        rec = {"name": "EXAMPLE-NET", "handle": "NET-45-33-0-0-1", "country": "US",
+               "startAddress": "45.33.0.0", "endAddress": "45.33.255.255",
+               "cidr0_cidrs": [{"v4prefix": "45.33.0.0", "length": 16}],
+               "entities": [{"roles": ["registrant"], "vcardArray": ["vcard", [["fn", {}, "text", "Example Hosting"]]],
+                             "entities": [{"roles": ["abuse"], "vcardArray": ["vcard", [["email", {}, "text", "abuse@example.net"]]]}]}]}
+        real_fetch, real_base = h._fetch_json, h.rdap_base
+        try:
+            h._fetch_json = lambda url, **k: rec
+            h.rdap_base = lambda ip: "https://rdap.example/"
+            r = h.rdap_lookup("45.33.1.5")
+        finally:
+            h._fetch_json, h.rdap_base = real_fetch, real_base
+        self.assertEqual(r["org"], "Example Hosting")
+        self.assertEqual(r["abuse"], "abuse@example.net")
+        self.assertEqual(r["networks"], ["45.33.0.0/16"])
+
+    def test_block_refuses_own_server_private_and_too_wide(self):
+        real = (h.own_networks, h.server_networks)
+        h.own_networks = lambda: {h.own_net("45.33.9.9")}
+        h.server_networks = lambda: {h._ipaddress.ip_network(h.SERVER_IP)}
+        try:
+            for net, why in (("10.0.0.0/24", "public"), ("45.0.0.0/8", "too wide"), ("45.33.9.0/24", "your own"),
+                             (h.SERVER_IP + "/32", "cut this server off")):
+                with self.assertRaises(h.Refused) as cm:
+                    h.block_add([net.encode().hex(), "none"])
+                self.assertIn(why, str(cm.exception))
+        finally:
+            h.own_networks, h.server_networks = real
+
+    def _block_with(self, entries, net):
+        import contextlib
+        saved = {}
+        real = (h.read_blocked, h.save_and_apply, h.change_lock, h.server_networks, h.locate, h.known_own_networks, h.geo_reader)
+        if h.geo_reader is not self._no_db:
+            h.geo_reader = lambda kind: object()
+        h.own_networks = lambda: {h.own_net("45.33.9.9")}
+        h.read_blocked = lambda: dict(entries)
+        h.save_and_apply = lambda e, mine: saved.update(e=e, mine=mine)
+        h.change_lock = contextlib.nullcontext
+        h.server_networks = lambda: {h._ipaddress.ip_network(h.SERVER_IP)}
+        h.locate = lambda ip: {"asn": 1 if ip.startswith("45.33.9") else 2}
+        h.known_own_networks = lambda: set()
+        try:
+            return h.block_add([net.encode().hex(), "none"]), saved
+        finally:
+            (h.read_blocked, h.save_and_apply, h.change_lock, h.server_networks, h.locate, h.known_own_networks, h.geo_reader) = real
+
+    @staticmethod
+    def _no_db(kind):
+        return None
+
+    def test_network_block_refused_without_the_provider_database(self):
+        real = h.geo_reader
+        h.geo_reader = self._no_db
+        try:
+            with self.assertRaises(h.Refused) as cm:
+                self._block_with({}, "46.1.2.0/24")
+            self.assertIn("provider database", str(cm.exception))
+            h.geo_reader = self._no_db
+            r, _ = self._block_with({}, "46.1.2.3")
+            self.assertEqual(r["blocked"], "46.1.2.3/32")
+        finally:
+            h.geo_reader = real
+
+    def test_block_inside_an_existing_block_is_refused(self):
+        with self.assertRaises(h.Refused) as cm:
+            self._block_with({"46.1.0.0/16": {"added": 1, "note": ""}}, "46.1.2.3")
+        self.assertIn("already covered by the block on 46.1.0.0/16", str(cm.exception))
+
+    def test_wider_block_replaces_the_ones_it_covers(self):
+        r, saved = self._block_with({"46.1.2.3/32": {"added": 1, "note": ""}, "47.0.0.1/32": {"added": 1, "note": ""}},
+                                    "46.1.0.0/16")
+        self.assertEqual(r["replaced"], ["46.1.2.3/32"])
+        self.assertEqual(sorted(saved["e"]), ["46.1.0.0/16", "47.0.0.1/32"])
+        self.assertIn(h.own_net("45.33.9.9"), saved["mine"])
+
+    def test_network_on_your_own_provider_is_refused_but_one_address_is_not(self):
+        with self.assertRaises(h.Refused) as cm:
+            self._block_with({}, "45.33.98.0/24")   # same provider (fixture ASN 1) as 45.33.9.9
+        self.assertIn("same provider", str(cm.exception))
+        r, _ = self._block_with({}, "45.33.98.7")
+        self.assertEqual(r["blocked"], "45.33.98.7/32")
+
+    def test_table_accepts_replies_and_own_networks_before_dropping(self):
+        written = {}
+        real_must, real_mk = h.must, h._tempfile.mkstemp
+        import tempfile
+        d = tempfile.mkdtemp()
+        def grab(cmd, timeout=0):
+            with open(cmd[-1]) as f:
+                written.setdefault("text", f.read())
+        h.must = grab
+        real_nft = h.BLOCK_NFT
+        h.BLOCK_NFT = os.path.join(d, "blocklist.nft")
+        try:
+            h.apply_blocklist({"46.1.0.0/16": {}}, {h.own_net("45.33.9.9"), h.own_net("45.33.9.10")})
+        finally:
+            h.must, h.BLOCK_NFT = real_must, real_nft
+        t = written["text"]
+        self.assertIn("priority -150", t)
+        order = [t.index(x) for x in ("ct direction reply accept", "ip saddr @own4 accept", "ip saddr @blocked4 drop")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("elements = { 46.1.0.0/16 }", t)
+
+
+    @unittest.skipUnless(shutil.which("nft") and hasattr(os, "geteuid") and os.geteuid() == 0, "needs nft and root")
+    def test_generated_tables_parse_with_empty_and_full_sets(self):
+        import subprocess
+        import tempfile
+        cases = [({}, set()),
+                 ({"46.1.0.0/16": {}}, {h.own_net("2a02:1:2:3::99")}),
+                 ({"46.1.0.0/16": {}, "2a03:4000:1::/48": {}}, {h.own_net("45.33.9.9"), h.own_net("2a02:1:2:3::99")})]
+        real_must, real_nft = h.must, h.BLOCK_NFT
+        d = tempfile.mkdtemp()
+        texts = []
+
+        def grab(cmd, timeout=0):
+            with open(cmd[-1]) as f:
+                texts.append(f.read())
+            raise h.Refused("captured")
+        h.must, h.BLOCK_NFT = grab, os.path.join(d, "blocklist.nft")
+        try:
+            for entries, mine in cases:
+                with self.assertRaises(h.Refused):
+                    h.apply_blocklist(entries, mine)
+        finally:
+            h.must, h.BLOCK_NFT = real_must, real_nft
+        for t in texts:
+            path = os.path.join(d, "check.nft")
+            with open(path, "w") as f:
+                f.write(t.replace("destroy table inet argus\n", "").replace("inet argus", "inet argus_check"))
+            p = subprocess.run(["nft", "-c", "-f", path], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
 
 
 if __name__ == "__main__":

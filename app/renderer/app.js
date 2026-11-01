@@ -1189,9 +1189,10 @@ async function loadSignins() {
   const days = $('si-days').value;
   const my = ++siSeq;
   trSeq++;                                   // a route still being traced belongs to the old view
-  $('si-route').hidden = true;
+  $('si-detail').hidden = true;
   $('si-summary').textContent = 'Reading the server logs…';
-  $('si-rows').replaceChildren(row([el('span', 'Loading…', 'muted'), '', '', '', '', '', '']));
+  $('si-rows').replaceChildren(row([el('span', 'Loading…', 'muted'), '', '', '', '', '', '', '']));
+  loadBlocked();
   let d;
   try { d = await call('attacks', [days]); }
   catch (err) { if (my === siSeq) { $('si-summary').textContent = 'Could not read the sign-in logs: ' + errText(err); $('si-rows').replaceChildren(); } return; }
@@ -1201,7 +1202,7 @@ async function loadSignins() {
   const span = { 1: 'the last 24 hours', 7: 'the last 7 days', 30: 'the last 30 days' }[d.days];
   $('si-summary').textContent = `In ${span}: ${t.addresses.toLocaleString()} addresses made ${t.ssh.toLocaleString()} SSH attempts`
     + (t.mail ? ` and ${t.mail.toLocaleString()} mail login failures` : '') + (t.probes ? `, plus ${t.probes.toLocaleString()} scans that never got as far as a sign-in` : '')
-    + `. All refused.${t.bans ? ` mailcow banned ${t.bans} ${t.bans === 1 ? 'address' : 'addresses'} for repeated mail failures.` : ''}`;
+    + `. All refused.${t.returning ? ` ${t.returning.toLocaleString()} of them came back on more than one day.` : ''}${t.bans ? ` mailcow banned ${t.bans} ${t.bans === 1 ? 'address' : 'addresses'} for repeated mail failures.` : ''}`;
   $('si-countries').textContent = d.countries.length ? 'Most attempts from: ' + d.countries.slice(0, 8).map(([c, n]) => `${c} (${n.toLocaleString()})`).join(', ') : '';
   $('si-credit').textContent = (d.geo?.credit || '') + (d.geo?.updated ? ` · updated ${d.geo.updated}` : ' · location data not downloaded yet') + ' · Map: Natural Earth.';
   $('si-count').textContent = d.rows.length < t.addresses ? `Busiest ${d.rows.length} of ${t.addresses.toLocaleString()} shown here and on the map` : `${t.addresses.toLocaleString()}`;
@@ -1211,11 +1212,121 @@ async function loadSignins() {
     tries.append(el('span', String(r.tries || 0), 'mono'));
     const bits = [r.ssh && `${r.ssh} SSH`, r.mail && `${r.mail} mail`, r.probes && `${r.probes} scans`, r.banned && 'banned'].filter(Boolean);
     if (bits.length) tries.append(el('div', bits.join(' · '), 'muted small'));
-    return row([el('span', r.ip, 'mono'), placeText(r), el('span', r.network || '', 'small'), tries,
+    const vis = el('div', null, 'su-cell');
+    vis.append(el('span', `${r.visits} ${r.visits === 1 ? 'visit' : 'visits'} · ${r.days} ${r.days === 1 ? 'day' : 'days'}`, 'small'));
+    if (r.days > 1) vis.append(el('span', 'Returning', 'pill warn'));
+    if (r.blocked) vis.append(el('span', 'Blocked', 'pill bad'));
+    return row([el('span', r.ip, 'mono'), placeText(r), el('span', r.network || '', 'small'), tries, vis,
       el('span', (r.users || []).join(', '), 'mono small'), el('span', new Date(r.last * 1000).toLocaleString(), 'small'),
-      (() => { const b = button('Trace Route', 'trace-btn', () => traceTo(r)); b.disabled = tracing; return b; })()]);
+      button('Details', '', () => showAddress(r))]);
   }));
-  if (!d.rows.length) $('si-rows').replaceChildren(row([el('span', 'No refused sign-ins in this period.', 'muted'), '', '', '', '', '', '']));
+  if (!d.rows.length) $('si-rows').replaceChildren(row([el('span', 'No refused sign-ins in this period.', 'muted'), '', '', '', '', '', '', '']));
+}
+
+let detailSeq = 0, detailRow = null;
+async function showAddress(r) {
+  const my = ++detailSeq;
+  trSeq++;
+  detailRow = r;
+  $('si-detail').hidden = false;
+  $('si-route').hidden = true;
+  $('si-detail-title').textContent = r.ip;
+  $('si-detail-btns').replaceChildren();
+  $('si-who').replaceChildren(el('dd', 'Looking it up…', 'muted'));
+  $('si-visits').replaceChildren(row([el('span', 'Loading…', 'muted'), '', '', '', '']));
+  $('si-timeline').replaceChildren();
+  $('si-timeline-note').textContent = '';
+  $('si-detail').scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+  let info;
+  try { info = await call('ip-info', [hex(r.ip)]); }
+  catch (err) { if (my === detailSeq) $('si-who').replaceChildren(el('dd', 'Could not look it up: ' + errText(err), 'muted')); return; }
+  if (my !== detailSeq) return;
+  const reg = info.who?.registry || {};
+  const facts = [
+    ['Reverse Name', info.who?.ptr ? info.who.ptr + (info.who.ptr_confirmed ? ' (confirmed)' : ' (what it calls itself; not confirmed)') : 'none'],
+    ['Owner', reg.org || reg.name || (info.who?.registry_error || 'unknown')],
+    ['Registry Record', [reg.name, reg.handle].filter(Boolean).join(' · ')],
+    ['Network', (reg.networks || []).join(', ') || reg.range || ''],
+    ['Country', [reg.country, placeText(info.geo)].filter(Boolean).join(' · located in ')],
+    ['Report Abuse To', reg.abuse || ''],
+  ].filter(([, v]) => v);
+  $('si-who').replaceChildren(...facts.flatMap(([k, v]) => {
+    const dd = el('dd', null);
+    dd.append(el('span', v, k === 'Report Abuse To' || k === 'Network' || k === 'Reverse Name' ? 'mono' : ''));
+    if (k === 'Report Abuse To') dd.append(button('Copy', '', () => window.argus.copy(v, false)));
+    return [el('dt', k), dd];
+  }));
+  drawTimeline(info.days);
+  $('si-timeline-note').textContent = `${info.visit_count} separate ${info.visit_count === 1 ? 'visit' : 'visits'} in 30 days (a gap of more than 30 minutes starts a new one).`;
+  $('si-visits').replaceChildren(...[...info.visits].reverse().slice(0, 30).map((v) => {
+    const mins = Math.max(1, Math.round((v.end - v.start) / 60));
+    return row([new Date(v.start * 1000).toLocaleString(), mins < 60 ? `${mins} min` : `${(mins / 60).toFixed(1)} h`, String(v.attempts),
+      v.kinds.map((k) => ({ ssh: 'SSH', mail: 'mail', ban: 'mail ban', scan: 'scan' }[k] || k)).join(', '), el('span', v.users.join(', '), 'mono small')]);
+  }));
+  if (!info.visits.length) $('si-visits').replaceChildren(row([el('span', 'No attempts in the last 30 days.', 'muted'), '', '', '', '']));
+  const net = (reg.networks || []).find((n) => { const len = Number(n.split('/')[1]); return n.includes(':') ? len >= 32 && len < 128 : len >= 16 && len < 32; });
+  const btns = [button('Trace Route', 'trace-btn', () => traceTo(r))];
+  if (info.blocked) btns.push(button(`Unblock ${info.blocked}`, '', () => unblock(info.blocked)));
+  else {
+    btns.push(button('Block Address', 'danger', () => blockIt(r.ip + (r.ip.includes(':') ? '/128' : '/32'), r, reg)));
+    if (net) btns.push(button(`Block Network ${net}`, 'danger', () => blockIt(net, r, reg)));
+  }
+  btns.push(button('Close', '', () => { $('si-detail').hidden = true; drawMap(siData?.rows || [], siData?.server, null); }));
+  for (const b of btns) if (b.classList.contains('trace-btn')) b.disabled = tracing;
+  $('si-detail-btns').replaceChildren(...btns);
+}
+
+function drawTimeline(days) {
+  const svg = $('si-timeline');
+  const max = Math.max(1, ...days.map((d) => d.attempts));
+  const w = 300 / days.length;
+  const parts = [svgEl('line', { x1: 0, y1: 60, x2: 300, y2: 60, class: 'axis' })];
+  days.forEach((d, i) => {
+    const hgt = d.attempts ? Math.max(2, (d.attempts / max) * 56) : 0;
+    const bar = svgEl('rect', { x: (i * w + 1).toFixed(1), y: (60 - hgt).toFixed(1), width: (w - 2).toFixed(1), height: hgt.toFixed(1), class: 'bar' });
+    const t = svgEl('title'); t.textContent = `${d.day}: ${d.attempts} ${d.attempts === 1 ? 'attempt' : 'attempts'}`;
+    bar.append(t);
+    parts.push(bar);
+  });
+  const l = svgEl('text', { x: 0, y: 69, class: 'tick' }); l.textContent = days[0]?.day.slice(5) || '';
+  const r = svgEl('text', { x: 300, y: 69, class: 'tick end' }); r.textContent = 'today';
+  parts.push(l, r);
+  svg.replaceChildren(...parts);
+}
+
+async function blockIt(network, r, reg) {
+  const owner = reg.org || reg.name || r.network || 'unknown owner';
+  const wide = !/\/(32|128)$/.test(network);
+  if (!await confirmAction({ title: `Block ${network}?`,
+    text: wide ? `Every address in ${network} (${owner}) is cut off from the whole server: SSH, mail and websites. Use this when one network keeps sending attackers; anyone legitimate on it is blocked too. The server can still reach out to it (sending mail, updates); only connections that network starts are dropped, so mail sent from it is refused too. Your own known addresses are never blocked, but if you later sign in from a new address inside this network you'd be locked out. The way back in is the Oracle Cloud console: run sudo nft destroy table inet argus && sudo systemctl disable argus-blocklist.service, unblock the network in Argus, then run sudo systemctl enable argus-blocklist.service.`
+      : `${r.ip} (${owner}, ${placeText(r)}) is cut off from the whole server: SSH, mail and websites. You can unblock it at any time below.`,
+    ok: 'Block', word: wide ? 'BLOCK' : undefined })) return;
+  try {
+    const res = await call('block-add', [hex(network), hex(`From Sign-In Attempts: ${owner}`.replace(/[^A-Za-z0-9 .,:;()'/@_+-]/g, '').slice(0, 120))]);
+    const rep = res?.replaced?.length ? ` It replaces the narrower ${res.replaced.length === 1 ? 'block' : 'blocks'} on ${res.replaced.join(', ')}.` : '';
+    say(`${network} is blocked.${rep}`);
+  } catch (err) { say('It was not blocked: ' + errText(err)); return; }
+  await loadBlocked();
+  showAddress(r);
+}
+
+async function unblock(network) {
+  if (!await confirmAction({ title: `Unblock ${network}?`, text: 'It can reach the server again (and will be refused at sign-in as before).', ok: 'Unblock' })) return;
+  try { await call('block-remove', [hex(network)]); say(`${network} is unblocked.`); }
+  catch (err) { say('It was not unblocked: ' + errText(err)); return; }
+  await loadBlocked();
+  if (detailRow && !$('si-detail').hidden) showAddress(detailRow);
+}
+
+async function loadBlocked() {
+  let d;
+  try { d = await call('block-list'); }
+  catch (err) { $('bl-rows').replaceChildren(row([el('span', 'Could not read the block list: ' + errText(err), 'muted'), '', '', '', '', ''])); return; }
+  $('bl-state').textContent = d.blocked.length ? `${d.blocked.length} blocked` + (d.active ? '' : ' · not loaded on the server right now') : '';
+  $('bl-rows').replaceChildren(...d.blocked.map((b) => row([el('span', b.network, 'mono'), [b.place, b.owner].filter(Boolean).join(' · '), el('span', b.note, 'small'),
+    el('span', new Date(b.added * 1000).toLocaleString(), 'small'), el('span', b.dropped == null ? '' : `${b.dropped.toLocaleString()} packets`, 'mono small'),
+    button('Unblock', '', () => unblock(b.network))])));
+  if (!d.blocked.length) $('bl-rows').replaceChildren(row([el('span', 'Nothing is blocked. Open an address’s Details to block it.', 'muted'), '', '', '', '', '']));
 }
 
 async function traceTo(r) {
@@ -1230,16 +1341,16 @@ async function traceTo(r) {
 async function traceRoute(r, my) {
   $('si-route').hidden = false;
   $('si-route-title').textContent = `Route to ${r.ip}`;
-  $('si-hops').replaceChildren(row([el('span', 'Tracing (up to a minute)…', 'muted'), '', '', '', '']));
-  $('si-route').scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+  $('si-route-note').textContent = 'From this server outward, one line per network hop, three probes each. If the usual probes stop short, Argus tries ICMP, then TCP to port 22. Hops that don’t answer show as no reply.';
+  $('si-hops').replaceChildren(row([el('span', 'Tracing (usually under a minute, up to two)…', 'muted'), '', '', '', '']));
   let t;
   try { t = await call('trace', [hex(r.ip)]); }
   catch (err) { if (my === trSeq) $('si-hops').replaceChildren(row([el('span', 'The route could not be traced: ' + errText(err), 'muted'), '', '', '', ''])); return; }
   if (my !== trSeq) return;
+  $('si-route-note').textContent = (t.reached ? `Reached ${r.ip} using ${t.mode} probes.` : `Did not reach ${r.ip} itself: its network stops answering before the end, which is common. Best result shown (${t.mode}).`)
+    + ` Tried: ${t.tried.join('; ')}.`;
   $('si-hops').replaceChildren(...t.hops.map((h) => row([String(h.hop), el('span', h.ip === 'private' ? 'private address' : h.ip || 'no reply', h.ip && h.ip !== 'private' ? 'mono' : 'muted'),
     h.ip && h.ip !== 'private' ? placeText(h) : '', el('span', h.network || '', 'small'), h.ms == null ? '' : h.ms.toFixed(1) + ' ms'])));
-  const reached = t.hops.some((h) => h.ip === t.target);
-  if (!reached) $('si-hops').append(row([el('span', `The last hops didn't answer, which is common: many networks ignore these probes. ${r.ip} is in ${placeText(t.target_geo)}.`, 'muted small'), '', '', '', '']));
   const pts = [];
   if (typeof t.server?.lat === 'number') pts.push(mapXY(t.server.lon, t.server.lat));
   for (const h of t.hops) if (typeof h.lat === 'number') pts.push(mapXY(h.lon, h.lat));
@@ -1248,7 +1359,6 @@ async function traceRoute(r, my) {
 }
 $('si-days').addEventListener('change', () => loadSignins());
 $('si-refresh').addEventListener('click', () => loadSignins());
-$('si-route-close').addEventListener('click', () => { $('si-route').hidden = true; drawMap(siData?.rows || [], siData?.server, null); });
 
 // ---------- collapsible sections (remembered on this PC) ----------
 for (const sec of document.querySelectorAll('[data-collapse]')) {

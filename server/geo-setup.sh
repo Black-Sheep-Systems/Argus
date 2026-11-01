@@ -1,5 +1,6 @@
 #!/bin/bash
-# One-time setup for Argus's sign-in attacks page. Run as root by the server chat.
+# One-time setup for Argus's Sign-In Attempts page (locations, the block list).
+# Run as root by the server chat.
 # Installs the reader for DB-IP's free location databases and a monthly timer
 # that refreshes them (argus-helper geo-update). Safe to run again.
 set -euo pipefail
@@ -51,6 +52,34 @@ if [ ! -f /etc/ssh/sshd_config.d/04-argus-loglevel.conf ]; then
 fi
 # (read the whole output: grep -q would stop early and, with pipefail, look like a failure)
 [ "$(sshd -T | awk 'tolower($1)=="loglevel"{print toupper($2)}')" = VERBOSE ] || echo "note: LogLevel VERBOSE is not in effect; check the other sshd_config.d files"
+# The block list: Argus's own nftables table, loaded again at every start.
+cat > /etc/systemd/system/argus-blocklist.service <<'UNIT'
+[Unit]
+Description=Argus: load the address block list
+# Same shape as Debian's nftables.service: no default dependencies (avoids an
+# ordering cycle with networking), loaded after nftables.service (which flushes
+# the whole ruleset) and again whenever that service is restarted or reloaded.
+DefaultDependencies=no
+After=local-fs.target nftables.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
+ConditionPathExists=/var/lib/argus/blocklist.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /var/lib/argus/blocklist.nft
+ExecReload=/usr/sbin/nft -f /var/lib/argus/blocklist.nft
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+systemctl daemon-reload
+systemctl reenable argus-blocklist.service >/dev/null 2>&1
+systemd-analyze verify argus-blocklist.service || true
 install -d -o root -g root -m 0755 /etc/argus
 [ -f /etc/argus/own-addresses ] || printf '%s\n' '# Addresses or networks that are yours and must never appear on the Sign-In Attempts page.' '# One per line, for example 203.0.113.7 or 2001:db8:1:2::/64' > /etc/argus/own-addresses
 # First download now, rather than waiting for the timer.

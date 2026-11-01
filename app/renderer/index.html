@@ -248,15 +248,28 @@
             <p class="muted small map-legend"><span class="dot ssh"></span> SSH attempts <span class="dot mail"></span> Mail login failures <span class="dot here"></span> This server · Larger dots: more tries. <span id="si-credit"></span></p>
             <p id="si-countries" class="small"></p>
           </section>
-          <section class="card full" id="si-route" hidden>
-            <div class="card-head"><h3 id="si-route-title">Route</h3><button class="btn small" type="button" id="si-route-close">Close</button></div>
-            <p class="muted small">From this server outward, one line per network hop. Hops that don't answer show as no reply; hidden private hops are part of a provider's network.</p>
-            <div class="table-wrap"><table><thead><tr><th scope="col">Hop</th><th scope="col">Address</th><th scope="col">Location</th><th scope="col">Network</th><th scope="col">Time</th></tr></thead><tbody id="si-hops"></tbody></table></div>
+          <section class="card full" id="si-detail" hidden>
+            <div class="card-head"><h3 id="si-detail-title">Address</h3><div class="btns" id="si-detail-btns"></div></div>
+            <div class="detail-grid">
+              <div><h4>Who It Is</h4><dl class="facts" id="si-who"></dl></div>
+              <div><h4>When It Came</h4><svg id="si-timeline" viewBox="0 0 300 70" role="img" aria-label="Attempts per day over the last 30 days"></svg><p class="muted small" id="si-timeline-note"></p></div>
+            </div>
+            <div class="table-wrap"><table class="plain"><thead><tr><th scope="col">Visit</th><th scope="col">Lasted</th><th scope="col">Attempts</th><th scope="col">What</th><th scope="col">Tried As</th></tr></thead><tbody id="si-visits"></tbody></table></div>
+            <div id="si-route" hidden>
+              <h4 id="si-route-title">Route</h4>
+              <p class="muted small" id="si-route-note"></p>
+              <div class="table-wrap"><table><thead><tr><th scope="col">Hop</th><th scope="col">Address</th><th scope="col">Location</th><th scope="col">Network</th><th scope="col">Time</th></tr></thead><tbody id="si-hops"></tbody></table></div>
+            </div>
+          </section>
+          <section class="card full">
+            <div class="card-head"><h3>Blocked Addresses</h3><span class="muted small" id="bl-state"></span></div>
+            <p class="muted small">Blocked addresses can't reach anything on the server: SSH, mail, websites. The block is applied before anything else sees the traffic and is restored at every start. Your own addresses and this server can't be blocked.</p>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Address or Network</th><th scope="col">Where</th><th scope="col">Note</th><th scope="col">Blocked Since</th><th scope="col">Dropped</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="bl-rows"></tbody></table></div>
           </section>
           <section class="card full">
             <div class="card-head"><h3>Addresses</h3><span class="muted small" id="si-count"></span></div>
             <p class="muted small">Every one of these was refused. SSH needs your key and your code; mail failures are wrong passwords. Addresses that have signed in successfully (yours, the mailbox owners' and the upload accounts'), and any listed in /etc/argus/own-addresses on the server, are left out.</p>
-            <div class="table-wrap"><table><thead><tr><th scope="col">Address</th><th scope="col">Location</th><th scope="col">Network</th><th scope="col">Tries</th><th scope="col">Tried As</th><th scope="col">Last Seen</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="si-rows"></tbody></table></div>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Address</th><th scope="col">Location</th><th scope="col">Network</th><th scope="col">Tries</th><th scope="col">Visits</th><th scope="col">Tried As</th><th scope="col">Last Seen</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="si-rows"></tbody></table></div>
           </section>
         </div>
       </div>

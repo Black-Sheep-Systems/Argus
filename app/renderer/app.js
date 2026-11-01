@@ -276,10 +276,12 @@ const TILES = [
   ['Sign-ins', (s) => {
     const si = obj(s.signins); if (!si) return null;
     const acc = num(si.accepted_24h), ref = num(si.refused_24h);
-    return tile('Sign-Ins', ref == null ? UNK_PILL : ref > 0 ? ['warn', 'Bots knocking'] : ['ok', 'Quiet'], [
+    const t = tile('Sign-Ins', ref == null ? UNK_PILL : ref > 0 ? ['warn', 'Bots knocking'] : ['ok', 'Quiet'], [
       ['Accepted, 24 h', acc],
       ['Refused, 24 h', ref],
     ]);
+    t.append(button('See Where They Come From', '', () => goTo('signins')));
+    return t;
   }],
 ];
 
@@ -310,7 +312,7 @@ function render(s) {
 // ---------- views (phase 2) ----------
 let lastStatus = null;
 let currentView = 'dashboard';
-const VIEWS = ['dashboard', 'server', 'backups', 'hephaestus', 'activity', 'terminal', 'files', 'mail', 'web', 'accounts'];
+const VIEWS = ['dashboard', 'server', 'backups', 'hephaestus', 'activity', 'terminal', 'files', 'mail', 'web', 'accounts', 'signins'];
 
 function el(tag, text, cls) {
   const e = document.createElement(tag);
@@ -379,7 +381,7 @@ function confirmAction({ title, text, ok, word, extra, wide }) {
 
 function showView(v) {
   currentView = v;
-  $('page-title').textContent = { dashboard: 'Everything at a Glance', server: 'Server', backups: 'Backups', hephaestus: 'Hephaestus', activity: 'Activity Log', terminal: 'Terminal', files: 'Files', mail: 'Mail', web: 'Websites', accounts: 'Accounts' }[v];
+  $('page-title').textContent = { dashboard: 'Everything at a Glance', server: 'Server', backups: 'Backups', hephaestus: 'Hephaestus', activity: 'Activity Log', terminal: 'Terminal', files: 'Files', mail: 'Mail', web: 'Websites', accounts: 'Accounts', signins: 'Sign-In Attempts' }[v];
   $('refreshed').hidden = v !== 'dashboard';
   for (const name of VIEWS) $('view-' + name).hidden = name !== v;
   for (const b of document.querySelectorAll('button.nav')) {
@@ -422,6 +424,7 @@ async function loadView(v) {
     else if (v === 'mail') await loadMail();
     else if (v === 'web') await loadWeb();
     else if (v === 'accounts') await loadAccounts();
+    else if (v === 'signins') await loadSignins();
   } catch (err) {
     say('Could not load this page: ' + errText(err));
   }
@@ -1142,6 +1145,110 @@ $('hu-find').addEventListener('click', async () => {
   if (!EMAIL_OK.test(email)) { say('That is not an email address.'); return; }
   huManage(email);
 });
+
+// ---------- sign-in attempts: table, world map, traceroute ----------
+const SVGNS = 'http://www.w3.org/2000/svg';
+const svgEl = (tag, attrs) => { const e = document.createElementNS(SVGNS, tag); for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, String(v)); return e; };
+const mapXY = (lon, lat) => [(lon + 180) / 360 * 1000, (90 - lat) / 180 * 500];
+const placeText = (g) => [g.city, g.country].filter(Boolean).join(', ') || 'Unknown';
+let siData = null, siSeq = 0, trSeq = 0, tracing = false;
+
+function drawMap(rows, server, route) {
+  const svg = $('si-map');
+  const base = svgEl('path', { d: WORLD_MAP_PATH, class: 'land' });
+  const dots = svgEl('g');
+  for (const r of [...rows].sort((a, b) => (b.tries + b.probes) - (a.tries + a.probes))) {
+    if (typeof r.lat !== 'number') continue;
+    const [x, y] = mapXY(r.lon, r.lat);
+    const n = r.tries || r.probes || 1;
+    const c = svgEl('circle', { cx: x.toFixed(1), cy: y.toFixed(1), r: Math.min(16, 2.2 + Math.sqrt(n) / 2.2).toFixed(1), class: 'hit ' + (r.mail && !r.ssh ? 'mail' : 'ssh') });
+    const t = svgEl('title'); t.textContent = `${r.ip} · ${placeText(r)} · ${n} ${n === 1 ? 'try' : 'tries'}`;
+    c.append(t);
+    dots.append(c);
+  }
+  const parts = [base, dots];
+  if (route && route.length > 1) {
+    // Split where a leg crosses the date line, so it isn't drawn the long way round.
+    let seg = [route[0]];
+    const segs = [seg];
+    for (const p of route.slice(1)) { if (Math.abs(p[0] - seg[seg.length - 1][0]) > 500) { seg = [p]; segs.push(seg); } else seg.push(p); }
+    for (const sg of segs) if (sg.length > 1) parts.push(svgEl('polyline', { points: sg.map(([x, y]) => x.toFixed(1) + ',' + y.toFixed(1)).join(' '), class: 'route' }));
+    for (const [x, y] of route.slice(1)) parts.push(svgEl('circle', { cx: x.toFixed(1), cy: y.toFixed(1), r: 3, class: 'hop' }));
+  }
+  if (typeof server?.lat === 'number') {
+    const [x, y] = mapXY(server.lon, server.lat);
+    const h = svgEl('circle', { cx: x.toFixed(1), cy: y.toFixed(1), r: 5, class: 'here' });
+    const t = svgEl('title'); t.textContent = 'This server' + (server.city ? ' (' + server.city + ')' : '');
+    h.append(t);
+    parts.push(h);
+  }
+  svg.replaceChildren(...parts);
+}
+
+async function loadSignins() {
+  const days = $('si-days').value;
+  const my = ++siSeq;
+  trSeq++;                                   // a route still being traced belongs to the old view
+  $('si-route').hidden = true;
+  $('si-summary').textContent = 'Reading the server logs…';
+  $('si-rows').replaceChildren(row([el('span', 'Loading…', 'muted'), '', '', '', '', '', '']));
+  let d;
+  try { d = await call('attacks', [days]); }
+  catch (err) { if (my === siSeq) { $('si-summary').textContent = 'Could not read the sign-in logs: ' + errText(err); $('si-rows').replaceChildren(); } return; }
+  if (my !== siSeq) return;                  // a newer request has been made since
+  siData = d;
+  const t = d.total;
+  const span = { 1: 'the last 24 hours', 7: 'the last 7 days', 30: 'the last 30 days' }[d.days];
+  $('si-summary').textContent = `In ${span}: ${t.addresses.toLocaleString()} addresses made ${t.ssh.toLocaleString()} SSH attempts`
+    + (t.mail ? ` and ${t.mail.toLocaleString()} mail login failures` : '') + (t.probes ? `, plus ${t.probes.toLocaleString()} scans that never got as far as a sign-in` : '')
+    + `. All refused.${t.bans ? ` mailcow banned ${t.bans} ${t.bans === 1 ? 'address' : 'addresses'} for repeated mail failures.` : ''}`;
+  $('si-countries').textContent = d.countries.length ? 'Most attempts from: ' + d.countries.slice(0, 8).map(([c, n]) => `${c} (${n.toLocaleString()})`).join(', ') : '';
+  $('si-credit').textContent = (d.geo?.credit || '') + (d.geo?.updated ? ` · updated ${d.geo.updated}` : ' · location data not downloaded yet') + ' · Map: Natural Earth.';
+  $('si-count').textContent = d.rows.length < t.addresses ? `Busiest ${d.rows.length} of ${t.addresses.toLocaleString()} shown here and on the map` : `${t.addresses.toLocaleString()}`;
+  drawMap(d.rows, d.server, null);
+  $('si-rows').replaceChildren(...d.rows.map((r) => {
+    const tries = el('div');
+    tries.append(el('span', String(r.tries || 0), 'mono'));
+    const bits = [r.ssh && `${r.ssh} SSH`, r.mail && `${r.mail} mail`, r.probes && `${r.probes} scans`, r.banned && 'banned'].filter(Boolean);
+    if (bits.length) tries.append(el('div', bits.join(' · '), 'muted small'));
+    return row([el('span', r.ip, 'mono'), placeText(r), el('span', r.network || '', 'small'), tries,
+      el('span', (r.users || []).join(', '), 'mono small'), el('span', new Date(r.last * 1000).toLocaleString(), 'small'),
+      (() => { const b = button('Trace Route', 'trace-btn', () => traceTo(r)); b.disabled = tracing; return b; })()]);
+  }));
+  if (!d.rows.length) $('si-rows').replaceChildren(row([el('span', 'No refused sign-ins in this period.', 'muted'), '', '', '', '', '', '']));
+}
+
+async function traceTo(r) {
+  if (tracing) return;
+  const my = ++trSeq;
+  tracing = true;
+  for (const b of document.querySelectorAll('.trace-btn')) b.disabled = true;
+  try { await traceRoute(r, my); }
+  finally { tracing = false; for (const b of document.querySelectorAll('.trace-btn')) b.disabled = false; }
+}
+
+async function traceRoute(r, my) {
+  $('si-route').hidden = false;
+  $('si-route-title').textContent = `Route to ${r.ip}`;
+  $('si-hops').replaceChildren(row([el('span', 'Tracing (up to a minute)…', 'muted'), '', '', '', '']));
+  $('si-route').scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+  let t;
+  try { t = await call('trace', [hex(r.ip)]); }
+  catch (err) { if (my === trSeq) $('si-hops').replaceChildren(row([el('span', 'The route could not be traced: ' + errText(err), 'muted'), '', '', '', ''])); return; }
+  if (my !== trSeq) return;
+  $('si-hops').replaceChildren(...t.hops.map((h) => row([String(h.hop), el('span', h.ip === 'private' ? 'private address' : h.ip || 'no reply', h.ip && h.ip !== 'private' ? 'mono' : 'muted'),
+    h.ip && h.ip !== 'private' ? placeText(h) : '', el('span', h.network || '', 'small'), h.ms == null ? '' : h.ms.toFixed(1) + ' ms'])));
+  const reached = t.hops.some((h) => h.ip === t.target);
+  if (!reached) $('si-hops').append(row([el('span', `The last hops didn't answer, which is common: many networks ignore these probes. ${r.ip} is in ${placeText(t.target_geo)}.`, 'muted small'), '', '', '', '']));
+  const pts = [];
+  if (typeof t.server?.lat === 'number') pts.push(mapXY(t.server.lon, t.server.lat));
+  for (const h of t.hops) if (typeof h.lat === 'number') pts.push(mapXY(h.lon, h.lat));
+  if (typeof t.target_geo?.lat === 'number') pts.push(mapXY(t.target_geo.lon, t.target_geo.lat));
+  drawMap(siData?.rows || [], siData?.server, pts);
+}
+$('si-days').addEventListener('change', () => loadSignins());
+$('si-refresh').addEventListener('click', () => loadSignins());
+$('si-route-close').addEventListener('click', () => { $('si-route').hidden = true; drawMap(siData?.rows || [], siData?.server, null); });
 
 // ---------- collapsible sections (remembered on this PC) ----------
 for (const sec of document.querySelectorAll('[data-collapse]')) {

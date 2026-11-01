@@ -19,6 +19,7 @@
     <button class="nav" type="button" data-view="web">Websites</button>
     <button class="nav" type="button" data-view="mail">Mail</button>
     <button class="nav" type="button" data-view="accounts">Accounts</button>
+    <button class="nav" type="button" data-view="signins">Sign-In Attempts</button>
     <button class="nav" type="button" data-view="hephaestus">Hephaestus</button>
     <button class="nav" type="button" data-view="backups">Backups</button>
     <button class="nav" type="button" data-view="files">Files</button>
@@ -237,6 +238,29 @@
         </div>
       </div>
 
+      <div id="view-signins" class="view" hidden>
+        <div class="cards">
+          <section class="card full">
+            <div class="card-head"><h3>Where the Attempts Come From</h3>
+              <div class="btns"><label class="inline-label">Period <select id="si-days"><option value="1">Last 24 Hours</option><option value="7" selected>Last 7 Days</option><option value="30">Last 30 Days</option></select></label><button class="btn small" type="button" id="si-refresh">Refresh</button></div></div>
+            <p id="si-summary" class="muted">Loading…</p>
+            <div class="map-wrap"><svg id="si-map" viewBox="0 20 1000 410" role="img" aria-label="World map of where refused sign-ins came from"></svg></div>
+            <p class="muted small map-legend"><span class="dot ssh"></span> SSH attempts <span class="dot mail"></span> Mail login failures <span class="dot here"></span> This server · Larger dots: more tries. <span id="si-credit"></span></p>
+            <p id="si-countries" class="small"></p>
+          </section>
+          <section class="card full" id="si-route" hidden>
+            <div class="card-head"><h3 id="si-route-title">Route</h3><button class="btn small" type="button" id="si-route-close">Close</button></div>
+            <p class="muted small">From this server outward, one line per network hop. Hops that don't answer show as no reply; hidden private hops are part of a provider's network.</p>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Hop</th><th scope="col">Address</th><th scope="col">Location</th><th scope="col">Network</th><th scope="col">Time</th></tr></thead><tbody id="si-hops"></tbody></table></div>
+          </section>
+          <section class="card full">
+            <div class="card-head"><h3>Addresses</h3><span class="muted small" id="si-count"></span></div>
+            <p class="muted small">Every one of these was refused. SSH needs your key and your code; mail failures are wrong passwords. Addresses that have signed in successfully (yours, the mailbox owners' and the upload accounts'), and any listed in /etc/argus/own-addresses on the server, are left out.</p>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Address</th><th scope="col">Location</th><th scope="col">Network</th><th scope="col">Tries</th><th scope="col">Tried As</th><th scope="col">Last Seen</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="si-rows"></tbody></table></div>
+          </section>
+        </div>
+      </div>
+
       <div id="view-terminal" class="view" hidden>
         <div class="term-bar">
           <span class="muted">Signed in as mattridge. <span class="mono">sudo</span> works without a password, so take care. Copy: select, then Ctrl+Shift+C. Paste: Ctrl+Shift+V.</span>
@@ -323,6 +347,7 @@
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="vendor/qrcode.js"></script>
+<script src="world-map.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

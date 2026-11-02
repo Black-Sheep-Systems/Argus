@@ -1402,10 +1402,20 @@ def block_kind(body):
     return "other"
 
 
+# Mail-setup names have no front page (mailcow answers 404 there by design);
+# check the address mail apps actually ask for instead. This assumes every
+# autoconfig.* and autodiscover.* name is routed to mailcow, as it is today.
+CHECK_PATHS = {"autoconfig": "/mail/config-v1.1.xml", "autodiscover": "/autodiscover/autodiscover.xml"}
+
+
+def check_path(name):
+    return next((v for k, v in CHECK_PATHS.items() if name.startswith(k + ".")), "/")
+
+
 def http_code(name):
     try:
         p = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "8",
-                            "--resolve", name + ":443:127.0.0.1", "https://" + name + "/"],
+                            "--resolve", name + ":443:127.0.0.1", "https://" + name + check_path(name)],
                            capture_output=True, text=True, timeout=12)
         return int(p.stdout or 0)
     except Exception:
@@ -1596,7 +1606,8 @@ def web_job_script(restore_from, label, extra_prep="", test_names=None, extra_un
         "docker compose up -d caddy >/dev/null 2>&1; docker restart " + CADDY + " >/dev/null; sleep 4; RESTORED=1; "
         "echo 'The last good configuration is back.'; }; "
         "trap 'rc=$?; trap - ERR; if [ $RESTORED = 0 ] && [ $UNDO = 1 ]; then restore; fi; exit $rc' ERR; "
-        "code() { curl -s -o /dev/null -w '%{http_code}' -m 8 --resolve \"$1:443:127.0.0.1\" \"https://$1/\" || true; }; "
+        "code() { p=/; case \"$1\" in " + "".join(k + ".*) p=" + v + ";; " for k, v in CHECK_PATHS.items()) + "esac; "
+        "curl -s -o /dev/null -w '%{http_code}' -m 8 --resolve \"$1:443:127.0.0.1\" \"https://$1$p\" || true; }; "
         "echo '1. How each site answers now'; declare -A BEFORE; "
         "for n in " + " ".join(names) + "; do BEFORE[$n]=$(code $n); done; "
         + ("UNDO=1; " + extra_prep if extra_prep else "") +

@@ -478,6 +478,25 @@ class Intel(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stderr)
 
 
+
+class SiteChecks(unittest.TestCase):
+    def test_mail_setup_names_are_checked_where_mail_apps_ask(self):
+        import subprocess
+        names = ["autoconfig.blksheepltd.com", "autodiscover.x.org", "www.autoconfig.x", "example.com", "autoconfigx.com", "autoconfig"]
+        want = ["/mail/config-v1.1.xml", "/autodiscover/autodiscover.xml", "/", "/", "/", "/"]
+        self.assertEqual([h.check_path(n) for n in names], want)
+        # the restart check's shell function picks the same paths
+        src = open(os.path.join(HERE, "..", "argus-helper")).read()
+        i = src.index('"code() { p=/; case')
+        expr = src[i:src.index("|| true; }; \"", i) + len("|| true; }; \"")]
+        fn = eval("(" + expr.replace("\n", " ") + ")", {"CHECK_PATHS": h.CHECK_PATHS})
+        fn = fn.replace("curl -s -o /dev/null -w '%{http_code}' -m 8 --resolve \"$1:443:127.0.0.1\" ", "echo ")
+        out = subprocess.run(["bash", "-c", fn + " for n in " + " ".join(names) + "; do code $n; done"],
+                             capture_output=True, text=True).stdout.split()
+        self.assertEqual(out, ["https://%s%s" % (n, p) for n, p in zip(names, want)])
+
+
+
 if __name__ == "__main__":
     sys.argv[1:] = []
     unittest.main(verbosity=1)

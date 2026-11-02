@@ -1,0 +1,1126 @@
+<title>Argus User Guide</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a fixed contents rail with search on the left, one reading column on the right; the rail folds above the text on a phone.
+   Colours follow Argus's own screen (deep teal on a cool grey-green ground) so the manual looks like the app it describes. */
+:root {
+  --ground: #EEF2F1; --panel: #FFFFFF; --line: #D3DCDA; --rule: #E3EAE8;
+  --text: #13212E; --muted: #4A5A66; --accent: #0B5E5B; --accent-soft: #DCEEEC;
+  --code-bg: #F3F6F5; --mark: #FFE7A3; --rail: #13212E; --rail-text: #C9D6DA; --rail-muted: #8FA5AE; --rail-current: #1F4057; --ring: #3FB8AF;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --ground: #0F1A24; --panel: #172633; --line: #2A3E4E; --rule: #23384A;
+  --text: #E4ECEF; --muted: #A7B8C2; --accent: #6FD3CB; --accent-soft: #163B3A;
+  --code-bg: #12202B; --mark: #5A4710; --rail: #0A131B; --rail-text: #C9D6DA; --rail-muted: #7F96A0; --rail-current: #1F4057; --ring: #3FB8AF;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --ground: #0F1A24; --panel: #172633; --line: #2A3E4E; --rule: #23384A;
+  --text: #E4ECEF; --muted: #A7B8C2; --accent: #6FD3CB; --accent-soft: #163B3A;
+  --code-bg: #12202B; --mark: #5A4710; --rail: #0A131B; --rail-text: #C9D6DA; --rail-muted: #7F96A0; --rail-current: #1F4057; --ring: #3FB8AF;
+  color-scheme: dark }
+
+* { box-sizing: border-box; }
+html { scroll-padding-top: 16px; }
+body { margin: 0; background: var(--ground); color: var(--text); font: 15px/1.6 var(--sans); }
+a { color: var(--accent); }
+:focus-visible { outline: 3px solid var(--ring); outline-offset: 2px; }
+
+.shell { display: grid; grid-template-columns: 290px minmax(0, 1fr); min-height: 100vh; }
+.rail { background: var(--rail); color: var(--rail-text); position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  padding-block: 22px 28px; padding-left: max(18px, env(safe-area-inset-left, 0px)); padding-right: 18px; }
+.brand { display: flex; align-items: baseline; gap: 8px; margin: 0 0 4px; }
+.brand b { font-size: 20px; letter-spacing: .02em; color: #fff; }
+.brand span { color: var(--rail-muted); font-size: 13px; }
+.rail p.small { color: var(--rail-muted); font-size: 12.5px; margin: 0 0 16px; }
+.search { position: relative; margin-bottom: 14px; }
+.search input { width: 100%; font: inherit; font-size: 14px; padding: 8px 10px; border-radius: 6px; border: 1px solid #2E4658;
+  background: #0E1B25; color: #E4ECEF; }
+.search input::placeholder { color: #7F96A0; }
+#hits { font-size: 12.5px; color: var(--rail-muted); min-height: 1.2em; margin: 6px 2px 0; }
+.toc, .toc ul { list-style: none; margin: 0; padding: 0; }
+.toc > li { margin-top: 12px; }
+.toc a { color: var(--rail-text); text-decoration: none; display: block; padding: 3px 8px; border-radius: 5px; font-size: 13.5px; }
+.toc a.g { font-weight: 600; color: #fff; font-size: 14px; }
+.toc ul a { padding-left: 16px; color: var(--rail-muted); }
+.toc a:hover, .toc a.on { background: var(--rail-current); color: #fff; }
+.toc li.miss { display: none; }
+
+main { min-width: 0; padding-block: 28px 80px; padding-left: max(28px, env(safe-area-inset-left, 0px)); padding-right: max(28px, env(safe-area-inset-right, 0px)); }
+.col { max-width: 80ch; }
+header.top { margin-bottom: 26px; }
+header.top h1 { font-size: 30px; line-height: 1.2; margin: 0 0 8px; text-wrap: balance; }
+header.top p { margin: 0 0 6px; color: var(--muted); max-width: 66ch; }
+.facts { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 14px; font-size: 13px; color: var(--muted); }
+.facts code { font-size: 12.5px; }
+
+.group { margin-top: 44px; }
+.group > h2 { font-size: 23px; margin: 0 0 10px; padding-bottom: 8px; border-bottom: 2px solid var(--accent); text-wrap: balance; }
+.sec { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 22px 16px; margin-top: 16px; }
+.sec > h3 { font-size: 18px; margin: 14px 0 6px; color: var(--accent); }
+.sec h4 { font-size: 15.5px; margin: 22px 0 6px; padding-top: 14px; border-top: 1px solid var(--rule); }
+.sec p, .sec li { max-width: 72ch; }
+ul, ol { padding-left: 22px; }
+li { margin: 3px 0; }
+strong { font-weight: 600; }
+code { font-family: var(--mono); font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 4px; padding: 0 4px; overflow-wrap: anywhere; }
+.code { position: relative; margin: 10px 0; }
+.code pre { margin: 0; background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; overflow-x: auto; }
+.code pre code { background: none; border: 0; padding: 0; font-size: 13px; overflow-wrap: normal; white-space: pre; }
+.copy { position: absolute; top: 6px; right: 6px; font: 600 12px var(--sans); padding: 3px 9px; border-radius: 5px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+.copy:hover { border-color: var(--accent); }
+.tw { overflow-x: auto; margin: 10px 0; }
+table { border-collapse: collapse; font-size: 13.5px; min-width: 520px; }
+th, td { text-align: left; vertical-align: top; padding: 7px 10px; border-bottom: 1px solid var(--rule); }
+th { color: var(--muted); font-weight: 600; font-size: 12.5px; border-bottom: 1px solid var(--line); }
+mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px; }
+.sec.miss, .group.miss { display: none; }
+#nothing { display: none; margin-top: 30px; color: var(--muted); }
+
+.railtoggle, .totop { display: none; }
+@media (max-width: 860px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .rail { position: static; height: auto; padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-left: max(16px, env(safe-area-inset-left, 0px)); }
+  .toc { display: none; }
+  .rail.open .toc { display: block; }
+  .totop { display: block; position: fixed; z-index: 5; right: max(16px, calc(env(safe-area-inset-right, 0px) + 12px)); bottom: max(16px, calc(env(safe-area-inset-bottom, 0px) + 12px));
+    font: 600 13px var(--sans); color: #fff; background: var(--rail-current); border: 1px solid var(--ring); border-radius: 18px; padding: 8px 14px; box-shadow: 0 2px 8px rgba(0,0,0,.25); }
+  .railtoggle { display: inline-block; margin-top: 4px; font: 600 13px var(--sans); color: #fff; background: var(--rail-current); border: 0; border-radius: 5px; padding: 6px 12px; }
+  main { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-bottom: 96px; }
+  .sec { padding: 4px 14px 12px; }
+  header.top h1 { font-size: 25px; }
+}
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+</style>
+
+<div class="shell">
+  <nav class="rail" id="rail" aria-label="Contents">
+    <div class="brand"><b>Argus</b><span>user guide</span></div>
+    <p class="small">Every page and button, what it does on the server, and how to do it without Argus.</p>
+    <div class="search">
+      <label for="q" class="small" style="display:block;color:var(--rail-muted);font-size:12.5px;margin-bottom:4px">Search the guide</label>
+      <input id="q" type="search" placeholder="Try “block”, “quota” or “restart”" autocomplete="off">
+      <div id="hits" aria-live="polite"></div>
+    </div>
+    <button class="railtoggle" type="button" id="railtoggle" aria-expanded="false" aria-controls="toc">Contents</button>
+    <ul class="toc" id="toc">
+<li><a class="g" href="#how-argus-works">How Argus Works</a>
+<ul><li><a href="#what-argus-is">What Argus is</a></li><li><a href="#how-it-connects-sign-in-screen-sign-in-t">How it connects (sign-in screen: &quot;Sign In to the Server&quot;)</a></li><li><a href="#what-runs-where">What runs where</a></li><li><a href="#passwords-and-one-time-secrets">Passwords and one-time secrets</a></li><li><a href="#confirmations">Confirmations</a></li><li><a href="#the-activity-log-and-the-helper-s-own-lo">The Activity log (and the helper&#x27;s own log)</a></li><li><a href="#background-jobs">Background jobs</a></li><li><a href="#app-controls-sidebar-foot-and-header">App controls (sidebar foot) and header</a></li></ul>
+</li>
+<li><a class="g" href="#the-pages">The Pages</a>
+<ul><li><a href="#dashboard-page-title-everything-at-a-gla">Dashboard (page title &quot;Everything at a Glance&quot;)</a></li><li><a href="#server">Server</a></li><li><a href="#websites">Websites</a></li><li><a href="#mail">Mail</a></li><li><a href="#accounts">Accounts</a></li><li><a href="#sign-in-attempts">Sign-In Attempts</a></li><li><a href="#hephaestus">Hephaestus</a></li><li><a href="#backups">Backups</a></li><li><a href="#files">Files</a></li><li><a href="#terminal">Terminal</a></li><li><a href="#activity-log">Activity Log</a></li></ul>
+</li>
+<li><a class="g" href="#doing-it-by-hand">Doing It by Hand</a>
+<ul><li><a href="#running-the-helper-yourself">Running the helper yourself</a></li><li><a href="#server-2">Server</a></li><li><a href="#websites-2">Websites</a></li><li><a href="#mail-2">Mail</a></li><li><a href="#accounts-2">Accounts</a></li><li><a href="#sign-in-attempts-and-the-block-list">Sign-In Attempts and the block list</a></li><li><a href="#hephaestus-2">Hephaestus</a></li><li><a href="#backups-2">Backups</a></li><li><a href="#files-2">Files</a></li></ul>
+</li>
+<li><a class="g" href="#what-argus-put-on-the-server">What Argus Put on the Server</a>
+</li>
+<li><a class="g" href="#recovery">Recovery</a>
+<ul><li><a href="#locked-out-by-the-block-list">Locked out by the block list</a></li><li><a href="#ssh-and-pam-changes-from-accounts-setup-">SSH and PAM changes from accounts-setup.sh</a></li><li><a href="#hephaestus-3">Hephaestus</a></li><li><a href="#web-server">Web server</a></li><li><a href="#services-and-updates">Services and updates</a></li><li><a href="#files-and-accounts">Files and accounts</a></li><li><a href="#connection">Connection</a></li></ul>
+</li>
+    </ul>
+  </nav>
+  <main>
+    <div class="col">
+      <header class="top">
+        <h1>Argus User Guide</h1>
+        <p>Argus is a desktop app for running a Linux server from your PC. This guide covers every page, card and button: what you see, what happens on the server when you press it, what Argus refuses to do, and the commands to do the same job by hand when Argus isn't available.</p>
+        <p>Labels in <strong>bold</strong> are exactly as they appear on screen. Words in angle brackets, such as <code>&lt;name&gt;</code> or <code>&lt;stamp&gt;</code>, are placeholders: replace them, brackets included, before you run a command. Nothing secret is written here: secret files are named by path only.</p>
+        <div class="facts"><span>Placeholders such as <code>&lt;server address&gt;</code> and <code>&lt;your user&gt;</code> stand for your own server's details</span><span>Written 2 November 2026 from the Argus source</span></div>
+      </header>
+<section class="group" id="how-argus-works" data-group><h2>How Argus Works</h2>
+<section class="sec" id="what-argus-is"><h3>What Argus is</h3><p>A Windows desktop app (Electron screen, Rust native module, <code>app/</code> and <code>native/</code> and <code>core/</code>) for administering one Linux server over one SSH connection. The sidebar shows &quot;Argus&quot; and the server's name, which is set in the source. Only one copy of Argus can run at a time; starting a second one brings the first window forward (<code>app.requestSingleInstanceLock</code>).</p>
+</section>
+<section class="sec" id="how-it-connects-sign-in-screen-sign-in-t"><h3>How it connects (sign-in screen: &quot;Sign In to the Server&quot;)</h3><ul>
+<li>These details are compiled into Argus: to use it with your own server, change them in the source (<code>native/src/lib.rs</code>, <code>core/src/bin/signin_check.rs</code>, <code>app/main.js</code>, and <code>SERVER_IP</code> in <code>server/argus-helper</code>) and rebuild. Names such as <code>bss-caddy</code>, <code>bss-php</code> and <code>/opt/web</code> are the container and folder names on the server Argus was built for; yours may differ.</li>
+<li>Target is hard-coded in <code>native/src/lib.rs</code> (the sign-in messages quoted below are in <code>core/src/lib.rs</code>): host <code>&lt;server address&gt;</code> (the server), port 22, user <code>&lt;your user&gt;</code>. The screen says &quot;Signing in as &lt;your user&gt;@&lt;server address&gt;.&quot;</li>
+<li>Key file: <code>%USERPROFILE%\.ssh\&lt;your key file&gt;</code> on the PC (falls back to <code>$HOME</code>). If it is missing: &quot;no key file at ...&quot;.</li>
+<li>Step 1, field <strong>Key passphrase</strong>, button <strong>Continue</strong>: the key is unlocked on the PC, Argus connects and checks the server's host key against the pinned fingerprint (built into Argus). Any other key, or a certificate instead of a plain key, is refused (&quot;server key did not match the pinned key: server showed ..., expected ...&quot;). The key is then presented.
+<ul>
+<li>If the server lets the key in without asking for a code, Argus refuses: &quot;the server let the key in without asking for the authenticator code; two-factor is not being enforced&quot;.</li>
+<li>If the key is accepted but no keyboard-interactive step is offered: &quot;key accepted, but the server is not offering the authenticator step&quot;.</li>
+</ul>
+</li>
+<li>Step 2, text &quot;Key accepted. Now the code from your authenticator app.&quot;, field <strong>Authenticator code</strong> (6 to 8 digits), button <strong>Sign In</strong>. A wrong code ends the attempt and the screen goes back to the passphrase (&quot;... Start again with your passphrase.&quot;). Argus answers at most one prompt and stops after four rounds.</li>
+<li>Time limits: connecting and each sign-in step 20 s; each server command 60 s; keepalive every 30 s; the connection closes after 600 s of inactivity.</li>
+<li>Once in, the header shows the pill <strong>Connected</strong> and &quot;&lt;your user&gt;@&lt;server address&gt; · key and code · server key matched&quot;.</li>
+<li>If the connection drops, the pill becomes <strong>Not connected</strong> and the message says &quot;Lost the connection: ... Disconnect and sign in again (a fresh code is needed).&quot;</li>
+<li>README limits: the passphrase and code pass through JavaScript strings that cannot be wiped; russh keeps one plain copy of the code; a Disconnect pressed during sign-in does not cancel the sign-in under way.</li>
+</ul>
+</section>
+<section class="sec" id="what-runs-where"><h3>What runs where</h3><p>On the PC:</p>
+<ul>
+<li>The window (renderer) can call only the fixed list in <code>app/preload.js</code>. It loads nothing from the network: every request that is not one of Argus's own screen files is cancelled, and camera, microphone and similar permissions are refused.</li>
+<li><code>main.js</code> does the PC-side work: listing PC folders and drives, PC file previews, the Hephaestus <code>git</code> commands (repository hard-coded as <code>&lt;path to the Hephaestus repository&gt;</code>), the public DNS lookups for the mail record check, opening <code>https://&lt;mail server address&gt;/admin</code> in the browser, and the clipboard (sensitive copies are cleared after 30 s if unchanged; Windows clipboard history may still keep a copy).</li>
+<li>The native module holds the only SSH connection, and allows only the helper actions in its <code>ACTIONS</code> list (plus <code>SECRET_ACTIONS</code>, which take a password on stdin). Every argument must be 1 to 2048 characters of <code>[A-Za-z0-9._-]</code>, not starting with <code>-</code>; at most 4 arguments.</li>
+</ul>
+<p>On the server:</p>
+<ul>
+<li>Server actions go through <code>/usr/local/sbin/argus-helper</code> (Python, run as root through <code>sudo -n</code>). The helper itself says it &quot;is not a security boundary: &lt;your user&gt; has full sudo. It keeps Argus's buttons to known, logged actions.&quot;</li>
+<li>Exceptions (they do not go through the helper):
+<ul>
+<li><strong>Files</strong>: listing, previews and downloads run over SFTP as root (<code>sudo -n /usr/lib/openssh/sftp-server</code>). Uploads go to a temporary file over SFTP and are then put in place by the helper (<code>file-commit</code>); new folders are made by the helper (<code>file-mkdir</code>); downloads are recorded afterwards with <code>note-file</code>.</li>
+<li><strong>Terminal</strong>: a normal interactive shell as <code>&lt;your user&gt;</code> (pseudo-terminal <code>xterm-256color</code>). Nothing typed there is logged by Argus.</li>
+</ul>
+</li>
+<li>Long changes run as background systemd units (see &quot;Background jobs&quot; below).</li>
+</ul>
+</section>
+<section class="sec" id="passwords-and-one-time-secrets"><h3>Passwords and one-time secrets</h3><ul>
+<li>Password dialog (shared): legend &quot;Password&quot;, choices &quot;Generate one and show it once&quot; or &quot;I'll type one&quot; (&quot;New password (12 characters or more)&quot; and &quot;Type it again&quot;). Note shown: &quot;The password goes to the server on its own channel. It is never put on a command line and never written to a log.&quot; The typed password (or the word <code>generate</code>) goes to the helper on stdin. The helper accepts 12 to 200 characters, no control characters. A generated password is 20 letters and digits with at least one digit, lower and upper case letter.</li>
+<li>One-time display dialog: shows the value, warns &quot;This is the only time it is shown. Copy it now; Argus clears the clipboard again after 30 seconds.&quot;, buttons <strong>Copy</strong> and <strong>Done</strong>.</li>
+<li>Authenticator dialog (upload accounts): QR code, the key, five emergency codes; &quot;This is the only time these are shown. Hand them over now; Argus clears the clipboard again after 30 seconds.&quot;; buttons <strong>Copy Key and Codes</strong> and <strong>Done</strong>.</li>
+</ul>
+</section>
+<section class="sec" id="confirmations"><h3>Confirmations</h3><p>Most changes open a confirmation dialog with a title, text, <strong>Cancel</strong> and a red button. Some ask you to type a word (&quot;Type &lt;word&gt; to confirm&quot;) before the button works. Each one is listed under its button below.</p>
+</section>
+<section class="sec" id="the-activity-log-and-the-helper-s-own-lo"><h3>The Activity log (and the helper&#x27;s own log)</h3><ul>
+<li>Every helper call is appended to <code>/var/log/argus/actions.log</code> (root, 0600) as one JSON line: time, session, action, arguments (or a readable summary the action records instead of raw hex), result (<code>ok</code>, <code>refused: &lt;why&gt;</code>, or <code>failed: &lt;type&gt;</code>). What the server sent back is never logged; passwords are never logged.</li>
+<li>Arguments are cut to 64 characters (330 for file, mail, alias and quarantine actions). An action with unexpected arguments logs no arguments.</li>
+<li>Session ids: a random 16-hex-character id per sign-in; jobs calling the helper use <code>job-web-&lt;6 digits&gt;</code>; the boot unit uses <code>boot-mounts</code>; the location timer uses <code>geo-timer</code>.</li>
+<li>The <strong>Activity Log</strong> view (<a href="#activity-log">Activity Log</a>) shows the last 300 entries.</li>
+</ul>
+</section>
+<section class="sec" id="background-jobs"><h3>Background jobs</h3><ul>
+<li><code>start_job</code> writes a script to <code>/var/log/argus/jobs/&lt;job&gt;.sh</code> (0700), logs to <code>/var/log/argus/jobs/&lt;job&gt;.log</code> (0600), and starts a transient unit <code>argus-&lt;job&gt;.service</code> with <code>systemd-run</code> (RuntimeMaxSec 3600 s; service updates 4 h). The log ends with <code>ARGUS-RESULT: ok</code> or <code>ARGUS-RESULT: failed</code>.</li>
+<li>Jobs: <code>updates</code>, <code>heph-rollback</code>, <code>heph-deploy</code>, <code>web</code>, <code>svc-update</code>.</li>
+<li>One change at a time: a lock file <code>/var/log/argus/jobs/.lock</code>. A new job (and reboot, upload-account changes, block list changes, staging a Hephaestus package, uploads into <code>/opt/web</code>) is refused with &quot;another change is starting; try again in a moment&quot;, or &quot;not now: the &lt;job&gt; job is still running&quot;, or &quot;not now: the server is installing updates right now&quot; (dpkg lock held).</li>
+<li>On screen, a job box shows a heading (&quot;Last update run: &quot;, &quot;Last rollback: &quot;, &quot;Last deploy: &quot;, &quot;Last web server change: &quot;, &quot;Last service update: &quot;) with a pill <strong>Running</strong>, <strong>Finished</strong>, <strong>Failed</strong> or <strong>Interrupted</strong>, the last 40 log lines, and a final line (&quot;■ Done: finished without errors.&quot;, &quot;■ Stopped: it failed. The lines above say where.&quot;, or &quot;■ Stopped before it finished (interrupted).&quot;). While running it re-reads every 3 s (helper action <code>job-status &lt;job&gt;</code>).</li>
+</ul>
+</section>
+<section class="sec" id="app-controls-sidebar-foot-and-header"><h3>App controls (sidebar foot) and header</h3><ul>
+<li><strong>Reload</strong> (tooltip &quot;Redraw the screen; you stay signed in&quot;): reloads the window. An open terminal session is closed on reload.</li>
+<li><strong>Restart</strong> (tooltip &quot;Close and reopen Argus; sign in again afterwards&quot;): confirm &quot;Restart Argus?&quot; / &quot;Argus signs out, closes and opens again with any changes. Sign in again with your passphrase and a fresh code.&quot; / <strong>Restart Argus</strong>.</li>
+<li><strong>Exit</strong> (tooltip &quot;Sign out and close Argus&quot;): confirm &quot;Exit Argus?&quot; / &quot;Argus signs out and closes.&quot; / <strong>Exit</strong>.</li>
+<li>Header: <strong>Theme</strong> select (&quot;Match Windows&quot;, &quot;Light&quot;, &quot;Dark&quot;; remembered on this PC), <strong>Refresh</strong> (re-reads the dashboard status), <strong>Disconnect</strong> (closes the terminal and the connection and returns to the passphrase step).</li>
+</ul>
+</section>
+</section>
+<section class="group" id="the-pages" data-group><h2>The Pages</h2><p>Sidebar order: Dashboard, Server, Websites, Mail, Accounts, Sign-In Attempts, Hephaestus, Backups, Files, Terminal, Activity Log.</p>
+
+<section class="sec" id="dashboard-page-title-everything-at-a-gla"><h3>Dashboard (page title &quot;Everything at a Glance&quot;)</h3><p>Data: helper action <code>status</code> every 30 s (&quot;Refreshed every 30 seconds · last at &lt;time&gt;&quot;). The helper builds each section in parallel with a 45 s overall deadline; a section not ready or not readable comes back empty and its tile shows <strong>Unknown</strong> with &quot;Status: could not be read&quot;. If the report itself fails but the connection is up: &quot;The server could not produce its status report: ... Trying again in 30 seconds.&quot;</p>
+<p>Tiles (each with a status pill):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Tile</th>
+<th>Shows</th>
+<th>Comes from on the server</th>
+<th>Pill</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Server</td>
+<td>Up for, Load (N CPUs), Memory, Disk, Reboot needed</td>
+<td><code>/proc/uptime</code>, load average, <code>/proc/meminfo</code>, disk use of <code>/</code>, <code>/run/reboot-required</code> (reboot needed), <code>/run/systemd/shutdown/scheduled</code> (restart scheduled)</td>
+<td><strong>Healthy</strong>, or <strong>Busy</strong> if memory over 90%, disk over 85% or load over 1.5 x CPUs</td>
+</tr>
+<tr>
+<td>Services</td>
+<td>Running, Unhealthy, Stopped, Finished one-off jobs</td>
+<td><code>docker ps -a</code>; <code>hephaestus-prod-migrate-1</code> exiting 0 counts as a finished one-off job</td>
+<td><strong>All running</strong>, or &quot;&lt;n&gt; need attention&quot;</td>
+</tr>
+<tr>
+<td>Websites</td>
+<td>Names served, Certificates (min to max days left), Could not check</td>
+<td>Site names from <code>/opt/web/Caddyfile</code>; certificate end date via <code>openssl s_client -connect 127.0.0.1:443 -servername &lt;name&gt;</code></td>
+<td>&quot;&lt;n&gt; with certificates&quot;, &quot;&lt;n&gt; expiring&quot; (under 21 days), &quot;&lt;n&gt; unreadable&quot;</td>
+</tr>
+<tr>
+<td>Mail</td>
+<td>Webmail and admin, Queue</td>
+<td>mailcow API <code>get/mailq/all</code> (answering means the web side works)</td>
+<td><strong>Answering</strong> or <strong>Web side down</strong></td>
+</tr>
+<tr>
+<td>Hephaestus</td>
+<td>Version, App health</td>
+<td><code>/var/lib/argus/heph-deployed</code>; <code>docker inspect</code> health of <code>hephaestus-prod-app-1</code></td>
+<td><strong>Live</strong> or the health word</td>
+</tr>
+<tr>
+<td>Backups</td>
+<td>Mail, Hephaestus Database (&quot;&lt;age&gt; · &lt;n&gt; kept&quot;)</td>
+<td>Newest entry (not <code>.part</code>) in <code>/opt/backups/mailcow</code> and <code>/opt/backups/hephaestus</code></td>
+<td><strong>Up to date</strong>, or &quot;&lt;n&gt; late or unknown&quot; (newest older than 26 h or unreadable)</td>
+</tr>
+<tr>
+<td>Scheduled Jobs</td>
+<td>One line per job: &quot;ok · &lt;last run&gt;&quot; or the result</td>
+<td><code>systemctl show</code> for the service and timer of <code>mailcow-backup</code>, <code>heph-db-backup</code>, <code>apt-daily-upgrade</code>, one further job hard-coded for the reference server (&quot;missing&quot; if either unit is not loaded)</td>
+<td><strong>All ok</strong>, &quot;&lt;n&gt; not ok&quot;, &quot;&lt;n&gt; unknown&quot;</td>
+</tr>
+<tr>
+<td>Updates</td>
+<td>Waiting, Security</td>
+<td><code>apt-get -s upgrade</code> (lines with &quot;security&quot;)</td>
+<td><strong>No security updates</strong> or &quot;&lt;n&gt; security&quot;</td>
+</tr>
+<tr>
+<td>Sign-Ins</td>
+<td>Accepted, 24 h; Refused, 24 h; button <strong>See Where They Come From</strong> (opens Sign-In Attempts)</td>
+<td>Same counting as the Sign-In Attempts page for the last 24 hours</td>
+<td><strong>Quiet</strong> or <strong>Bots knocking</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>&quot;Needs a look&quot; panel (&quot;One thing needs a look&quot; / &quot;&lt;n&gt; things need a look&quot;), each with a button that opens the right page and scrolls to the card:</p>
+<ul>
+<li>Disk over 85% full: button <strong>Open Files</strong>.</li>
+<li>Restart needed: <strong>Go to Restart</strong>.</li>
+<li>Service stopped or unhealthy, mailcow web side not answering: <strong>Go to Services</strong>.</li>
+<li>Certificate under 21 days: <strong>Go to Websites</strong>.</li>
+<li>More than 20 messages in the mail queue: <strong>Go to Mail Queue</strong>.</li>
+<li>Hephaestus not healthy: <strong>Go to Hephaestus</strong>.</li>
+<li>Backup missing, unreadable or over a day old: <strong>Go to Backups</strong>.</li>
+<li>Scheduled job not successful (&quot;In the Terminal, &quot;systemctl status &lt;name&gt;&quot; shows why.&quot;): <strong>Open Terminal</strong>.</li>
+<li>Security updates waiting: <strong>Go to Updates</strong>.</li>
+</ul>
+<p>Doing it by hand: <code>cat /var/lib/argus/heph-deployed</code>; <code>docker ps -a</code>; <code>systemctl list-timers</code>; <code>systemctl status &lt;job&gt;.service</code>; <code>apt-get -s upgrade | grep ^Inst</code>; <code>ls -lt /opt/backups/mailcow /opt/backups/hephaestus</code>; <code>test -e /run/reboot-required &amp;&amp; echo restart needed</code>. Or the whole report: <code>sudo /usr/local/sbin/argus-helper --session by-hand-01 status</code> (see <a href="#running-the-helper-yourself">Running the helper yourself</a>).</p>
+</section>
+<section class="sec" id="server"><h3>Server</h3><h4>Services</h4>
+<p>Text: &quot;Restarting a service stops it for a few seconds. Visitors to that site or service see an error while it starts again.&quot;</p>
+<ul>
+<li>Table columns: Service, Version, Update Available, (actions).</li>
+<li>Rows: running containers from the dashboard status (<code>docker ps</code>). Version and the update pill come from helper action <code>service-updates</code> (cached in <code>/var/lib/argus/service-updates.json</code>, re-checked when older than 6 hours). Pills: <strong>Up to Date</strong>, <strong>Update Available</strong>, <strong>Newer Version (Manual)</strong>, <strong>Your Code</strong> (Hephaestus), <strong>Can't Check</strong>. Hovering a pill shows the detail. Footer: &quot;Checked with each publisher &lt;date&gt;; checked again every 6 hours or with Check Now.&quot;</li>
+<li>Button <strong>Restart</strong> (per row): confirm &quot;Restart &lt;name&gt;?&quot; / &quot;&lt;name&gt; stops for a few seconds and starts again. Anything it serves shows an error meanwhile.&quot; / <strong>Restart</strong>. Helper action <code>service-restart &lt;name&gt;</code>: name must match a container name pattern and be running (&quot;no running container by that name&quot;), then <code>docker restart -t 30 &lt;name&gt;</code>.</li>
+</ul>
+<h4>Updates</h4>
+<p>Sub-heading <strong>System Packages</strong></p>
+<ul>
+<li>List from helper action <code>updates-list</code>: <code>apt-get -s upgrade</code> (it does not run <code>apt-get update</code> first, so it reflects the last package-list refresh), at most 60 packages. For each: description (<code>apt-cache show</code>), &quot;&lt;from&gt; → &lt;to&gt; · &lt;source&gt;&quot;, and &quot;What this update changes&quot; (from <code>apt-get changelog</code>, entries newer than the installed version, cached in <code>/var/cache/argus/changelogs</code> and pruned after 60 days; &quot;Change details are not available.&quot; otherwise).</li>
+<li>Rating pills: <strong>High · security fix</strong> (from Debian security updates), <strong>High · marked urgent</strong> (maintainer urgency high, emergency or critical), <strong>Medium · time-sensitive fix</strong> (stable-updates), <strong>Low · routine</strong>, <strong>Not rated</strong>. Advice line: &quot;Apply soon: ...&quot;, &quot;Time-sensitive fixes. Apply when convenient, within a few days.&quot; or &quot;Routine. These can wait for your next update round.&quot; If Docker or containerd is in the list: &quot;This includes Docker. Installing it restarts every service on the server, mail included, for a minute or two.&quot;</li>
+<li>Button <strong>Apply Updates</strong> (disabled when nothing is waiting): confirm &quot;Apply Updates?&quot; / &quot;The waiting updates are installed now. Services they touch may restart briefly. [Docker sentence if included] If an update needs the server restarted, Argus says so and you choose when.&quot; / <strong>Apply Updates</strong>. Helper action <code>updates-apply</code>, job <code>updates</code>:
+<code>apt-get -o DPkg::Lock::Timeout=600 update &amp;&amp; apt-get -y -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade</code> (non-interactive), then prints &quot;A restart is needed to finish these updates.&quot; if <code>/run/reboot-required</code> exists. Refused while another job runs or apt is busy.</li>
+</ul>
+<p>Sub-heading <strong>Service Updates</strong>, button <strong>Check Now</strong> (helper action <code>service-updates refresh</code>: checks every container with its publisher now).</p>
+<ul>
+<li>What the check does (<code>check_services</code>): for each container, works out its kind:
+<ul>
+<li>mailcow containers: compares <code>git describe --tags</code> in <code>/opt/mailcow-dockerized</code> with the latest GitHub release of mailcow-dockerized.</li>
+<li><code>hephaestus:local</code>: shown as <strong>Your Code</strong> (&quot;deploy new versions from the Hephaestus page&quot;).</li>
+<li>images built on the server (a compose <code>build:</code> line, or <code>bss-php:8.5</code> built by hand from <code>/opt/web/php</code>): checks whether the Dockerfile's base images have a patched build, and whether a newer base version exists.</li>
+<li>ready-made images: compares the registry digest (Docker Hub or ghcr.io only) with the local one; pinned images (<code>name:tag@sha256:...</code>) are reported but changed by hand; newer tags of the same shape (same major or the next one) are reported as manual.</li>
+<li>a container running an older copy of its image tag: &quot;running an older copy of ...; restart it onto the current one&quot;.</li>
+</ul>
+</li>
+<li>Each item shows a pill (<strong>Update Available</strong> or <strong>Manual</strong>), the detail, a <strong>How to Update</strong> section (by-hand steps written by the helper), and, if Argus can apply it, a button:
+<ul>
+<li><strong>Update Mail System</strong> (mailcow): confirm &quot;Update the Mail System?&quot; / &quot;Argus takes a mail backup first, then runs mailcow's updater. Mail and webmail are unavailable for a few minutes. If the backup fails, nothing is updated.&quot; / <strong>Update Mail System</strong>.</li>
+<li><strong>Update</strong> (other services): confirm &quot;Update &lt;names&gt;?&quot; / &quot;&lt;detail&gt;. It restarts for a few seconds; anything using it sees an error meanwhile.&quot; (plural wording for several) / <strong>Update</strong>.</li>
+</ul>
+</li>
+<li>Helper action <code>service-update &lt;container&gt;|mailcow</code>, job <code>svc-update</code> (4 h limit):
+<ul>
+<li><code>mailcow</code>: 1/3 <code>systemctl start mailcow-backup.service</code> (if it fails: &quot;The backup failed; nothing was updated.&quot;); 2/3 <code>cd /opt/mailcow-dockerized; ./update.sh --force</code>, run again if it exits 2 (it updated itself); 3/3 after 20 s, every mailcow container must be running. Clears the service cache.</li>
+<li><code>pull</code>: tags the running image <code>argus-rollback/&lt;name&gt;:before-update</code>, <code>docker compose pull &lt;svc&gt;</code>, <code>docker compose up -d --no-deps --force-recreate &lt;svc&gt;</code>, checks it runs.</li>
+<li><code>rebuild</code>: same, with <code>docker compose build --pull &lt;svc&gt;</code>.</li>
+<li><code>rebuild-image</code> (<code>bss-php:8.5</code>): tags it <code>bss-php:before-update</code>, <code>docker build --pull -t bss-php:8.5 /opt/web/php</code>, recreates every container that uses it, checks they run. On failure it prints the undo.</li>
+<li><code>recreate</code>: tags the running image <code>argus-rollback/&lt;name&gt;:before-update</code>, then recreates the container onto the current image.</li>
+</ul>
+</li>
+<li>Safeguards: &quot;check for updates first&quot; (no cache); &quot;Argus has no update to apply for &lt;name&gt;; see How to Update&quot;; the compose folder (from the container's labels, re-read live) must be a real root-owned folder under <code>/opt</code>, not writable by group or others, and not mailcow's (&quot;that service can't be updated from here ...&quot;). <code>hephaestus-prod-migrate-1</code> is never offered.</li>
+</ul>
+<h4>Restart the Server</h4>
+<p>Text: &quot;Everything on the server goes offline for about two minutes: websites, mail and Hephaestus. Argus disconnects and you sign in again afterwards.&quot;</p>
+<ul>
+<li><strong>Restart in One Minute</strong>: confirm &quot;Restart the Server?&quot; / &quot;In one minute the server restarts. Websites, mail and Hephaestus are offline for about two minutes. You can cancel during that minute.&quot; / type <code>restart</code> / <strong>Restart in One Minute</strong>. Helper action <code>reboot</code>: under the change lock, <code>shutdown -r +1 &quot;Restart requested from Argus&quot;</code>. Refused while a job runs or apt is busy. Afterwards: &quot;The server restarts in one minute. Argus will lose its connection; sign in again in about three minutes.&quot;</li>
+<li><strong>Cancel the Restart</strong> (shown while a restart is scheduled): confirm &quot;Cancel the Restart?&quot; / &quot;The scheduled restart is called off and the server keeps running.&quot; / <strong>Cancel the Restart</strong>. Helper action <code>reboot-cancel</code>: <code>shutdown -c</code>.</li>
+<li>State line: &quot;A restart is scheduled within the next minute.&quot; (from <code>/run/systemd/shutdown/scheduled</code>).</li>
+</ul>
+</section>
+<section class="sec" id="websites"><h3>Websites</h3><h4>Sites</h4>
+<ul>
+<li>Table: Name, What It Is (&quot;Website&quot;, &quot;App on the server&quot;, &quot;Redirect&quot;, &quot;Other&quot;, with the folder, port or target underneath), Answering, Certificate, (actions).</li>
+<li>Helper action <code>sites-list</code>: parses the site blocks in <code>/opt/web/Caddyfile</code> (and <code>root</code> lines in <code>/opt/web/sites/&lt;file&gt;.caddy</code> it imports); &quot;Answering&quot; is the HTTP code from <code>curl --resolve &lt;name&gt;:443:127.0.0.1 https://&lt;name&gt;/</code> (for <code>autoconfig.*</code> names, <code>/mail/config-v1.1.xml</code>; for <code>autodiscover.*</code> names, <code>/autodiscover/autodiscover.xml</code>, because those mail-setup names have no front page and answer 404 there by design) (pill <strong>Not answering</strong>, &quot;Error &lt;code&gt;&quot; for 5xx, or the code); &quot;Certificate&quot; is days left via <code>openssl s_client</code> (red under 14 days, amber under 30, <strong>Unknown</strong> if unreadable).</li>
+<li>Button <strong>Renew</strong> (per name): confirm &quot;Get a New Certificate for &lt;name&gt;?&quot; / &quot;The current certificate is set aside (kept in /root/config-backups-argus) and the web server restarts; every site blips for a second or two. Caddy then asks Let's Encrypt for a new one, which takes up to a minute. Only needed if the certificate is wrong; Caddy renews on its own 30 days before expiry. Let's Encrypt allows about five new certificates per name per week, so do not repeat this many times. If no new certificate arrives within 90 seconds, the old one is put back.&quot; / <strong>Get a New Certificate</strong>. Helper action <code>cert-renew &lt;name&gt;(hex)</code>, job <code>web</code>:
+<ul>
+<li>Refused if the name is not served, if <code>/opt/web</code> has edits not yet applied, or if no certificate folder is found.</li>
+<li>Moves <code>&lt;caddy data folder&gt;/caddy/certificates/&lt;issuer&gt;/&lt;name&gt;</code> (the host folder bound to <code>/data</code> in <code>bss-caddy</code>) to <code>/root/config-backups-argus/cert-&lt;name&gt;-&lt;stamp&gt;/&lt;n&gt;/</code>, then runs the shared web job (below), testing every other name; step 5 waits up to 90 s for a certificate to be served for the name; if none, the old certificate folders are moved back.</li>
+</ul>
+</li>
+</ul>
+<h4>Web Server Configuration</h4>
+<ul>
+<li>State line from <code>sites-list</code>: &quot;Nothing has been applied through Argus yet. The first Apply keeps the configuration the web server is running now as the first good copy (only if the files have not been edited since it started).&quot;, or &quot;The files have changed since the last apply (&lt;stamp&gt;). Check, then Apply.&quot;, or &quot;The files match what was last applied (&lt;stamp&gt;).&quot;</li>
+<li>Help text: &quot;To change it, edit the files in /opt/web on the Files page (the old version is kept). Then Check, and Apply. Apply restarts the web server: every site blips for a second or two. If a site that worked stops working, the last good configuration is put back by itself.&quot;</li>
+<li>The configuration is <code>/opt/web/Caddyfile</code>, <code>/opt/web/site-rules.caddy</code>, <code>/opt/web/docker-compose.yml</code> and <code>/opt/web/sites/*.caddy</code>. <code>/opt/web/caddy.env</code> and <code>/opt/web/agent-allow/allow.caddy</code> are never shown.</li>
+<li><strong>Open /opt/web in Files</strong>: switches to Files at <code>/opt/web</code>.</li>
+<li><strong>Check</strong>: helper action <code>caddy-check</code>. Validates in a throwaway container: same image as <code>bss-caddy</code>, all its mounts read-only, <code>--network none</code>, <code>--env-file /opt/web/caddy.env</code>, an empty temporary <code>/data/logs</code>, <code>caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile</code>. Shows <strong>Valid</strong> or <strong>Not valid</strong> with the last 25 lines; values from <code>caddy.env</code> and addresses from the agent allow-list are replaced by &quot;[hidden]&quot;, and lines naming <code>HEPH_PROXY_SECRET</code> or <code>allow.caddy</code> are dropped.</li>
+<li><strong>Apply Changes</strong> (disabled when nothing changed): confirm &quot;Apply the Web Server Changes?&quot; / &quot;The configuration is checked first; if it does not pass, nothing is restarted and your edits stay as they are. Then the web server restarts (every site blips for a second or two) and every site is tested. If a site that worked before stops working, the last good configuration is put back by itself, and your edited files are kept in /var/lib/argus/caddy-history/failed-&lt;time&gt; so nothing is lost.&quot; / <strong>Apply</strong>. Helper action <code>caddy-apply</code>, job <code>web</code>.
+<ul>
+<li>The first time, it keeps the live configuration as the first good copy, but only if no file changed after <code>bss-caddy</code> last started; otherwise refused: &quot;the files in /opt/web changed after the web server last started, so Argus cannot tell which configuration is live. Put the files back as they were (the Files page keeps copies) and try again, or ask for the first copy to be set up by hand&quot;.</li>
+<li>Refused if &quot;nothing has changed since the last apply&quot;.</li>
+</ul>
+</li>
+<li><strong>Show the configuration files</strong> (expands): helper action <code>caddy-show</code>, read-only, each file as text.</li>
+<li><strong>Earlier configurations</strong> (expands): helper action <code>caddy-history</code>, up to 20 kept configurations, newest marked &quot;(last applied)&quot;. Others have <strong>Roll Back to This</strong>: confirm &quot;Roll the Web Server Configuration Back?&quot; / &quot;The configuration kept on &lt;stamp&gt; is put back, checked, and the web server restarts (every site blips). If a site that works in both would stop working, the current configuration is put back. Names added since then stop being served (their folders and files stay); the job lists them.&quot; / <strong>Roll Back</strong>. Helper action <code>caddy-rollback &lt;stamp&gt;</code>, job <code>web</code>. Refused if that configuration is not kept or <code>/opt/web</code> has unapplied edits. Only names present in both configurations are tested.</li>
+</ul>
+<p>The shared web job (all of Apply, Roll Back, Renew, Add Site):</p>
+<ol>
+<li>&quot;How each site answers now&quot; (records each name's HTTP code).</li>
+<li>(Argus's own change, if any.) &quot;Checking the configuration&quot; (calls the helper's <code>caddy-check</code>).</li>
+<li>&quot;Restarting the web server (every site blips for a second or two)&quot;: <code>cd /opt/web; docker compose up -d caddy; docker restart bss-caddy</code>.</li>
+<li>&quot;Testing every site again&quot;: a site that answered under 400 and now gives 000 or 400 and up, or under 500 and now 500 and up, counts as broken.</li>
+<li>(Renew only: waiting for the certificate.)</li>
+</ol>
+<ul>
+<li>On success: a copy goes to <code>/var/lib/argus/caddy-history/&lt;YYYYMMDD-HHMMSS&gt;/</code>; the 20 newest good copies and 10 newest failed copies are kept.</li>
+<li>On failure after a change was made: the current files are copied to <code>/var/lib/argus/caddy-history/failed-&lt;stamp&gt;/</code>, the last good copy is put back, and the web server restarts. For Apply, if the check fails before any restart, nothing is put back and the edits stay.</li>
+</ul>
+<h4>Add a Site</h4>
+<ul>
+<li>Legend &quot;What Should It Be?&quot; with &quot;A website (a folder of pages on the server)&quot;, &quot;A redirect to another address&quot;, &quot;An app running on the server (a local port)&quot;.</li>
+<li>Fields: <strong>Domain (without www)</strong>; for a redirect &quot;Send visitors to (an https:// address)&quot;; for an app &quot;Local port the app listens on (for example 8090)&quot;.</li>
+<li><strong>Add Site</strong>: confirm &quot;Add &lt;domain&gt;?&quot; / &quot;&lt;domain&gt; and www.&lt;domain&gt; become &lt;what&gt;. The web server restarts (every site blips). Nothing changes in DNS: Argus shows the records to add at your registrar, and the certificate arrives once they point here.&quot; / <strong>Add Site</strong>. Helper action <code>site-add static|redirect|proxy &lt;domain&gt;(hex) [&lt;target&gt;(hex)]</code>, job <code>web</code>.
+<ul>
+<li>Website: makes <code>/srv/&lt;domain&gt;/public</code> (0755) with a &quot;Coming soon&quot; <code>index.html</code> if none, writes <code>/opt/web/sites/&lt;domain&gt;.caddy</code> (root, compression, security headers, dot-files answer 404, file server), adds a read-only mount of <code>/srv/&lt;domain&gt;/public</code> to <code>/opt/web/docker-compose.yml</code> (inserted before the <code>site-rules.caddy</code> mount line), and appends a block for <code>&lt;domain&gt;</code> plus a 308 redirect from <code>www.&lt;domain&gt;</code> to the Caddyfile.</li>
+<li>Redirect: one block for both names, <code>redir &lt;target&gt;{uri} 308</code>. Target must be an <code>https://</code> address.</li>
+<li>App: <code>reverse_proxy 127.0.0.1:&lt;port&gt;</code> with compression; <code>www.</code> redirects. Port 1024 to 65535.</li>
+<li>Refused: domain with <code>www.</code>, domain already served, unapplied edits in <code>/opt/web</code>, no good configuration kept yet.</li>
+<li>Afterwards the card shows the DNS records: A <code>&lt;domain&gt;</code> and A <code>www.&lt;domain&gt;</code> pointing to <code>&lt;server address&gt;</code>, and &quot;No AAAA (IPv6) record: the server has no IPv6 address.&quot;</li>
+<li>If the job puts the last good configuration back, the new <code>/srv/&lt;domain&gt;</code> folder is not removed (the job only restores the configuration files).</li>
+</ul>
+</li>
+</ul>
+</section>
+<section class="sec" id="mail"><h3>Mail</h3><p>All mail data comes from mailcow's API at <code>http://127.0.0.1:8080/api/v1/</code> on the server, using the API key in <code>/opt/mailcow-dockerized/mailcow.conf</code> (never printed). A change counts only if mailcow answers with an explicit success (&quot;mailcow did not confirm the change; look again before retrying&quot; otherwise; &quot;mailcow refused it: ...&quot; on an error). Helper action <code>mail-overview</code> loads the page: mailboxes, app passwords per mailbox, aliases, domains, queue, quarantine, and who has two-factor on (read-only query of the <code>tfa</code> table inside the <code>mailcowdockerized-mysql-mailcow-1</code> container).</p>
+<h4>Mailboxes</h4>
+<ul>
+<li>Columns: Address (with name, <strong>Disabled</strong> pill), Used (&quot;&lt;used&gt; of &lt;limit&gt; · &lt;n&gt;%&quot;), Webmail Two-Factor (<strong>On</strong>, <strong>Off</strong>, <strong>Unknown</strong>), App Passwords (count), Last Sign-In (newest of IMAP, SMTP, POP3 and SSO sign-ins, or &quot;never&quot;), (actions).</li>
+<li>Footer: &quot;Mail apps use app passwords, one per device, so a lost phone is revoked without changing the main password. Two-factor is set up by each person in webmail; resetting it (for a lost phone) is done in mailcow's admin pages.&quot;</li>
+<li><strong>New Mailbox</strong>: asks &quot;Full address (domains: ...)&quot; (must be on an existing mailcow domain), &quot;Person or purpose shown with the address (optional)&quot;, size in GB (above 0, up to 1000), then the password dialog. Helper action <code>mailbox-add &lt;local&gt;(hex) &lt;domain&gt;(hex) &lt;MB&gt; &lt;name&gt;(hex or 00)</code> with the password on stdin; mailcow <code>add/mailbox</code> (active, TLS enforced in and out). A generated password is shown once: &quot;Give this to the mailbox owner. They should set up two-factor in webmail after their first sign-in.&quot;</li>
+<li><strong>Manage</strong> (per mailbox) opens a menu:
+<ul>
+<li><strong>Change Password</strong> (&quot;type one, or have one generated and shown once&quot;): password dialog, helper action <code>mailbox-password &lt;mailbox&gt;(hex)</code> (stdin); mailcow <code>edit/mailbox</code>. Generated one shown once: &quot;Mail apps that used the old one stop working until they are given this (or an app password).&quot;</li>
+<li><strong>App Passwords</strong> (&quot;&lt;n&gt; now; one per device&quot;): dialog &quot;App Passwords for &lt;mailbox&gt;&quot; / &quot;One per device (phone, laptop, mail app). Make a new one for each device; revoke it if the device is lost.&quot; Each entry has <strong>Revoke</strong>: confirm 'Revoke &quot;&lt;name&gt;&quot;?' / &quot;The device using it can no longer get or send mail for &lt;mailbox&gt;. Its owner's other devices are not affected.&quot; / <strong>Revoke</strong>; helper action <code>app-passwd-delete &lt;id&gt;</code> (mailcow <code>delete/app-passwd</code>). Button <strong>Make a New One</strong> asks &quot;Which device is it for?&quot; (letters, digits, spaces, <code>._'-</code>, up to 60), helper action <code>app-passwd-add &lt;mailbox&gt;(hex) &lt;name&gt;(hex)</code>: a 24-character password valid for IMAP, DAV, SMTP, EAS, POP3 and Sieve, shown once.</li>
+<li><strong>Size Limit</strong>: size in GB, not below what is used; helper action <code>mailbox-set &lt;mailbox&gt;(hex) quota &lt;MB&gt;</code>.</li>
+<li><strong>Disable</strong> / <strong>Enable</strong>: confirm &quot;Disable &lt;mailbox&gt;?&quot; / &quot;It stops receiving and sending mail and cannot sign in. Its mail is kept, and enabling it again restores everything.&quot; (or &quot;It can receive, send and sign in again.&quot;); helper action <code>mailbox-set &lt;mailbox&gt;(hex) inactive|active</code>.</li>
+<li><strong>Reset Two-Factor</strong> (&quot;opens mailcow's admin pages&quot;): confirm &quot;Reset Two-Factor in mailcow&quot; / &quot;mailcow's API cannot reset two-factor, so this opens mailcow's admin pages in your browser. Sign in there, open the mailbox &lt;mailbox&gt; and remove its two-factor key; its owner then sets it up again in webmail.&quot; / <strong>Open mailcow Admin</strong>. Opens <code>https://&lt;mail server address&gt;/admin</code>. No helper call.</li>
+<li><strong>Delete Mailbox</strong> (&quot;removes it and all its mail&quot;): confirm &quot;Delete &lt;mailbox&gt;?&quot; / &quot;The mailbox and all &lt;n&gt; of its messages (&lt;size&gt;) are deleted. This cannot be undone except from a backup. Mail sent to it afterwards bounces.&quot; / type the full address / <strong>Delete Mailbox</strong>. Helper action <code>mailbox-delete &lt;mailbox&gt;(hex)</code>.</li>
+</ul>
+</li>
+</ul>
+<h4>Domains</h4>
+<ul>
+<li>Each domain with &quot;&lt;n&gt; mailboxes · &lt;n&gt; aliases&quot; and <strong>Check Mail Records (SPF, DKIM, DMARC)</strong>: helper action <code>mail-dkim &lt;domain&gt;(hex)</code> gets the DKIM selector and record mailcow expects; then the PC (not the server) looks up MX, SPF, DKIM and DMARC in public DNS. Each line shows <strong>OK</strong>, <strong>Problem</strong> or <strong>Unknown</strong>: MX must be the mailcow hostname (or <code>mail.&lt;domain&gt;</code>); exactly one SPF record that allows the server (<code>mx</code>, <code>a</code>, <code>include:</code>, <code>ip4:</code> or <code>ip6:</code>; if missing: 'add a TXT record &quot;v=spf1 mx -all&quot;'); DKIM must match mailcow's key; exactly one DMARC record (if missing: an example <code>v=DMARC1; p=quarantine</code>).</li>
+</ul>
+<h4>Aliases and Forwarding</h4>
+<ul>
+<li>Columns: Alias Address, Delivers To (each target, <strong>Disabled</strong> pill), (actions). Buttons <strong>New Alias</strong> and <strong>Hide</strong>/<strong>Show</strong> (remembered on this PC).</li>
+<li><strong>New Alias</strong>: asks &quot;The address that receives mail (for example sales@example.com, or @domain for a catch-all)&quot;, then &quot;One or more addresses, separated by commas&quot;; confirm &quot;Create &lt;addr&gt;?&quot; / &quot;Mail to &lt;addr&gt; will be delivered to &lt;goto&gt;.&quot; / <strong>Create Alias</strong>. Helper action <code>alias-add &lt;addr&gt;(hex) &lt;goto&gt;(hex)</code>; every target must be an email address (&quot;check the addresses&quot;).</li>
+<li><strong>Delete</strong>: confirm &quot;Delete the Alias &lt;addr&gt;?&quot; / &quot;Mail to &lt;addr&gt; will no longer be forwarded to &lt;goto&gt;; it will bounce unless another alias or mailbox takes it.&quot; / <strong>Delete Alias</strong>. Helper action <code>alias-delete &lt;id&gt;</code>.</li>
+</ul>
+<h4>Queue and Quarantine</h4>
+<ul>
+<li>Buttons <strong>Retry All Now</strong> and <strong>Hide</strong>/<strong>Show</strong>.</li>
+<li>Queue list (sender, recipients, queue name) or &quot;Nothing waiting: all mail has gone out.&quot;:
+<ul>
+<li><strong>Retry Now</strong>: confirm &quot;Retry This Message Now?&quot; / &quot;The message from &lt;sender&gt; is tried again straight away. Nothing is deleted.&quot; / <strong>Retry</strong>. Helper action <code>mailq-deliver &lt;queue id&gt;</code>.</li>
+<li><strong>Delete</strong>: confirm &quot;Delete This Message from the Queue?&quot; / &quot;The message from &lt;sender&gt; will not be delivered. This cannot be undone.&quot; / <strong>Delete Message</strong>. Helper action <code>mailq-delete &lt;queue id&gt;</code>.</li>
+<li><strong>Retry All Now</strong>: confirm &quot;Retry the Queue Now?&quot; / &quot;Every waiting message is tried again straight away. Nothing is deleted.&quot; / <strong>Retry All</strong>. Helper action <code>mailq-flush</code>.</li>
+</ul>
+</li>
+<li>Sub-heading <strong>Quarantine</strong>: columns (select), From, To, Subject, Score, (actions); select-all box; <strong>Release Selected</strong>, <strong>Delete Selected</strong>, and per row <strong>Release</strong>, <strong>Delete</strong>.
+<ul>
+<li>Release: confirm &quot;Release This Message?&quot; (or &quot;Release &lt;n&gt; Messages?&quot;) / &quot;&lt;what&gt; will be delivered to &lt;recipient&gt;. Only release mail you trust: it was held as likely spam or harmful.&quot; / <strong>Release</strong>. Helper action <code>quarantine-release &lt;id&gt;</code>, one call per message.</li>
+<li>Delete: confirm &quot;Delete This Held Message?&quot; (or &quot;Delete &lt;n&gt; Held Messages?&quot;) / &quot;&lt;what&gt; will be removed for good.&quot; / <strong>Delete</strong>. Helper action <code>quarantine-delete &lt;id&gt;</code>.</li>
+</ul>
+</li>
+</ul>
+</section>
+<section class="sec" id="accounts"><h3>Accounts</h3><h4>Server Setup Still Needed (only when something is missing)</h4>
+<p>A message says upload accounts can't be made until the server's one-time setup is finished, and lists what is missing, from: &quot;Disk size limits (quotas) are not switched on.&quot;, &quot;Authenticator codes are not yet kept in the shared, root-only folder.&quot;, &quot;SSH's settings for upload accounts are not in place.&quot;, &quot;Shared folders are not yet reconnected automatically when the server starts.&quot; The checks (<code>accounts_ready</code>): <code>quotaon -p -u /</code> says &quot;is on&quot;; <code>/etc/pam.d/sshd</code> has the line <code>auth required pam_google_authenticator.so secret=/var/lib/google-authenticator/${USER} user=root</code>; <code>/etc/ssh/sshd_config.d/60-argus-upload.conf</code> holds the exact ForceCommand line and <code>05-argus-deny.conf</code> exists; <code>/etc/systemd/system/argus-upload-mounts.service</code> exists. These are set up by <code>server/accounts-setup.sh</code> (<a href="#what-argus-put-on-the-server">What Argus Put on the Server</a>). While anything is missing, <strong>New Upload Account</strong> is disabled.</p>
+<h4>Upload Accounts</h4>
+<p>Footer: &quot;Each account can only upload and download, only in its own folder, and signs in with its own key plus an authenticator code. It has no terminal and can't see anything else on the server.&quot;</p>
+<ul>
+<li>Columns: Account (description, <strong>Disabled</strong> pill), Folder (&quot;Its Own Folder&quot; or the shared folder, <strong>Not Connected</strong> pill if the share is not mounted), Used (&quot;&lt;used&gt; of &lt;limit&gt; · &lt;n&gt;%&quot;), Sign-In (&quot;&lt;n&gt; Key(s) + Code&quot; or <strong>No Key Yet</strong>), <strong>Manage</strong>.</li>
+<li>Data: helper action <code>acct-list</code>: members of group <code>argus-upload</code> with a uid from 30000 to 59999; quotas from <code>repquota -u -O csv /</code>; keys from <code>/etc/ssh/argus-keys/&lt;name&gt;</code>; shares from <code>/var/lib/argus/upload-mounts.json</code>; disabled = member of <code>argus-disabled</code>.</li>
+<li>How an account is locked down (from <code>accounts-setup.sh</code> and the helper): SFTP only (<code>ForceCommand internal-sftp -d /files -u 0027 -P symlink,hardlink -l INFO -f AUTHPRIV</code>), chroot <code>/srv/sftp/&lt;name&gt;</code>, keys in <code>/etc/ssh/argus-keys/&lt;name&gt;</code>, key and authenticator code required, no forwarding, no TTY, members of <code>argus-disabled</code> refused.</li>
+<li><strong>New Upload Account</strong>:
+<ol>
+<li>&quot;Account name: 3 to 31 lowercase letters, digits or hyphens, starting with a letter&quot;.</li>
+<li>&quot;Who or what it is for (optional)&quot;.</li>
+<li>Folder choice: &quot;The account sees this folder and nothing else. It can read what is already there and add its own files and folders, but it cannot change or delete anyone else's files. Folders a website serves (such as a site's public folder) can't be shared, so uploads never go live by themselves; to share a folder beside a site, make it first in Files with New Folder.&quot; Options &quot;Its Own New Folder (Private)&quot; and the folders from helper action <code>acct-folders</code>.</li>
+<li>Size in GB (above 0, up to 100).</li>
+<li>Confirm &quot;Create &lt;name&gt;?&quot; / &quot;&lt;name&gt; can upload up to &lt;n&gt; GB to &lt;folder&gt;. Next you'll see its authenticator code once, then add its key.&quot; / <strong>Create Account</strong>.</li>
+<li>Helper action <code>acct-add &lt;name&gt; &lt;label&gt;(hex or none) &lt;MB&gt; own|&lt;folder&gt;(hex)</code>. Then the authenticator dialog (&quot;Authenticator Code for &lt;name&gt;&quot;), then the Add Key prompt.</li>
+</ol>
+<ul>
+<li>What <code>acct-add</code> does (under the change lock): next unused number from <code>/var/lib/argus/upload-uid</code> (30000 to 59999, never reused); <code>groupadd --gid</code>, <code>useradd</code> (home <code>/srv/sftp/&lt;name&gt;</code>, shell <code>/usr/sbin/nologin</code>, group <code>argus-upload</code>, comment = description); <code>/srv/sftp/&lt;name&gt;</code> root 0755; <code>/srv/sftp/&lt;name&gt;/files</code> 0750 (own folder: owned by the account; shared: root, the folder gets ACLs (account rwx on folders, read on existing files, default read for new files, sticky bit on every folder) and is bind-mounted read/write at <code>files</code> through a handle, then remounted <code>nosuid,nodev,noexec</code>, and recorded in <code>upload-mounts.json</code>); disk quota <code>setquota -u &lt;name&gt; &lt;KB&gt; &lt;KB&gt; 200000 200000 /</code>; an empty key file; a new authenticator file <code>/var/lib/google-authenticator/&lt;name&gt;</code> (0400; rate limit 3 per 30 s, window 3, no reuse, TOTP, five emergency codes). If any step fails, only what this call made is undone.</li>
+<li>Refused: setup not finished; name taken by any server account or group; folder not shareable (see below); description characters; size outside 1 to 102400 MB.</li>
+<li>Shareable folders (<code>share_problem</code>): plain names under <code>/srv/&lt;site&gt;/...</code> (not <code>/srv/sftp</code> or one further folder hard-coded for the reference server, at least two levels below <code>/srv</code>); not served by a website or reachable by any container (Caddy <code>root</code> lines in <code>/opt/web</code>, <code>/srv</code> paths in compose files under <code>/opt</code>, and every container's actual mounts); reached without links; the folder owned by root; every folder above it from <code>/srv</code> down owned by root with no group/other write and no ACL write entries.</li>
+</ul>
+</li>
+<li><strong>Manage</strong> menu:
+<ul>
+<li><strong>Keys</strong> (&quot;&lt;n&gt; now; add or remove&quot;): dialog &quot;Keys for &lt;name&gt;&quot; / &quot;The keys that may sign in to this account. Each sign-in also needs the account's authenticator code.&quot; Each key has <strong>Remove</strong>; button <strong>Add Key</strong>.</li>
+<li><strong>Size Limit</strong> (&quot;now ...&quot;): GB from 0.001 to 100, not below what is used; helper action <code>acct-set &lt;name&gt; quota &lt;MB&gt;</code>.</li>
+<li><strong>Description</strong>: helper action <code>acct-set &lt;name&gt; label &lt;hex|none&gt;</code> (<code>usermod --comment</code>).</li>
+<li><strong>New Authenticator Code</strong> (&quot;for a lost phone; the old code stops working&quot;): confirm &quot;New Authenticator Code for &lt;name&gt;?&quot; / &quot;A new code is made and shown once. The old one stops working straight away, and anyone signed in as this account is signed out.&quot; / <strong>Make New Code</strong>. Helper action <code>acct-set &lt;name&gt; new-code</code>: writes a new secret file and ends the account's sessions; the authenticator dialog &quot;New Code for &lt;name&gt;&quot; follows.</li>
+<li><strong>Disable</strong> (&quot;stops sign-in now; keeps everything&quot;) / <strong>Enable</strong> (&quot;lets it sign in again&quot;): confirm &quot;Disable &lt;name&gt;?&quot; / &quot;It can no longer sign in, and anyone signed in as it now is cut off. Its files, keys and code are kept.&quot; (or &quot;It can sign in again with its key and code.&quot;). Helper action <code>acct-set &lt;name&gt; disable|enable</code>: <code>gpasswd -a|-d &lt;name&gt; argus-disabled</code>; disable also kills its processes (<code>pkill -KILL -u</code>).</li>
+<li><strong>Delete Account</strong> (&quot;removes the account; its files are kept&quot;): confirm &quot;Delete &lt;name&gt;?&quot; / own folder: &quot;The account, its keys and its code are removed. Its folder is moved to /var/backups/argus and kept for 30 days.&quot;; shared: &quot;The account, its keys and its code are removed. Files it uploaded to &lt;folder&gt; stay there, handed to root.&quot; / type the account name / <strong>Delete Account</strong>. Helper action <code>acct-delete &lt;name&gt;</code>: disables and cuts off the account, unmounts and revokes ACLs (handing its files to root) for a share, or moves its own <code>files</code> folder to <code>/var/backups/argus/account-&lt;name&gt;-&lt;stamp&gt;</code> (owned by root); clears its quota, key file and authenticator file; <code>userdel</code>, <code>groupdel</code>.</li>
+</ul>
+</li>
+</ul>
+<h4>Your Sign-In Keys</h4>
+<p>&quot;The keys that may sign in as &lt;your user&gt; (always with your authenticator code as well).&quot; Data: <code>/home/&lt;your user&gt;/.ssh/authorized_keys</code>. Each key: comment, type, bits, fingerprint.</p>
+<ul>
+<li><strong>Add Key</strong>: &quot;Paste the whole public key line (it starts with ssh-ed25519; never the private key)&quot; / <strong>Add Key</strong>. If the text contains &quot;PRIVATE KEY&quot;, nothing is sent (&quot;That is a private key. Nothing was sent; use the .pub file instead.&quot;). Helper action <code>key-add &lt;account&gt; &lt;key&gt;(hex)</code>: accepts <code>ssh-ed25519</code>, <code>sk-ssh-ed25519@openssh.com</code>, <code>ecdsa-sha2-nistp256/384/521</code>, <code>sk-ecdsa-sha2-nistp256@openssh.com</code>, <code>ssh-rsa</code> (RSA at least 3072 bits); no options; comment limited to <code>[A-Za-z0-9@._ +-]</code>; no duplicates. The file is replaced in one step (&lt;your user&gt;, 0600; upload accounts root 0644).</li>
+<li><strong>Remove</strong>: confirm &quot;Remove This Key from &lt;account&gt;?&quot; / '&quot;&lt;comment&gt;&quot; can no longer sign in as &lt;account&gt;. If it is the key Argus is using now, you stay signed in until you disconnect, then cannot sign in with it again.' / <strong>Remove Key</strong>. Helper action <code>key-remove &lt;account&gt; &lt;fingerprint&gt;(hex)</code>. The last key of &lt;your user&gt; is refused by the screen and by the helper: &quot;that is your last key; add another one first, or you could not sign in&quot;. Removing an upload account's key also ends its sessions.</li>
+</ul>
+<h4>Hephaestus Users</h4>
+<p>All of these run <code>heph-admin</code> inside the running app container: <code>cd /opt/hephaestus/deploy &amp;&amp; docker compose exec -T app heph-admin ...</code> (any value starting with <code>-</code> other than <code>--admin</code>, <code>--role</code>, <code>--password</code> is refused). Data: helper action <code>heph-people</code> (<code>list-staff</code>, <code>list-tenants</code>).</p>
+<ul>
+<li>Staff table: Staff, Role (&quot;Platform Admin&quot;, &quot;Technician&quot;), Status (<strong>Active</strong>/<strong>Inactive</strong>), Two-Factor (<strong>On</strong>/<strong>Not Set Up</strong>), <strong>Manage</strong>. Companies table: Short Name, Company. &quot;Company users aren't listed here; use Manage a User with their email address.&quot;</li>
+<li><strong>Manage a User</strong>: &quot;Their email address (staff or company user)&quot;, then the same menu as <strong>Manage</strong>.</li>
+<li><strong>Manage</strong> menu (title is the email, subtitle &quot;Hephaestus account&quot;):
+<ul>
+<li><strong>Set Password</strong> (&quot;type one, or have one generated; signs them out everywhere&quot;): password dialog; helper action <code>heph-user &lt;email&gt;(hex) set-password</code> (stdin; <code>heph-admin set-password</code>). A generated one is shown once.</li>
+<li><strong>Reset Link</strong> (&quot;a one-time link to hand over; works for 4 hours&quot;): confirm &quot;Reset Link for &lt;email&gt;?&quot; / &quot;Hephaestus makes a one-time link that lets them choose a new password. It works for 4 hours, and any earlier link stops working. Hand it over directly, not by email.&quot; / <strong>Make Link</strong>. Helper action <code>heph-user &lt;email&gt;(hex) reset-link</code> (<code>heph-admin reset-link &lt;email&gt; 4</code>); the link is shown once.</li>
+<li><strong>Reset Two-Factor</strong> (&quot;for a lost phone; they set it up again at next sign-in&quot;): confirm &quot;Reset Two-Factor for &lt;email&gt;?&quot; / &quot;Their authenticator code is cleared and they are signed out. They set up a new one the next time they sign in.&quot; / <strong>Reset Two-Factor</strong>. <code>heph-admin reset-totp</code>.</li>
+<li><strong>Sign Out Everywhere</strong> (&quot;ends all their sessions now&quot;): confirm &quot;Sign &lt;email&gt; Out Everywhere?&quot; / &quot;Every session they have open ends now. Their password and two-factor are unchanged.&quot; / <strong>Sign Out</strong>. <code>heph-admin revoke-sessions</code>.</li>
+</ul>
+</li>
+<li><strong>New Staff Account</strong>: email, first name, last name, role (&quot;Technician&quot; or &quot;Platform Admin&quot;: &quot;A platform admin sees every company. A technician sees none until granted one.&quot;), password. Helper action <code>heph-staff-add &lt;email&gt;(hex) &lt;first TAB last&gt;(hex) admin|technician</code> (stdin; <code>heph-admin create-staff &lt;email&gt; &lt;first&gt; &lt;last&gt; [--admin]</code>). Refused if a staff account with that email exists (create-staff would otherwise re-password it). &quot;They set up two-factor at their first sign-in.&quot;</li>
+<li><strong>New Company</strong>: &quot;Company name&quot;, then &quot;Short Name for &lt;name&gt;&quot; (&quot;Goes in every page address; can't be changed later&quot;), 2 to 40 lowercase letters, digits or hyphens; confirm &quot;Create &lt;name&gt;?&quot; / &quot;A new, empty company with the short name &lt;slug&gt;. Add its first administrator with New Company User.&quot; / <strong>Create Company</strong>. Helper action <code>heph-company-add &lt;slug&gt; &lt;name&gt;(hex)</code> (<code>heph-admin new-tenant &lt;slug&gt; &lt;name words&gt;</code>). Refused if the short name exists.</li>
+<li><strong>New Company User</strong>: company, email, names, role (&quot;User&quot;, &quot;Technician&quot;, &quot;Company Admin&quot;; &quot;If this address is already in that company, its name, role and password are replaced.&quot;), password. Helper action <code>heph-user-add &lt;slug&gt; &lt;email&gt;(hex) &lt;names&gt;(hex) tenant_user|tenant_tech|tenant_admin</code> (stdin; <code>heph-admin new-user &lt;slug&gt; &lt;email&gt; &lt;first&gt; &lt;last&gt; --role &lt;role&gt; --password</code>). Refused if the company does not exist.</li>
+</ul>
+</section>
+<section class="sec" id="sign-in-attempts"><h3>Sign-In Attempts</h3><p>Background (from the helper's comments and code):</p>
+<ul>
+<li>Sources: the SSH journal (<code>journalctl -u ssh</code>) and mailcow's netfilter container log (<code>docker logs</code> of <code>mailcowdockerized-netfilter-mailcow-1</code>: mail login failures and bans). Every pattern is anchored so text an attacker chooses cannot add or hide an address.</li>
+<li>Your own addresses (left out of the page, never blockable, accepted ahead of the block list): where <code>&lt;your user&gt;</code> or <code>root</code> finished an SSH sign-in in the last 180 days, the address of the Argus session asking, and anything in <code>/etc/argus/own-addresses</code>. IPv6 is matched by /64. Remembered in <code>/var/lib/argus/own-seen.json</code> for 180 days.</li>
+<li>&quot;Other&quot; signed-in addresses: where a mailbox (dovecot/postfix logs, 90 days) or an upload account signed in. Left out unless also refused, then shown as <strong>Has Signed In</strong>; blockable after a typed confirmation.</li>
+<li>&quot;Used Your SSH Key&quot;: an address where the key step for &lt;your user&gt; or root succeeded (&quot;Partial publickey&quot;, logged because of <code>LogLevel VERBOSE</code>) but no sign-in finished.</li>
+<li>Locations from the DB-IP lite databases in <code>/var/lib/argus/geo</code> (no online lookups); credit &quot;IP locations by DB-IP (db-ip.com), CC BY 4.0&quot; and &quot;Map: Natural Earth&quot;.</li>
+<li>If a sign-in log can't be read, the page is refused rather than risk showing one of your addresses (&quot;could not read the SSH sign-in log, so your own addresses can't be left out safely&quot;).</li>
+</ul>
+<h4>Where the Attempts Come From</h4>
+<ul>
+<li><strong>Period</strong> (&quot;Last 24 Hours&quot;, &quot;Last 7 Days&quot; (default), &quot;Last 30 Days&quot;) and <strong>Refresh</strong>. Helper action <code>attacks &lt;1|7|30&gt; [&lt;column&gt; &lt;asc|desc&gt;]</code>.</li>
+<li>Summary sentence: addresses, SSH attempts, mail login failures, scans, &quot;All refused.&quot;, how many used your key, how many returned on more than one day, how many mailcow banned.</li>
+<li>World map: dots for SSH attempts, mail login failures, and this server; larger dots for more tries. Legend and &quot;Most attempts from: ...&quot; (top 8 countries).</li>
+</ul>
+<h4>Address Details (opens from <strong>Details</strong> in Addresses)</h4>
+<ul>
+<li>Helper action <code>ip-info &lt;ip&gt;(hex)</code>: refused for a non-public address or one of yours. Reverse name via <code>host</code> (and whether the name's own records confirm it), registry record via RDAP (registry found through IANA's bootstrap files, cached 30 days; answers cached 7 days in <code>/var/lib/argus/ipinfo-cache.json</code>, at most 3000 entries), location, the 30-day timeline grouped into visits (a gap over 30 minutes starts a new visit).</li>
+<li><strong>Who It Is</strong>: Reverse Name, Owner, Registry Record, Network, Country, Report Abuse To (with <strong>Copy</strong>).</li>
+<li><strong>When It Came</strong>: bars per day for 30 days; &quot;&lt;n&gt; separate visits in 30 days (a gap of more than 30 minutes starts a new one).&quot;</li>
+<li>Visits table: Visit, Lasted, Attempts, What (SSH, mail, mail ban, scan), Tried As (last 30 visits).</li>
+<li>Buttons:
+<ul>
+<li><strong>Trace Route</strong>: helper action <code>trace &lt;ip&gt;(hex)</code>. Refused for your own addresses and for addresses that have not tried the server in 30 days and are not blocked (&quot;only addresses that have tried to sign in here can be traced&quot;), and while another trace runs (<code>/run/argus-trace.lock</code>). Runs <code>traceroute</code> as <code>nobody</code> (UDP; then ICMP, then TCP to port 22 with only the raw-socket capability), 3 probes per hop, up to 24 hops, 120 s in all. Shows the Route table (Hop, Address, Location, Network, Time) and draws it on the map.</li>
+<li><strong>Block Address</strong> (red): see Block below, for <code>&lt;ip&gt;/32</code> (IPv6 <code>/128</code>).</li>
+<li><strong>Block Network &lt;net&gt;</strong> (red): offered when the registry gives a network from /16 to /31 (IPv6 /32 to /127).</li>
+<li><strong>Unblock &lt;net&gt;</strong> (instead of the block buttons when already blocked).</li>
+<li><strong>Close</strong>.</li>
+</ul>
+</li>
+</ul>
+<h4>Blocked Addresses</h4>
+<p>Text: &quot;Blocked addresses can't reach anything on the server: SSH, mail, websites. The block is applied before anything else sees the traffic and is restored at every start. Your own addresses and this server can't be blocked. An address where a mailbox or upload account has signed in can be, after you confirm.&quot;</p>
+<ul>
+<li>State: &quot;&lt;n&gt; blocked&quot;, plus &quot; · not loaded on the server right now&quot; if the nftables table is absent.</li>
+<li>Columns: Address or Network, Where, Note, Blocked Since, Dropped (&quot;&lt;n&gt; packets&quot; since the table was last loaded), <strong>Unblock</strong>.</li>
+<li>Data: helper action <code>block-list</code> (<code>/var/lib/argus/blocked.json</code>, <code>nft -j list set inet argus blocked4|blocked6</code>).</li>
+<li><strong>Block an Address</strong>: &quot;Address or Network (for example 203.0.113.7 or 203.0.113.0/24)&quot;; then <code>ip-info</code> on the address (a private address or one of yours stops here), then Block.</li>
+<li>Block (from Details or by hand):
+<ul>
+<li>Single address: confirm &quot;Block &lt;net&gt;?&quot; / &quot;&lt;ip&gt; (&lt;owner&gt;, &lt;place&gt;) is cut off from the whole server: SSH, mail and websites. You can unblock it at any time below.&quot; / <strong>Block</strong>.</li>
+<li>Network: same title; the text (paraphrased here) says every address in &lt;net&gt; (&lt;owner&gt;) is cut off from the whole server: SSH, mail and websites. Use this when one network keeps sending attackers; anyone legitimate on it is blocked too. The server can still reach out to it (sending mail, updates); only connections that network starts are dropped, so mail sent from it is refused too. Addresses you sign in from over SSH are never blocked, but if you later sign in from a new address inside this network you'd be locked out. The way back in is the cloud provider's console: run sudo nft destroy table inet argus &amp;&amp; sudo systemctl disable argus-blocklist.service, unblock the network in Argus, then run sudo systemctl enable argus-blocklist.service. / type <code>BLOCK</code> / <strong>Block</strong>.</li>
+<li>If a mailbox or upload account signed in there: second confirm &quot;Block &lt;net&gt; Anyway?&quot; / &quot;... If that sign-in was the mailbox or upload account's owner, blocking cuts them off too. If you believe the password was stolen, block it and change that password.&quot; / type <code>BLOCK</code> / <strong>Block Anyway</strong> (sends <code>confirm-signed-in</code>).</li>
+<li>Helper action <code>block-add &lt;net&gt;(hex) &lt;note&gt;(hex) [confirm-signed-in]</code> (note &quot;From Sign-In Attempts: &lt;owner&gt;&quot; or &quot;Added by hand: &lt;owner&gt;&quot;). Refused: note characters; wider than IPv4 /16 or IPv6 /32; IPv4 written as <code>::ffff:</code> IPv6; not public; contains the server's address, its gateways or name servers; overlaps one of your own networks; a mailbox/upload sign-in without confirmation; for a network: the provider database missing, the network's provider unknown, or the same provider you sign in from (and a provider where a mailbox/upload account signed in, without confirmation); already blocked; covered by a wider block; list full (5000). A wider block replaces narrower ones it covers.</li>
+<li>Applying: writes <code>/var/lib/argus/blocklist.nft</code> (table <code>inet argus</code>: sets <code>own4</code>, <code>own6</code>, <code>blocked4</code>, <code>blocked6</code>; prerouting hook at priority -150; replies and related traffic accepted first, then your networks, then drops), checks it with <code>nft -c -f</code>, loads it with <code>nft -f</code>, then saves <code>/var/lib/argus/blocked.json</code>.</li>
+</ul>
+</li>
+<li><strong>Unblock</strong>: confirm &quot;Unblock &lt;net&gt;?&quot; / &quot;It can reach the server again (and will be refused at sign-in as before).&quot; / <strong>Unblock</strong>. Helper action <code>block-remove &lt;net&gt;(hex)</code>.</li>
+</ul>
+<h4>Addresses</h4>
+<p>Text explains what is listed and the pills (see the screen; key points: &quot;Every one of these was refused.&quot;, your own addresses and those in <code>/etc/argus/own-addresses</code> are left out, &quot;Used Your SSH Key means your key was accepted there but the code was never right: if that wasn't you, your key has been copied; replace it and block the address.&quot;).</p>
+<ul>
+<li>Columns (each a sort button; third click returns to the default): Address, Location, Network, Tries (with &quot;&lt;n&gt; SSH · &lt;n&gt; mail · &lt;n&gt; scans · banned&quot;), Visits (&quot;&lt;n&gt; visits · &lt;n&gt; days&quot; with pills <strong>Returning</strong>, <strong>Blocked</strong>, <strong>Has Signed In</strong>, <strong>Used Your SSH Key</strong>), Tried As, Last Seen, <strong>Details</strong>. <strong>Default Order</strong> button appears when sorted.</li>
+<li>The server sends at most 400 rows; with more addresses, sorting asks the server again so the sort covers all of them. Addresses that used your key are always among the 400. Default order: used your key, then signed-in, then busiest.</li>
+</ul>
+</section>
+<section class="sec" id="hephaestus"><h3>Hephaestus</h3><p>This page deploys one specific web app, Hephaestus, that this copy of Argus was built for. If you don't run it, skip this page and the Hephaestus parts of Doing It by Hand and Recovery.</p>
+<h4>Roll Back</h4>
+<p>Text: &quot;Puts an earlier version of the app live. The database is left as it is: columns added by newer versions stay, which does no harm. What is live now is kept, so a rollback can itself be undone. Server checks run afterwards.&quot;</p>
+<ul>
+<li>&quot;Live now:&quot; from <code>/var/lib/argus/heph-deployed</code>. Table: Earlier Version, Built, <strong>Roll Back to This</strong>. Data: helper action <code>rollback-list</code>: <code>docker images hephaestus</code> tags <code>pre-...</code>, skipping the live image and duplicates, at most 8.</li>
+<li><strong>Roll Back to This</strong>: confirm &quot;Roll Hephaestus Back to &lt;name&gt;?&quot; / &quot;Hephaestus restarts on the earlier version &lt;name&gt;. It is offline for a minute or two, a few minutes at most. The database is not changed. The version live now is kept so you can switch back, and if &lt;name&gt; does not start, Argus puts the current version back on its own.&quot; / type the version name / <strong>Roll Back</strong>. Helper action <code>heph-rollback &lt;tag&gt;</code>, job <code>heph-rollback</code> (tag must be one of the listed choices):
+<ol>
+<li><code>cd /opt/hephaestus/deploy</code>; <code>docker tag hephaestus:local hephaestus:pre-argus-&lt;stamp&gt;</code>; <code>docker tag hephaestus:&lt;tag&gt; hephaestus:local</code>.</li>
+<li><code>docker compose up -d --no-deps --no-build app</code> (the migrate step is skipped). If it can't start, or is not healthy within 2 minutes (24 checks, 5 s apart), the kept version is tagged back and started again.</li>
+<li>Writes the version (the commit, or &quot;rollback to &lt;tag&gt;&quot;) to <code>/var/lib/argus/heph-deployed</code>.</li>
+<li>Server checks: <code>HEPH_RESOLVE=&lt;app address&gt;:443:127.0.0.1 bash scripts/verify.sh</code>; must print &quot;&lt;n&gt; passed, 0 failed&quot;, else &quot;The earlier version IS LIVE, but the server checks did not all pass&quot;.</li>
+<li>Keeps only the three newest <code>pre-argus-</code> images.</li>
+</ol>
+</li>
+</ul>
+<h4>Deploy</h4>
+<ul>
+<li>Source panel (from the PC repository <code>&lt;path to the Hephaestus repository&gt;</code>): Source (repo and branch), Latest commit, Committed. Warning if files in the package paths are uncommitted (&quot;They are not included; commit them first if they should go live.&quot;). Note: &quot;Only committed work is deployed, and only the usual set: Cargo files, crates, migrations, deploy (never .env) and the RLS test. &quot;Prepare&quot; sends it to the server and shows what would change. Nothing goes live until you confirm.&quot;</li>
+<li><strong>Prepare This Version</strong>: on the PC, <code>git archive</code> (LF line endings) of the latest commit with <code>Cargo.toml</code>, <code>Cargo.lock</code>, <code>crates</code>, <code>migrations</code>, <code>deploy</code>, <code>tools/test/rls_invariants.sql</code>; refused if the latest commit changed since the page was read. The archive goes over SFTP to <code>/var/lib/argus/deploy/.argus-upload-&lt;hex&gt;</code>, then helper action <code>heph-stage &lt;tmpname&gt; &lt;commit&gt;</code> (under the change lock):
+<ul>
+<li>Refused: package over 300 MB, unpacks to over 1 GB or 20000 entries, holds anything outside the allowed set (any <code>.env*</code> except <code>.env.example</code>, <code>deploy/docker-compose.vps.yml</code>, <code>target/</code>, absolute paths, <code>..</code>), or has no <code>Cargo.toml</code>/<code>crates/</code>.</li>
+<li>Unpacks to <code>/var/lib/argus/deploy/src-&lt;commit&gt;</code>, lists changed/added/removed files against <code>/opt/hephaestus</code>, lists new migrations, writes the full diff to <code>/var/lib/argus/deploy/diff-&lt;commit&gt;.txt</code>, removes older staged packages.</li>
+<li>Shows &quot;Ready: &lt;commit&gt; (live now: ...)&quot;, counts, new migrations warning (&quot;These change the database and are not undone by a rollback ...&quot;), &quot;Files that change&quot;, and &quot;Show every change, line by line&quot; (helper action <code>heph-diff &lt;commit&gt;</code>, cut at 512 KB). A note on the card says changes that touch security should be reviewed before they go live, and that Argus cannot do that review.</li>
+</ul>
+</li>
+<li><strong>Deploy &lt;commit&gt;</strong>: confirm &quot;Deploy &lt;commit&gt;?&quot; / &quot;What happens: the current source is backed up, the database is saved, and &lt;live&gt; is kept for rollback. The new version is built while the old one keeps running (several minutes). [Its database migrations are applied, then it / Then it] starts; Hephaestus is offline for a minute or two. If the build, the migrations or the start fail, or it is not healthy within two minutes, the previous version is put back automatically [(database columns the migrations added stay; they do no harm)]. Last, the server checks run: if any fail, the new version stays live and Argus says so, so you can roll back from this page.&quot; / type the commit / <strong>Deploy</strong>. Helper action <code>heph-deploy &lt;commit&gt;</code>, job <code>heph-deploy</code>:
+<ol>
+<li>Back up <code>/opt/hephaestus</code> (without <code>deploy/.env*</code> and <code>target</code>) to <code>/root/config-backups-argus/hephaestus-pre-&lt;commit&gt;-&lt;stamp&gt;</code>.</li>
+<li><code>docker exec hephaestus-prod-db-1 pg_dump -U &lt;database owner&gt; -d heph -Fc</code> to <code>/root/heph-pre-&lt;commit&gt;-&lt;stamp&gt;.dump</code> (0600).</li>
+<li>Tag the live image <code>hephaestus:pre-&lt;live commit&gt;</code> (or <code>pre-argus-&lt;stamp&gt;</code>; a stamp is added if that tag already points elsewhere).</li>
+<li>Copy in <code>Cargo.toml</code>, <code>Cargo.lock</code>, <code>crates/</code>, <code>migrations/</code>, <code>tools/test/rls_invariants.sql</code>, <code>deploy/</code> (keeping <code>deploy/.env*</code> and <code>deploy/docker-compose.vps.yml</code>); <code>docker compose config --quiet</code>.</li>
+<li><code>docker compose build app</code>.</li>
+<li><code>docker compose run --rm migrate</code>.</li>
+<li><code>docker compose up -d</code>; wait up to 2 minutes for healthy.</li>
+<li>Record the commit in <code>/var/lib/argus/heph-deployed</code>, remove the staged copy, run <code>scripts/verify.sh</code> as in the rollback.</li>
+</ol>
+<ul>
+<li>Any failure in steps 4 to 7 restores the source backup, re-tags the kept image as <code>local</code> and restarts the app. Migrations are not undone.</li>
+<li>Refused: commit not staged (&quot;that package is not staged; prepare it again&quot;).</li>
+</ul>
+</li>
+</ul>
+</section>
+<section class="sec" id="backups"><h3>Backups</h3><p>Two cards, <strong>Mail</strong> and <strong>Hephaestus Database</strong>.</p>
+<ul>
+<li>Each lists what is kept (time, size in MB, newest first) from <code>/opt/backups/mailcow</code> and <code>/opt/backups/hephaestus</code> (entries ending <code>.part</code> are skipped), via helper action <code>backup-list</code>. &quot;&lt;n&gt; kept. Older copies are removed automatically.&quot; or &quot;None kept yet.&quot; or &quot;Could not read this folder.&quot;</li>
+<li><strong>Back Up Now</strong>: confirm &quot;Back Up &lt;label&gt; Now?&quot;:
+<ul>
+<li>Mail: &quot;A copy of all mail, plus the websites' files, is made now. It takes a few minutes; mail and the websites keep working meanwhile. Copies past the kept number of days are removed.&quot;</li>
+<li>Hephaestus Database: &quot;A copy of the Hephaestus database is made now. It takes a few seconds; Hephaestus keeps working. Copies older than 14 days are removed.&quot;</li>
+<li>Button <strong>Back Up Now</strong>. Helper action <code>backup-run mail|hephaestus</code>: <code>systemctl start --no-block mailcow-backup.service</code> or <code>heph-db-backup.service</code>. Then: &quot;&lt;label&gt; backup started. It appears here when it finishes; refresh this page in a minute or two.&quot;</li>
+<li>What those two units contain, and the retention, are not in this repository; the retention wording comes from the confirmation text only.</li>
+</ul>
+</li>
+</ul>
+</section>
+<section class="sec" id="files"><h3>Files</h3><p>Help: &quot;Drag a file across to copy it, or select it and use the arrow button. Files dragged in from Windows Explorer upload too. Uploads keep the right owner and permissions; an overwritten file is copied to /var/backups/argus first.&quot;</p>
+<ul>
+<li>Pane <strong>This PC</strong>: <strong>Up</strong>, path box (Enter to open; empty lists drives as &quot;This PC (drives)&quot;), starts in the Windows home folder; button <strong>Upload to Server →</strong>.</li>
+<li>Pane <strong>Server</strong>: <strong>Up</strong>, path box, <strong>New Folder</strong>, starts at <code>/srv</code>; shows owner:group, mode and time; button <strong>← Download to PC</strong>. Warning when the folder is served by a website (&quot;This folder is served by a website: anything put here can be seen by anyone.&quot;: any path under <code>/var/www/</code>, or under <code>/srv/</code> containing <code>/public/</code>, <code>/public_html/</code>, <code>/htdocs/</code>, <code>/html/</code> or <code>/www/</code>).</li>
+<li>Selecting a file shows a preview: images up to 5 MB, otherwise the first 30 lines of the first 16 KB of text, or &quot;No preview for this kind of file.&quot;</li>
+<li>Listing, previews and downloads run over root SFTP. Paths with <code>..</code> are refused.</li>
+<li><strong>Upload</strong> (button, drag across, or drop from Explorer; files only: &quot;only files can be uploaded for now&quot;):
+<ul>
+<li>Plan: owner and group from the file being replaced, or from the folder for a new file; mode from the file being replaced, else from the first file in the folder with the same extension (without setuid/setgid/sticky and never world-writable), else 0644. Links and special files are not overwritten.</li>
+<li>Confirm &quot;Upload &lt;name&gt;?&quot; (&quot;The file is copied to the server.&quot;) or &quot;Replace &lt;name&gt; on the server?&quot; (&quot;A file with this name is already there. Check the two previews before replacing it.&quot;), with previews &quot;On the Server Now&quot; / &quot;From This PC&quot;, and the plan (To, Owner, Permissions, Old file &quot;replaced; a copy is kept in /var/backups/argus/&lt;date&gt;/&lt;time&gt;&lt;path&gt;&quot;); public web warning. Buttons <strong>Upload</strong> or <strong>Replace it</strong>.</li>
+<li>The file goes to a new private temporary file <code>.argus-upload-&lt;16 hex&gt;</code> (0600) in the target folder; then helper action <code>file-commit</code> checks nothing changed since you confirmed (&quot;... changed on the server since you confirmed; look again&quot; / &quot;... appeared on the server since you confirmed; look again&quot;), copies the old file to <code>/var/backups/argus/&lt;YYYY-MM-DD&gt;/&lt;HHMMSS&gt;&lt;full path&gt;</code> (0600), sets owner and mode on the temporary file and renames it into place, all through a handle on the folder without following links. Uploads into <code>/opt/web</code> take the change lock (&quot;another change is running; upload to /opt/web again when it has finished&quot;). On failure the temporary file is removed (<code>file-discard</code>).</li>
+</ul>
+</li>
+<li><strong>Download</strong>: needs a PC folder open; plain files only. If the name exists on the PC: confirm &quot;Replace &lt;name&gt; on This PC?&quot; / &quot;&lt;folder&gt; already has a file called &lt;name&gt;. It will be replaced.&quot; / <strong>Replace It</strong>. Windows-reserved names are refused. Recorded with <code>note-file download</code> (if that fails: &quot;(It could not be written to the Activity log.)&quot;).</li>
+<li><strong>New Folder</strong>: &quot;Name of the new folder in &lt;path&gt;&quot; / <strong>Create</strong>. Helper action <code>file-mkdir</code>: owned like its parent, mode 0755; refused if the name exists.</li>
+</ul>
+</section>
+<section class="sec" id="terminal"><h3>Terminal</h3><p>Bar: &quot;Signed in as &lt;your user&gt;. sudo works without a password, so take care. Copy: select, then Ctrl+Shift+C. Paste: Ctrl+Shift+V.&quot; State pill <strong>Not open</strong>, <strong>Opening…</strong>, <strong>Connected</strong>, <strong>Ended</strong>. Button <strong>New Session</strong> (opens a fresh shell, replacing the current one).</p>
+<ul>
+<li>Opened when the view is shown. One shell at a time. If output arrives faster than it can be shown (more than 8 MB waiting), the session is closed with a message. When the shell ends: &quot;[The session has ended. Press &quot;New session&quot; to open another.]&quot;</li>
+<li>Not logged in the Activity log.</li>
+</ul>
+</section>
+<section class="sec" id="activity-log"><h3>Activity Log</h3><p>Text: &quot;Everything Argus has asked the server to do, newest first. What the server sent back is not recorded.&quot;</p>
+<ul>
+<li>Columns: Time, Action, Details, Result (pill green for ok, amber for refused, red otherwise), Session.</li>
+<li>Helper action <code>activity</code>: the last 300 entries from the last 256 KB of <code>/var/log/argus/actions.log</code>.</li>
+</ul>
+</section>
+</section>
+<section class="group" id="doing-it-by-hand" data-group><h2>Doing It by Hand</h2>
+<section class="sec" id="running-the-helper-yourself"><h3>Running the helper yourself</h3><p>The helper works without Argus. From an SSH session as &lt;your user&gt;:</p>
+<div class="code"><button class="copy" type="button">Copy</button><pre><code>hex() { printf '%s' &quot;$1&quot; | od -An -tx1 -v | tr -d ' \n'; }
+sudo /usr/local/sbin/argus-helper --session by-hand-01 &lt;action&gt; [args]
+</code></pre></div>
+<ul>
+<li>The session id must be 8 to 64 letters, digits or hyphens. The call is logged like Argus's.</li>
+<li>Arguments marked (hex) above must be hex-encoded, lowercase (the <code>hex</code> function above does that).</li>
+<li>Password actions read stdin: <code>printf '%s' generate | sudo /usr/local/sbin/argus-helper --session by-hand-01 mailbox-password $(hex user@example.com)</code>. Output is JSON on stdout; a generated password or authenticator secret is printed to your terminal.</li>
+<li>Exit codes: 0 ok, 3 refused (reason on stderr), 2 bad usage or arguments, 1 failed.</li>
+<li>Audit note: the helper records the calling SSH session's address as one of yours for 180 days; running it from a long-lived tmux shell can record a stale address.</li>
+<li>Job progress: <code>sudo tail -40 /var/log/argus/jobs/&lt;job&gt;.log</code>; <code>systemctl status argus-&lt;job&gt;.service</code>.</li>
+</ul>
+<p>The raw commands below are taken from the helper's code. Anything not derived from the code is marked <strong>(uncertain)</strong>.</p>
+</section>
+<section class="sec" id="server-2"><h3>Server</h3><ul>
+<li>Restart a container: <code>sudo docker restart -t 30 &lt;name&gt;</code></li>
+<li>See waiting updates: <code>apt-get -s -o Debug::NoLocking=1 upgrade | grep '^Inst '</code></li>
+<li>Apply updates:
+<code>sudo apt-get -o DPkg::Lock::Timeout=600 update &amp;&amp; sudo DEBIAN_FRONTEND=noninteractive apt-get -y -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade</code>
+then <code>test -e /run/reboot-required &amp;&amp; echo 'restart needed'</code></li>
+<li>Restart the server in one minute: <code>sudo shutdown -r +1 &quot;Restart requested from Argus&quot;</code>; cancel: <code>sudo shutdown -c</code></li>
+<li>Service updates: each item's <strong>How to Update</strong> gives the by-hand steps. From the code:
+<ul>
+<li>mailcow: <code>cd /opt/mailcow-dockerized &amp;&amp; sudo ./update.sh --check</code>, then <code>sudo ./update.sh</code> (Argus first runs <code>sudo systemctl start mailcow-backup.service</code> and uses <code>./update.sh --force</code>, repeated once if it exits 2).</li>
+<li>patched image: <code>cd &lt;compose folder&gt; &amp;&amp; sudo docker compose pull &lt;svc&gt; &amp;&amp; sudo docker compose up -d --no-deps &lt;svc&gt;</code></li>
+<li>rebuild on a patched base: <code>cd &lt;compose folder&gt; &amp;&amp; sudo docker compose build --pull &lt;svc&gt; &amp;&amp; sudo docker compose up -d --no-deps &lt;svc&gt;</code></li>
+<li><code>bss-php</code>: <code>sudo docker tag bss-php:8.5 bss-php:before-update &amp;&amp; sudo docker build --pull -t bss-php:8.5 /opt/web/php</code>, then <code>(cd &lt;folder&gt; &amp;&amp; sudo docker compose up -d --no-deps --force-recreate &lt;svc&gt;)</code> for each container using it; undo: <code>sudo docker tag bss-php:before-update bss-php:8.5</code> and recreate the same containers.</li>
+<li>recreate onto the current image: <code>cd &lt;compose folder&gt; &amp;&amp; sudo docker compose up -d --no-deps --force-recreate &lt;svc&gt;</code></li>
+<li>Major database versions (PostgreSQL, MySQL, MariaDB): the How to Update steps cover dump, new volume or in-place upgrade, and undo; Argus never does these itself.</li>
+</ul>
+</li>
+</ul>
+</section>
+<section class="sec" id="websites-2"><h3>Websites</h3><ul>
+<li>Test a site as the server sees it: <code>curl -s -o /dev/null -w '%{http_code}' -m 8 --resolve &lt;name&gt;:443:127.0.0.1 https://&lt;name&gt;/</code> (for <code>autoconfig.*</code> names add <code>mail/config-v1.1.xml</code> after the slash, for <code>autodiscover.*</code> names <code>autodiscover/autodiscover.xml</code>; their front page is a 404 by design)</li>
+<li>Certificate end date: <code>echo | openssl s_client -connect 127.0.0.1:443 -servername &lt;name&gt; 2&gt;/dev/null | openssl x509 -noout -enddate</code></li>
+<li>Check the configuration without touching the live server: get the image and mounts with <code>sudo docker inspect -f '{{.Config.Image}} {{json .Mounts}}' bss-caddy</code>, then
+<code>sudo docker run --rm --network none --env-file /opt/web/caddy.env -v &lt;src&gt;:&lt;dest&gt;:ro ... --tmpfs /data/logs &lt;image&gt; caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile</code>
+(one <code>-v</code> per mount). By hand, the output is not masked: it can show values from <code>caddy.env</code>.</li>
+<li>Apply (restart the web server): <code>cd /opt/web &amp;&amp; sudo docker compose up -d caddy &amp;&amp; sudo docker restart bss-caddy</code>, then test every site.</li>
+<li>Keep a good copy after a working change (what Argus does): copy <code>Caddyfile</code>, <code>site-rules.caddy</code>, <code>docker-compose.yml</code> and <code>sites/*.caddy</code> from <code>/opt/web</code> into <code>/var/lib/argus/caddy-history/$(date +%Y%m%d-%H%M%S)/</code> (with a <code>sites/</code> subfolder).</li>
+<li>Roll back to a kept configuration:<div class="code"><button class="copy" type="button">Copy</button><pre><code>S=/var/lib/argus/caddy-history/&lt;stamp&gt;
+sudo cp -a $S/Caddyfile $S/site-rules.caddy $S/docker-compose.yml /opt/web/
+sudo rm -f /opt/web/sites/*.caddy; sudo cp -a $S/sites/. /opt/web/sites/
+cd /opt/web &amp;&amp; sudo docker compose up -d caddy &amp;&amp; sudo docker restart bss-caddy
+</code></pre></div>
+</li>
+<li>New certificate for one name: find the folder <code>&lt;host folder bound to /data in bss-caddy&gt;/caddy/certificates/&lt;issuer&gt;/&lt;name&gt;</code>, move it to <code>/root/config-backups-argus/cert-&lt;name&gt;-&lt;stamp&gt;/</code>, restart the web server as above, then check the end date. To put the old one back, move the folder back and restart.</li>
+<li>Add a site: follow the helper's steps under <a href="#websites">Websites</a> (folder, <code>sites/&lt;domain&gt;.caddy</code>, the compose mount, the Caddyfile block), then apply. The site file content is the <code>SITE_TEMPLATE</code> in the helper. Running the helper (<code>site-add</code>) by hand is simpler and keeps the safety checks.</li>
+</ul>
+</section>
+<section class="sec" id="mail-2"><h3>Mail</h3><ul>
+<li>mailcow's own admin pages: <code>https://&lt;mail server address&gt;/admin</code> (two-factor resets must be done there in any case).</li>
+<li>Through the helper by hand (<a href="#running-the-helper-yourself">Running the helper yourself</a>), for example:
+<ul>
+<li><code>... mailbox-set $(hex user@example.com) inactive</code></li>
+<li><code>... mailq-flush</code></li>
+<li><code>... mail-overview</code> (lists ids for alias, app password and quarantine actions)</li>
+</ul>
+</li>
+<li>Through mailcow's API directly (endpoints taken from the helper; the key is read on the server and is not shown here):<div class="code"><button class="copy" type="button">Copy</button><pre><code>K=$(sudo sed -n 's/^API_KEY=//p' /opt/mailcow-dockerized/mailcow.conf)
+curl -s -H &quot;X-API-Key: $K&quot; http://127.0.0.1:8080/api/v1/get/mailbox/all
+curl -s -H &quot;X-API-Key: $K&quot; -H 'Content-Type: application/json' -X POST \
+     -d '{&quot;action&quot;:&quot;flush&quot;}' http://127.0.0.1:8080/api/v1/edit/mailq
+</code></pre></div>
+Other endpoints used: <code>get/alias/all</code>, <code>get/domain/all</code>, <code>get/mailq/all</code>, <code>get/quarantine/all</code>, <code>get/app-passwd/all/&lt;mailbox&gt;</code>, <code>get/dkim/&lt;domain&gt;</code>, <code>add/mailbox</code>, <code>edit/mailbox</code>, <code>delete/mailbox</code>, <code>add/app-passwd</code>, <code>delete/app-passwd</code>, <code>add/alias</code>, <code>delete/alias</code>, <code>delete/mailq</code>, <code>edit/qitem</code> (release), <code>delete/qitem</code>. The key ends up in a shell variable and on curl's command line while it runs <strong>(caution, not from the code)</strong>.</li>
+<li>Who has two-factor (read-only, as the helper does):
+<code>sudo docker exec mailcowdockerized-mysql-mailcow-1 sh -c 'MYSQL_PWD=&quot;$MYSQL_ROOT_PASSWORD&quot; mysql -uroot -N -B &quot;$MYSQL_DATABASE&quot; -e &quot;SELECT username, authmech, active FROM tfa&quot;'</code></li>
+<li>Mail DNS records: Argus looks these up from the PC. On any machine: <code>nslookup -type=mx &lt;domain&gt;</code>, <code>-type=txt &lt;domain&gt;</code>, <code>-type=txt _dmarc.&lt;domain&gt;</code>, <code>-type=txt &lt;selector&gt;._domainkey.&lt;domain&gt;</code> <strong>(uncertain: not from the code; the code uses Node's resolver)</strong>.</li>
+</ul>
+</section>
+<section class="sec" id="accounts-2"><h3>Accounts</h3><ul>
+<li>Upload accounts: running the helper by hand (<code>acct-add</code>, <code>acct-set</code>, <code>acct-delete</code>, <code>key-add</code>, <code>key-remove</code>) is the safe way: sharing a folder uses handle-based mounts and ACL steps that are not safe to repeat by path.</li>
+<li>Simple pieces from the code:
+<ul>
+<li>Disable: <code>sudo gpasswd -a &lt;name&gt; argus-disabled &amp;&amp; sudo pkill -KILL -u &lt;name&gt;</code>; enable: <code>sudo gpasswd -d &lt;name&gt; argus-disabled</code></li>
+<li>Size limit: <code>sudo setquota -u &lt;name&gt; &lt;KB&gt; &lt;KB&gt; 200000 200000 /</code> (KB = MB x 1024); usage: <code>sudo repquota -u /</code></li>
+<li>Description: <code>sudo usermod --comment '&lt;text&gt;' &lt;name&gt;</code></li>
+<li>Keys: one public key per line in <code>/etc/ssh/argus-keys/&lt;name&gt;</code> (root, 0644); afterwards <code>sudo pkill -KILL -u &lt;name&gt;</code> ends open sessions.</li>
+<li>Shared folders after a restart: <code>sudo /usr/local/sbin/argus-helper --session by-hand-01 acct-mount-all</code></li>
+</ul>
+</li>
+<li>Your own keys: <code>/home/&lt;your user&gt;/.ssh/authorized_keys</code> (&lt;your user&gt;, 0600). Keep at least one working key.</li>
+<li>Hephaestus users (as the helper does):<div class="code"><button class="copy" type="button">Copy</button><pre><code>cd /opt/hephaestus/deploy
+sudo docker compose exec -T app heph-admin list-staff
+sudo docker compose exec -T app heph-admin list-tenants
+sudo docker compose exec -T app heph-admin reset-totp &lt;email&gt;
+sudo docker compose exec -T app heph-admin revoke-sessions &lt;email&gt;
+sudo docker compose exec -T app heph-admin reset-link &lt;email&gt; 4
+sudo docker compose exec -T app heph-admin set-password &lt;email&gt;          # password on stdin
+sudo docker compose exec -T app heph-admin create-staff &lt;email&gt; &lt;first&gt; &lt;last&gt; [--admin]   # password on stdin
+sudo docker compose exec -T app heph-admin new-tenant &lt;slug&gt; &lt;Company Name&gt;
+sudo docker compose exec -T app heph-admin new-user &lt;slug&gt; &lt;email&gt; &lt;first&gt; &lt;last&gt; --role tenant_user|tenant_tech|tenant_admin --password   # password on stdin
+</code></pre></div>
+By hand, <code>create-staff</code> on an existing email re-passwords it (the helper refuses that case).</li>
+</ul>
+</section>
+<section class="sec" id="sign-in-attempts-and-the-block-list"><h3>Sign-In Attempts and the block list</h3><ul>
+<li>Refused SSH attempts: <code>sudo journalctl -u ssh --since -7d -o short-unix --no-pager</code></li>
+<li>Mail login failures and bans: <code>sudo docker logs -t --since 168h mailcowdockerized-netfilter-mailcow-1</code></li>
+<li>Trace a route (as Argus does, without the <code>nobody</code>/capability wrapper): <code>traceroute -4 -n -q 3 -w 2 -m 24 -N 24 &lt;ip&gt;</code>; ICMP adds <code>-I</code>, TCP to port 22 adds <code>-T -p 22</code> (these two need root).</li>
+<li>Reverse name: <code>host -W 3 &lt;ip&gt;</code></li>
+<li>See the block list: <code>sudo nft list table inet argus</code>; <code>sudo cat /var/lib/argus/blocked.json</code></li>
+<li>Block or unblock: use the helper by hand (<code>block-add $(hex 203.0.113.7/32) none</code>, <code>block-remove $(hex 203.0.113.7/32)</code>), because it regenerates <code>/var/lib/argus/blocklist.nft</code> and keeps your own networks in front of the drops. Editing <code>blocked.json</code> alone does not change the live firewall.</li>
+<li>Reload the saved block list: <code>sudo systemctl reload argus-blocklist.service</code> (runs <code>nft -f /var/lib/argus/blocklist.nft</code>).</li>
+<li>Emergency removal: see <a href="#locked-out-by-the-block-list">Locked out by the block list</a>.</li>
+<li>Mark an address or network as yours: add a line to <code>/etc/argus/own-addresses</code> (one address or network per line, <code>#</code> comments).</li>
+<li>Refresh the location databases: <code>sudo systemctl start argus-geo-update.service</code></li>
+</ul>
+</section>
+<section class="sec" id="hephaestus-2"><h3>Hephaestus</h3><ul>
+<li>Roll back to an earlier image (the job's steps):<div class="code"><button class="copy" type="button">Copy</button><pre><code>cd /opt/hephaestus/deploy
+sudo docker images hephaestus
+sudo docker tag hephaestus:local hephaestus:pre-argus-$(date +%Y%m%d-%H%M%S)
+sudo docker tag hephaestus:&lt;pre-tag&gt; hephaestus:local
+sudo docker compose up -d --no-deps --no-build app
+sudo docker inspect -f '{{.State.Health.Status}}' hephaestus-prod-app-1     # repeat until healthy
+printf '%s\n' '&lt;version&gt;' | sudo tee /var/lib/argus/heph-deployed
+HEPH_RESOLVE=&lt;app address&gt;:443:127.0.0.1 bash scripts/verify.sh &lt;/dev/null
+</code></pre></div>
+(Whether <code>scripts/verify.sh</code> needs root is not stated in the code; the job runs it as root.)</li>
+<li>Deploy by hand: on the PC, <code>git -C &quot;&lt;path to the Hephaestus repository&gt;&quot; -c core.autocrlf=false -c core.eol=lf archive --format=tar.gz -o heph.tar.gz &lt;commit&gt; Cargo.toml Cargo.lock crates migrations deploy tools/test/rls_invariants.sql</code>; copy it to the server and unpack it into an empty folder (never including <code>deploy/.env*</code> or <code>deploy/docker-compose.vps.yml</code>); then on the server, as root, save these lines as a script and run it with <code>bash</code> (its first line makes it stop at the first error; pasted straight into a shell, that line would close the shell on an error):<div class="code"><button class="copy" type="button">Copy</button><pre><code>set -e
+STAMP=$(date +%Y%m%d-%H%M%S); C=&lt;commit&gt;; SRC=&lt;unpacked folder&gt;; KEEP=pre-argus-$STAMP
+mkdir -p /root/config-backups-argus &amp;&amp; chmod 700 /root/config-backups-argus
+rsync -a --exclude '/deploy/.env*' --exclude target /opt/hephaestus/ /root/config-backups-argus/hephaestus-pre-$C-$STAMP/
+docker exec hephaestus-prod-db-1 pg_dump -U &lt;database owner&gt; -d heph -Fc &gt; /root/heph-pre-$C-$STAMP.dump
+docker tag hephaestus:local hephaestus:$KEEP      # the live image, kept under a new name for the way back
+cp $SRC/Cargo.toml $SRC/Cargo.lock /opt/hephaestus/
+rsync -a --delete $SRC/crates/ /opt/hephaestus/crates/
+rsync -a --delete $SRC/migrations/ /opt/hephaestus/migrations/
+mkdir -p /opt/hephaestus/tools/test &amp;&amp; cp $SRC/tools/test/rls_invariants.sql /opt/hephaestus/tools/test/
+rsync -a --delete --exclude /.env --exclude '/.env.*' --exclude /docker-compose.vps.yml $SRC/deploy/ /opt/hephaestus/deploy/
+cd /opt/hephaestus/deploy &amp;&amp; docker compose config --quiet
+docker compose build app
+docker compose run --rm migrate
+docker compose up -d
+ok=0; for i in $(seq 24); do sleep 5; h=$(docker inspect -f '{{.State.Health.Status}}' hephaestus-prod-app-1 || true); echo &quot;health: $h&quot;; [ &quot;$h&quot; = healthy ] &amp;&amp; { ok=1; break; }; done
+[ $ok = 1 ] || { echo 'Not healthy after two minutes: run the revert below.'; exit 1; }
+printf '%s\n' &quot;$C&quot; &gt; /var/lib/argus/heph-deployed
+HEPH_RESOLVE=&lt;app address&gt;:443:127.0.0.1 bash scripts/verify.sh &lt;/dev/null
+</code></pre></div>
+To put the previous version back (the job's revert): <code>rsync -a --delete --exclude /deploy/.env --exclude '/deploy/.env.*' --exclude /deploy/docker-compose.vps.yml --exclude target /root/config-backups-argus/hephaestus-pre-&lt;commit&gt;-&lt;stamp&gt;/ /opt/hephaestus/</code>, <code>docker tag hephaestus:pre-argus-&lt;stamp&gt; hephaestus:local</code> (the name the block above kept), <code>cd /opt/hephaestus/deploy &amp;&amp; docker compose up -d --no-deps --no-build app</code>.</li>
+<li>Restoring the database dump: not in the code <strong>(uncertain)</strong>; the file is a <code>pg_dump -Fc</code> archive, which is restored with <code>pg_restore</code>.</li>
+</ul>
+</section>
+<section class="sec" id="backups-2"><h3>Backups</h3><ul>
+<li>Start now: <code>sudo systemctl start --no-block mailcow-backup.service</code> or <code>sudo systemctl start --no-block heph-db-backup.service</code></li>
+<li>What is kept: <code>ls -lt /opt/backups/mailcow /opt/backups/hephaestus</code></li>
+<li>Restoring a backup: not in the code <strong>(uncertain)</strong>.</li>
+</ul>
+</section>
+<section class="sec" id="files-2"><h3>Files</h3><ul>
+<li>Ordinary shell commands (<code>cp</code>, <code>chown</code>, <code>chmod</code>) or any SFTP client. Argus's habits worth copying: copy a file you overwrite to <code>/var/backups/argus/&lt;date&gt;/&lt;time&gt;&lt;path&gt;</code> first, keep the old file's owner and mode, and do not drop files into a folder a website serves unless they are meant to be public.</li>
+</ul>
+</section>
+</section>
+<section class="group" id="what-argus-put-on-the-server" data-group><h2>What Argus Put on the Server</h2><p>Installed by the setup scripts (run as root by the server administrator, not by Argus):</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Installed by</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/usr/local/sbin/argus-helper</code></td>
+<td>by hand (README: root, 0755)</td>
+<td>The fixed list of actions Argus may ask for</td>
+</tr>
+<tr>
+<td><code>argus-upload-mounts.service</code></td>
+<td>accounts-setup.sh</td>
+<td>At boot, before ssh, runs <code>argus-helper --session boot-mounts acct-mount-all</code> to reconnect shared folders</td>
+</tr>
+<tr>
+<td><code>argus-geo-update.service</code></td>
+<td>geo-setup.sh</td>
+<td>Runs <code>argus-helper --session geo-timer geo-update</code> (20 min limit, sandboxed: ProtectSystem=strict, writes only <code>/var/lib/argus</code> and <code>/var/log/argus</code>, no capabilities)</td>
+</tr>
+<tr>
+<td><code>argus-geo-update.timer</code></td>
+<td>geo-setup.sh</td>
+<td>Monthly on the 4th at 05:20, up to 2 h random delay, catches up if missed</td>
+</tr>
+<tr>
+<td><code>argus-blocklist.service</code></td>
+<td>geo-setup.sh</td>
+<td>Loads <code>/var/lib/argus/blocklist.nft</code> at boot (WantedBy sysinit.target), after <code>nftables.service</code>, and again when nftables reloads</td>
+</tr>
+<tr>
+<td><code>/etc/ssh/sshd_config.d/04-argus-loglevel.conf</code></td>
+<td>geo-setup.sh</td>
+<td><code>LogLevel VERBOSE</code>, so &quot;Used Your SSH Key&quot; can be detected</td>
+</tr>
+<tr>
+<td><code>/etc/ssh/sshd_config.d/05-argus-deny.conf</code></td>
+<td>accounts-setup.sh</td>
+<td><code>DenyGroups argus-disabled</code></td>
+</tr>
+<tr>
+<td><code>/etc/ssh/sshd_config.d/60-argus-upload.conf</code></td>
+<td>accounts-setup.sh</td>
+<td><code>Match Group argus-upload</code>: chroot, SFTP only, keys file, key plus code, no forwarding or TTY</td>
+</tr>
+<tr>
+<td><code>/etc/pam.d/sshd</code> (one line changed)</td>
+<td>accounts-setup.sh</td>
+<td>Authenticator secrets read from <code>/var/lib/google-authenticator/${USER}</code> as root</td>
+</tr>
+<tr>
+<td><code>/etc/fstab</code> (<code>usrquota</code> on <code>/</code>), <code>/aquota.user</code></td>
+<td>accounts-setup.sh</td>
+<td>Disk size limits</td>
+</tr>
+<tr>
+<td>Groups <code>argus-upload</code>, <code>argus-disabled</code></td>
+<td>accounts-setup.sh</td>
+<td>Upload accounts; disabled accounts</td>
+</tr>
+<tr>
+<td><code>/srv/sftp/</code> (0755), <code>/etc/ssh/argus-keys/</code> (0755)</td>
+<td>accounts-setup.sh</td>
+<td>Jails; upload account key files</td>
+</tr>
+<tr>
+<td><code>/var/lib/google-authenticator/</code> (0700)</td>
+<td>accounts-setup.sh</td>
+<td>Authenticator secret files (secret; including a copy of &lt;your user&gt;'s at <code>/var/lib/google-authenticator/&lt;your user&gt;</code>)</td>
+</tr>
+<tr>
+<td><code>/var/backups/argus-setup/</code> (0700)</td>
+<td>accounts-setup.sh</td>
+<td>Copies of <code>/etc/fstab</code> and <code>/etc/pam.d/sshd</code> from before the changes</td>
+</tr>
+<tr>
+<td><code>/etc/argus/own-addresses</code></td>
+<td>geo-setup.sh</td>
+<td>Your own addresses or networks, one per line</td>
+</tr>
+<tr>
+<td>Packages <code>quota</code>, <code>python3-maxminddb</code>, <code>traceroute</code></td>
+<td>setup scripts</td>
+<td>Quotas; location database reader; route tracing</td>
+</tr>
+</tbody>
+</table></div>
+<p>Made by the helper at run time:</p>
+<div class="tw"><table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transient units <code>argus-updates</code>, <code>argus-heph-rollback</code>, <code>argus-heph-deploy</code>, <code>argus-web</code>, <code>argus-svc-update</code> (<code>.service</code>)</td>
+<td>Background jobs started with <code>systemd-run</code> (no unit files on disk)</td>
+</tr>
+<tr>
+<td><code>/var/log/argus/actions.log</code></td>
+<td>The log behind the Activity Log view</td>
+</tr>
+<tr>
+<td><code>/var/log/argus/jobs/&lt;job&gt;.log</code>, <code>&lt;job&gt;.sh</code>, <code>.lock</code></td>
+<td>Job logs, job scripts, the one-change-at-a-time lock</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/heph-deployed</code></td>
+<td>The Hephaestus version that is live</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/deploy/</code> (<code>src-&lt;commit&gt;/</code>, <code>diff-&lt;commit&gt;.txt</code>, temporary <code>.argus-upload-*</code>)</td>
+<td>Staged Hephaestus package and its diff</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/caddy-history/&lt;stamp&gt;/</code>, <code>failed-&lt;stamp&gt;/</code></td>
+<td>Good web configurations (20 kept) and files set aside after a failed change (10 kept)</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/service-updates.json</code></td>
+<td>Cached service version check (6 h)</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/upload-mounts.json</code></td>
+<td>Which upload account shares which folder</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/upload-uid</code></td>
+<td>Next upload account number (30000 to 59999, never reused)</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/own-seen.json</code></td>
+<td>Your remembered sign-in addresses (180 days)</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/geo/dbip-city-lite.mmdb</code>, <code>dbip-asn-lite.mmdb</code>, <code>.lock</code></td>
+<td>Location and provider databases (DB-IP, CC BY 4.0)</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/rdap-bootstrap-4.json</code>, <code>-6.json</code></td>
+<td>IANA registry bootstrap files (30 days)</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/ipinfo-cache.json</code></td>
+<td>Registry and reverse-name answers (7 days, 3000 entries)</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/blocked.json</code></td>
+<td>The block list</td>
+</tr>
+<tr>
+<td><code>/var/lib/argus/blocklist.nft</code></td>
+<td>The nftables file generated from it (table <code>inet argus</code>)</td>
+</tr>
+<tr>
+<td><code>/var/cache/argus/changelogs/</code></td>
+<td>Package change-log summaries (pruned after 60 days)</td>
+</tr>
+<tr>
+<td><code>/var/backups/argus/&lt;date&gt;/&lt;time&gt;&lt;path&gt;</code></td>
+<td>Files overwritten by uploads</td>
+</tr>
+<tr>
+<td><code>/var/backups/argus/account-&lt;name&gt;-&lt;stamp&gt;/</code></td>
+<td>Own folders of deleted upload accounts</td>
+</tr>
+<tr>
+<td><code>/root/config-backups-argus/hephaestus-pre-&lt;commit&gt;-&lt;stamp&gt;/</code></td>
+<td>Hephaestus source before a deploy</td>
+</tr>
+<tr>
+<td><code>/root/config-backups-argus/cert-&lt;name&gt;-&lt;stamp&gt;/</code></td>
+<td>Certificates set aside by Renew</td>
+</tr>
+<tr>
+<td><code>/root/heph-pre-&lt;commit&gt;-&lt;stamp&gt;.dump</code></td>
+<td>Hephaestus database before a deploy</td>
+</tr>
+<tr>
+<td><code>/run/argus-trace.lock</code></td>
+<td>One trace at a time</td>
+</tr>
+<tr>
+<td>Upload account files: <code>/srv/sftp/&lt;name&gt;/files</code>, <code>/etc/ssh/argus-keys/&lt;name&gt;</code>, <code>/var/lib/google-authenticator/&lt;name&gt;</code> (secret)</td>
+<td>Per account</td>
+</tr>
+<tr>
+<td>Docker tags <code>hephaestus:pre-&lt;commit&gt;</code>, <code>hephaestus:pre-argus-&lt;stamp&gt;</code>, <code>argus-rollback/&lt;name&gt;:before-update</code>, <code>bss-php:before-update</code></td>
+<td>Rollback copies</td>
+</tr>
+</tbody>
+</table></div>
+<p>Referenced by the helper but not installed by anything in this repository:</p>
+<ul>
+<li><code>/etc/tmpfiles.d/argus.conf</code> with <code>d /var/backups/argus 0700 root root 30d</code> (the 30-day clean-up of <code>/var/backups/argus</code>).</li>
+<li>The timers and services the dashboard checks: <code>mailcow-backup</code>, <code>heph-db-backup</code>, <code>apt-daily-upgrade</code>, one further job hard-coded for the reference server.</li>
+<li><code>/opt/hephaestus/deploy/scripts/verify.sh</code>, <code>heph-admin</code> in the app image, mailcow's <code>update.sh</code>.</li>
+<li>The sudo rights that let <code>sudo -n</code> run the helper and <code>sftp-server</code> (the helper says &lt;your user&gt; has full sudo).</li>
+</ul>
+
+</section>
+<section class="group" id="recovery" data-group><h2>Recovery</h2>
+<section class="sec" id="locked-out-by-the-block-list"><h3>Locked out by the block list</h3><ul>
+<li>Your known admin networks are accepted ahead of the drops, and blocks overlapping them, the server, its gateways or name servers are refused. A risk remains if you later sign in from a new address inside a blocked network.</li>
+<li>The way back in, from the Block confirmation text: use the cloud provider's console and run
+<code>sudo nft destroy table inet argus &amp;&amp; sudo systemctl disable argus-blocklist.service</code>, then unblock the network in Argus, then <code>sudo systemctl enable argus-blocklist.service</code>.</li>
+<li><code>nft destroy table</code> alone lasts only until the next boot or nftables reload, which is why the service must be disabled too; and your cloud provider's serial console needs an account that can sign in with a password (an SSH-key-only setup usually has none), so the console sign-in has to be tested once beforehand (a local password-capable user, or your provider's run-command feature). <strong>Do this once now, not when you are locked out:</strong> sign in at your cloud provider's console and make sure you can get a shell there.</li>
+</ul>
+</section>
+<section class="sec" id="ssh-and-pam-changes-from-accounts-setup-"><h3>SSH and PAM changes from accounts-setup.sh</h3><ul>
+<li>The script prints the undo command to use if your sign-in fails: <code>cp -a /var/backups/argus-setup/pam-sshd.pre-argus-&lt;stamp&gt; /etc/pam.d/sshd</code>. Root's own sign-in is key-only and never uses the authenticator, so a root session stays usable to undo it.</li>
+<li>If <code>sshd -t</code> rejects the settings, the script puts the PAM file back and removes the two Argus sshd files itself.</li>
+<li><code>/etc/fstab</code> before quotas: <code>/var/backups/argus-setup/fstab.pre-quota-&lt;stamp&gt;</code> (put back automatically if the remount fails).</li>
+<li><code>04-argus-loglevel.conf</code> is removed automatically if <code>sshd -t</code> rejects it.</li>
+</ul>
+</section>
+<section class="sec" id="hephaestus-3"><h3>Hephaestus</h3><ul>
+<li>Rollback tags: a deploy keeps the live image as <code>hephaestus:pre-&lt;live commit&gt;</code> (or <code>pre-argus-&lt;stamp&gt;</code>; a stamp is appended rather than move an existing tag). A rollback keeps the live image as <code>pre-argus-&lt;stamp&gt;</code>, so it can itself be undone; only the three newest <code>pre-argus-</code> tags are kept.</li>
+<li>Automatic revert: a rollback that does not start or is not healthy in 2 minutes puts the previous image back; a deploy that fails at copy, build, migrate or start restores the source backup and the kept image.</li>
+<li>Database migrations are never undone; &quot;columns added by newer versions stay, which does no harm.&quot;</li>
+<li>Before every deploy: source backup in <code>/root/config-backups-argus/hephaestus-pre-&lt;commit&gt;-&lt;stamp&gt;</code> and database dump <code>/root/heph-pre-&lt;commit&gt;-&lt;stamp&gt;.dump</code>.</li>
+<li>If the server checks fail after a deploy or rollback, the new version stays live; roll back from the page.</li>
+</ul>
+</section>
+<section class="sec" id="web-server"><h3>Web server</h3><ul>
+<li>Every good apply is kept in <code>/var/lib/argus/caddy-history/&lt;stamp&gt;</code>; <strong>Earlier configurations</strong> can put one back.</li>
+<li>After a failed change, the files as they were go to <code>/var/lib/argus/caddy-history/failed-&lt;stamp&gt;</code> before the last good copy is restored.</li>
+<li>Renew: the old certificate is moved back if no new one arrives within 90 s; the set-aside copy stays in <code>/root/config-backups-argus/cert-&lt;name&gt;-&lt;stamp&gt;</code>.</li>
+<li>Let's Encrypt limit noted in the Renew text: about five new certificates per name per week.</li>
+</ul>
+</section>
+<section class="sec" id="services-and-updates"><h3>Services and updates</h3><ul>
+<li>Service updates keep the previous image as <code>argus-rollback/&lt;name&gt;:before-update</code> (pull, rebuild, recreate) or <code>bss-php:before-update</code> (rebuild of <code>bss-php:8.5</code>); for <code>bss-php</code> the job prints the undo (&quot;docker tag bss-php:before-update bss-php:8.5, then restart the same containers&quot;). For the other kinds, the code gives no undo command.</li>
+<li>A mailcow update starts only after a successful mail backup.</li>
+<li>Major database upgrades: the How to Update steps include taking a dump first and how to undo.</li>
+</ul>
+</section>
+<section class="sec" id="files-and-accounts"><h3>Files and accounts</h3><ul>
+<li>Overwritten files: <code>/var/backups/argus/&lt;date&gt;/&lt;time&gt;&lt;path&gt;</code>.</li>
+<li>A deleted upload account's own folder: <code>/var/backups/argus/account-&lt;name&gt;-&lt;stamp&gt;</code> (30 days, per the tmpfiles rule the helper refers to); files it put in a shared folder stay, owned by root.</li>
+<li>Lost phone (upload account): <strong>New Authenticator Code</strong>, or one of the five emergency codes. Lost phone (Hephaestus user): <strong>Reset Two-Factor</strong>. Lost phone (mailbox): mailcow admin pages. The code does not cover a lost authenticator for your own &lt;your user&gt; sign-in.</li>
+<li>The last &lt;your user&gt; key can't be removed.</li>
+<li>Shared folders not reconnected after a boot show <strong>Not Connected</strong>; <code>acct-mount-all</code> reconnects them (it runs at boot).</li>
+</ul>
+</section>
+<section class="sec" id="connection"><h3>Connection</h3><ul>
+<li>A lost connection needs Disconnect and a fresh sign-in (a new code).</li>
+<li>A scheduled server restart can be cancelled during its minute with <strong>Cancel the Restart</strong>.</li>
+</ul>
+</section>
+</section>
+      <button class="totop" type="button" id="totop">Contents and Search</button>
+      <p id="nothing">Nothing in the guide matches that. Try a shorter word, or a button's name as it appears on screen.</p>
+    </div>
+  </main>
+</div>
+
+<script>
+(() => {
+  const q = document.getElementById('q');
+  const hits = document.getElementById('hits');
+  const secs = [...document.querySelectorAll('.sec')];
+  const groups = [...document.querySelectorAll('.group')];
+  const original = new Map(secs.map((s) => [s, s.innerHTML]));
+  const navFor = (id) => document.querySelector(`.toc a[href="#${id}"]`)?.parentElement;
+
+  function clearMarks() { for (const [s, h] of original) if (s.dataset.marked) { s.innerHTML = h; delete s.dataset.marked; } }
+  function mark(el, term) {
+    const re = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, { acceptNode: (n) => n.parentElement.closest('button') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
+    const nodes = []; while (walk.nextNode()) nodes.push(walk.currentNode);
+    for (const n of nodes) {
+      if (!re.test(n.nodeValue)) continue; re.lastIndex = 0;
+      const frag = document.createDocumentFragment(); let last = 0;
+      n.nodeValue.replace(re, (m, i) => { frag.append(n.nodeValue.slice(last, i)); const k = document.createElement('mark'); k.textContent = m; frag.append(k); last = i + m.length; });
+      frag.append(n.nodeValue.slice(last)); n.replaceWith(frag);
+    }
+  }
+  let t;
+  function run() {
+    const term = q.value.trim();
+    clearMarks();
+    if (!term) {
+      secs.forEach((s) => { s.classList.remove('miss'); navFor(s.id)?.classList.remove('miss'); });
+      groups.forEach((g) => { g.classList.remove('miss'); navFor(g.id)?.classList.remove('miss'); });
+      hits.textContent = ''; document.getElementById('nothing').style.display = 'none'; return;
+    }
+    const low = term.toLowerCase(); let n = 0;
+    secs.forEach((s) => {
+      const ok = s.textContent.toLowerCase().includes(low);
+      s.classList.toggle('miss', !ok); navFor(s.id)?.classList.toggle('miss', !ok);
+      if (ok) { n++; if (term.length > 1) { mark(s, term); s.dataset.marked = '1'; } }
+    });
+    groups.forEach((g) => {
+      const any = g.querySelector('.sec:not(.miss)') || g.querySelector(':scope > :not(h2):not(.sec)')?.textContent.toLowerCase().includes(low);
+      g.classList.toggle('miss', !any); const li = navFor(g.id); if (li) li.classList.toggle('miss', !any);
+    });
+    hits.textContent = n ? `${n} ${n === 1 ? 'section matches' : 'sections match'}` : 'No matches';
+    document.getElementById('nothing').style.display = n ? 'none' : 'block';
+  }
+  q.addEventListener('input', () => { clearTimeout(t); t = setTimeout(run, 120); });
+  q.addEventListener('keydown', (e) => { if (e.key === 'Escape') { q.value = ''; run(); } });
+
+  document.addEventListener('click', async (e) => {
+    const b = e.target.closest('.copy'); if (!b) return;
+    const text = b.parentElement.querySelector('code').innerText;
+    try { await navigator.clipboard.writeText(text); b.textContent = 'Copied'; }
+    catch { const r = document.createRange(); r.selectNodeContents(b.parentElement.querySelector('code')); const s = getSelection(); s.removeAllRanges(); s.addRange(r); b.textContent = 'Selected: press Ctrl+C'; }
+    setTimeout(() => { b.textContent = 'Copy'; }, 1800);
+  });
+
+  const rail = document.getElementById('rail'), tg = document.getElementById('railtoggle');
+  tg.addEventListener('click', () => { const o = rail.classList.toggle('open'); tg.setAttribute('aria-expanded', String(o)); });
+  // On a phone: a contents link closes the list; the floating button brings you back to it.
+  document.getElementById('toc').addEventListener('click', (e) => { if (e.target.closest('a')) { rail.classList.remove('open'); tg.setAttribute('aria-expanded', 'false'); } });
+  document.getElementById('totop').addEventListener('click', () => { rail.classList.add('open'); tg.setAttribute('aria-expanded', 'true'); window.scrollTo(0, 0); q.focus({ preventScroll: true }); });
+
+  const links = new Map([...document.querySelectorAll('.toc a')].map((a) => [a.getAttribute('href').slice(1), a]));
+  const io = new IntersectionObserver((es) => {
+    for (const e of es) if (e.isIntersecting) { links.forEach((a) => a.classList.remove('on')); links.get(e.target.id)?.classList.add('on'); }
+  }, { rootMargin: '0px 0px -75% 0px' });
+  secs.forEach((s) => io.observe(s));
+})();
+</script>

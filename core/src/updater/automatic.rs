@@ -1,10 +1,15 @@
 use crate::updater::types::{ServiceUpdate, UpdateStatus};
+use crate::ssh::Session;   // uses the existing SSH session from core
 
-/// Returns a list of services that currently have automatic updates available.
-/// In a real implementation this would query the server.
-pub fn get_auto_update_services() -> Vec<ServiceUpdate> {
-    // TODO: Replace this mock with a real query against the server
-    vec![
+/// Queries the server and returns services that have automatic updates available.
+/// Replace the mock data with a real command when ready.
+pub fn get_auto_update_services(session: &Session) -> Result<Vec<ServiceUpdate>, String> {
+    // TODO: Replace this with a real command, e.g.:
+    // let output = session.execute("argus list-updates --format json")?;
+    // Then parse the JSON into Vec<ServiceUpdate>
+
+    // Current placeholder data
+    Ok(vec![
         ServiceUpdate {
             name: "bss-panel".to_string(),
             status: UpdateStatus::AutoAvailable,
@@ -19,21 +24,25 @@ pub fn get_auto_update_services() -> Vec<ServiceUpdate> {
             target_version: Some("8.6".to_string()),
             manual_instructions: None,
         },
-    ]
+    ])
 }
 
-/// Runs all automatic updates for services that support them.
-/// Returns a summary string on success.
-pub fn run_automatic_updates() -> Result<String, String> {
-    let services = get_auto_update_services();
+/// Runs all automatic updates using the provided SSH session.
+pub fn run_automatic_updates(session: &Session) -> Result<String, String> {
+    let services = get_auto_update_services(session)?;
     let mut updated = Vec::new();
 
     for service in services {
         if service.status == UpdateStatus::AutoAvailable {
-            // TODO: Replace with real execution using the existing SSH client
-            // Example placeholder:
-            // execute_command(&format!("docker compose pull {}", service.name))?;
-            // execute_command(&format!("docker compose up -d {}", service.name))?;
+            // Real execution placeholder – replace with actual docker commands
+            let pull = format!("docker compose pull {}", service.name);
+            let up = format!("docker compose up -d {}", service.name);
+
+            // TODO: session.execute(&pull)?;
+            // TODO: session.execute(&up)?;
+
+            println!("Would run: {}", pull);
+            println!("Would run: {}", up);
 
             updated.push(service.name);
         }

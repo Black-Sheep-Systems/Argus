@@ -1,36 +1,31 @@
-use crate::updater::{get_auto_update_services, run_automatic_updates, run_manual_update, ServiceUpdate, UpdateStatus};
+use crate::ssh::Session;
+use crate::updater::{get_auto_update_services, run_automatic_updates, run_manual_update, UpdateStatus};
 
-/// Main "Update All" workflow.
-/// Runs automatic updates first, then all manual ones, then restarts.
-pub fn update_all() -> Result<String, String> {
+pub fn update_all(session: &Session) -> Result<String, String> {
     let mut log = String::new();
 
-    // 1. Automatic updates
-    match run_automatic_updates() {
-        Ok(msg) => log.push_str(&format!("Automatic updates: {}\n", msg)),
-        Err(e) => return Err(format!("Automatic updates failed: {}", e)),
+    match run_automatic_updates(session) {
+        Ok(msg) => log.push_str(&format!("Automatic: {}\n", msg)),
+        Err(e) => return Err(format!("Automatic failed: {}", e)),
     }
 
-    // 2. Manual updates
-    let manual_services: Vec<ServiceUpdate> = get_auto_update_services()
+    let manual_services = get_auto_update_services(session)?
         .into_iter()
         .filter(|s| s.status == UpdateStatus::ManualRequired)
-        .collect();
+        .collect::<Vec<_>>();
 
     for service in manual_services {
-        match run_manual_update(&service.name) {
+        match run_manual_update(session, &service.name) {
             Ok(msg) => log.push_str(&format!("Manual {}: {}\n", service.name, msg)),
-            Err(e) => log.push_str(&format!("Manual {} failed: {}\n", service.name, e)),
+            Err(e) => log.push_str(&format!("Manual {} error: {}\n", service.name, e)),
         }
     }
 
-    // 3. Restart server (placeholder)
     log.push_str("Restarting server...\n");
-    // TODO: call existing restart logic from core
+    // TODO: session.execute("systemctl restart blacksheep")?;
 
-    // 4. Wait + refresh (placeholder)
-    log.push_str("Waiting 30 seconds then refreshing status...\n");
-    // TODO: std::thread::sleep + re-query status
+    log.push_str("Waiting 30s and refreshing status...\n");
+    // TODO: std::thread::sleep(Duration::from_secs(30));
 
     Ok(log)
 }

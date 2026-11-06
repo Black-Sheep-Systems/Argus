@@ -195,3 +195,22 @@ table.plain td:last-child { text-align: left; }
 th[aria-sort="ascending"] .sort-mark::after { content: "▲"; font-size: 10px; }
 th[aria-sort="descending"] .sort-mark::after { content: "▼"; font-size: 10px; }
 th[aria-sort="ascending"], th[aria-sort="descending"] { color: var(--text, inherit); }
+
+/* === Update All (Beta) === */
+.update-all-wrap {
+  margin-top: 12px;
+}
+
+.update-log {
+  white-space: pre-wrap;
+  background: #111;
+  color: #0f0;
+  padding: 12px;
+  margin-top: 12px;
+  height: 200px;
+  overflow: auto;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  display: none;
+  border: 1px solid #333;
+  border-radius: 4px;
+}

@@ -1,30 +1,36 @@
-use crate::updater::{run_automatic_updates, run_manual_update, ServiceUpdate, UpdateStatus};
+use crate::updater::{get_auto_update_services, run_automatic_updates, run_manual_update, ServiceUpdate, UpdateStatus};
 
+/// Main "Update All" workflow.
+/// Runs automatic updates first, then all manual ones, then restarts.
 pub fn update_all() -> Result<String, String> {
     let mut log = String::new();
 
-    // 1. Run automatic updates
+    // 1. Automatic updates
     match run_automatic_updates() {
-        Ok(msg) => log.push_str(&format!("Automatic: {}\n", msg)),
+        Ok(msg) => log.push_str(&format!("Automatic updates: {}\n", msg)),
         Err(e) => return Err(format!("Automatic updates failed: {}", e)),
     }
 
-    // 2. Get current status (placeholder – will be replaced with real query)
-    let manual_services = vec!["nds-api"]; // later: query real list
+    // 2. Manual updates
+    let manual_services: Vec<ServiceUpdate> = get_auto_update_services()
+        .into_iter()
+        .filter(|s| s.status == UpdateStatus::ManualRequired)
+        .collect();
 
-    // 3. Run manual updates for services that need it
-    for svc in manual_services {
-        match run_manual_update(svc) {
-            Ok(msg) => log.push_str(&format!("Manual {}: {}\n", svc, msg)),
-            Err(e) => log.push_str(&format!("Manual {} failed: {}\n", svc, e)),
+    for service in manual_services {
+        match run_manual_update(&service.name) {
+            Ok(msg) => log.push_str(&format!("Manual {}: {}\n", service.name, msg)),
+            Err(e) => log.push_str(&format!("Manual {} failed: {}\n", service.name, e)),
         }
     }
 
-    // 4. Restart + refresh (placeholder)
+    // 3. Restart server (placeholder)
     log.push_str("Restarting server...\n");
-    // TODO: call existing restart logic
-    log.push_str("Waiting 30 seconds and refreshing status...\n");
-    // TODO: sleep + re-query
+    // TODO: call existing restart logic from core
+
+    // 4. Wait + refresh (placeholder)
+    log.push_str("Waiting 30 seconds then refreshing status...\n");
+    // TODO: std::thread::sleep + re-query status
 
     Ok(log)
 }

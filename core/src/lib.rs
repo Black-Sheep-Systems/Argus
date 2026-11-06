@@ -1,6 +1,7 @@
 //! Argus core: the SSH connection to the Black Sheep server.
 //! Phase 1 holds only the sign-in. Everything else builds on `Session`.
 
+pub mod updater;
 pub mod files;
 
 use std::sync::{Arc, Mutex};

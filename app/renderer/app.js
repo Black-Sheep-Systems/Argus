@@ -436,6 +436,52 @@ async function loadServer() {
   const names = arr(obj(st.services)?.names) || [];
   $('svc-rows').replaceChildren(...(names.length ? names.map((n) => row([el('span', n, 'mono'), el('span', '…', 'muted'), el('span', 'Checking…', 'muted'),
     button('Restart', '', () => restartService(n))])) : [row(['No running services were reported.', '', '', ''])]));
+  
+// --- Update All (Beta) ---
+const updateAllWrap = el('div', null, 'update-all-wrap');
+updateAllWrap.style.marginTop = '12px';
+
+const logPanel = el('pre', '', 'update-log');
+logPanel.style.cssText = 'white-space:pre-wrap;background:#111;color:#0f0;padding:12px;margin-top:12px;height:200px;overflow:auto;font-family:monospace;display:none;border:1px solid #333;border-radius:4px;';
+
+const updateAllBtn = button('Update All', 'primary', async () => {
+  updateAllBtn.disabled = true;
+  logPanel.style.display = 'block';
+  logPanel.textContent = 'Starting Update All…\n';
+  try {
+    const result = await window.argus.updaterUpdateAll();
+    logPanel.textContent += result + '\n';
+  } catch (err) {
+    logPanel.textContent += `Error: ${errText(err)}\n`;
+  } finally {
+    updateAllBtn.disabled = false;
+  }
+});
+
+  
+updateAllWrap.append(updateAllBtn, logPanel);
+$('svc-rows').parentElement.appendChild(updateAllWrap);
+
+// Live log listener
+window.argus.updaterOnLog?.((msg) => {
+  logPanel.style.display = 'block';
+  logPanel.textContent += msg + '\n';
+  logPanel.scrollTop = logPanel.scrollHeight;
+});
+
+  
+const logPanel = el('pre', '', 'update-log');
+logPanel.style.cssText = 'white-space:pre-wrap;background:#111;color:#0f0;padding:12px;margin-top:12px;height:200px;overflow:auto;font-family:monospace;display:none;border:1px solid #333;border-radius:4px;';
+updateAllWrap.append(updateAllBtn, logPanel);
+$('svc-rows').parentElement.appendChild(updateAllWrap);
+
+// Live log listener
+window.argus.updaterOnLog?.((msg) => {
+  logPanel.style.display = 'block';
+  logPanel.textContent += msg + '\n';
+  logPanel.scrollTop = logPanel.scrollHeight;
+});
+  
   loadServiceUpdates(false);
   const reboot = obj(st.server)?.reboot_scheduled === true;
   $('reboot-state').textContent = reboot ? 'A restart is scheduled within the next minute.' : '';

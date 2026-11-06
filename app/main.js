@@ -299,6 +299,12 @@ handle('argus:app', async (op) => {
   }
 });
 
+// === Updater (Beta) ===
+handle('argus:updaterUpdateAll', async () => {
+  // TODO: Call into Rust core updater when ready
+  return "Update All completed (Rust integration pending)";
+});
+
 // One Argus at a time: a second copy would have its own separate connection.
 const firstCopy = app.requestSingleInstanceLock();
 if (!firstCopy) {

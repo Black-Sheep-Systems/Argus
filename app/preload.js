@@ -1,6 +1,3 @@
-// The only things the Argus window can ask for.
-const { contextBridge, ipcRenderer, webUtils } = require('electron');
-
 contextBridge.exposeInMainWorld('argus', {
   signInStart: (passphrase) => ipcRenderer.invoke('argus:signInStart', passphrase),
   signInFinish: (code) => ipcRenderer.invoke('argus:signInFinish', code),
@@ -31,6 +28,11 @@ contextBridge.exposeInMainWorld('argus', {
   dnsCheck: (domain, selector) => ipcRenderer.invoke('argus:dnsCheck', domain, selector),
   openMailAdmin: () => ipcRenderer.invoke('argus:openMailAdmin'),
   deployPrepare: (commit) => ipcRenderer.invoke('argus:deployPrepare', commit),
-  // A file dragged in from Windows Explorer: its full path on this PC.
   pathForFile: (file) => webUtils.getPathForFile(file),
+
+  // === Updater (Beta) - add these two lines ===
+  updaterUpdateAll: () => ipcRenderer.invoke('argus:updaterUpdateAll'),
+  updaterOnLog: (callback) => {
+    ipcRenderer.on('argus:updaterLog', (_event, message) => callback(message));
+  },
 });

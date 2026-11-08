@@ -11,11 +11,11 @@
     "postinstall": "node vendor.js"
   },
   "devDependencies": {
-    "electron": "44.9.0"
+    "electron": "^44.10.2"
   },
   "dependencies": {
-    "@xterm/xterm": "6.0.0",
     "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
     "qrcode-generator": "2.0.4"
   }
 }

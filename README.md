@@ -1,6 +1,6 @@
 # Argus
 
-Desktop admin app for the Black Sheep server. Design: `claude/argus-design.md` in the Inventory Control System project.
+Desktop admin app for the Black Sheep Server. Design: `claude/argus-design.md` in the Inventory Control System project.
 
 Phase 1, unfinished: `core/` holds the SSH sign-in (key + passphrase, then authenticator code, server key pinned).
 

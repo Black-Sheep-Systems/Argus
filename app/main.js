@@ -34,22 +34,23 @@ const RENDERER_DIR = pathToFileURL(path.join(__dirname, 'renderer')).href + '/';
 let win = null;
 
 function createWindow() {
-  win = new BrowserWindow({
-    width: 1360,
-    height: 900,
-    minWidth: 900,
-    minHeight: 600,
-    title: 'Argus',
-    backgroundColor: nativeTheme.shouldUseDarkColors ? '#0F1A24' : '#EEF2F1',
-    autoHideMenuBar: true,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      sandbox: true,
-      nodeIntegration: false,
-      webviewTag: false,
-      spellcheck: false,
-      devTools: !app.isPackaged,
+	win = new BrowserWindow({
+		width: 1360,
+		height: 900,
+		minWidth: 900,
+		minHeight: 600,
+		title: 'Argus',
+		icon: path.join(__dirname, 'assets', 'argus.ico'),
+		backgroundColor: nativeTheme.shouldUseDarkColors ? '#0F1A24' : '#EEF2F1',
+		autoHideMenuBar: true,
+		webPreferences: {
+		preload: path.join(__dirname, 'preload.js'),
+		contextIsolation: true,
+		sandbox: true,
+		nodeIntegration: false,
+		webviewTag: false,
+		spellcheck: false,
+		devTools: !app.isPackaged,
     },
   });
   win.removeMenu();

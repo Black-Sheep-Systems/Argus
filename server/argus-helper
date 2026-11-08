@@ -2752,6 +2752,20 @@ def split_ref(ref):
     return reg, repo, tag
 
 
+_LOOKUP = {"deadline": None}  # set by check_services: the end of its registry-lookup budget
+
+
+def _lookup_timeout(cap):
+    """A socket timeout no longer than the lookup budget allows; raises once it is spent."""
+    d = _LOOKUP["deadline"]
+    if d is None:
+        return cap
+    left = d - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("registry lookup budget spent")
+    return min(cap, left)
+
+
 def reg_get(reg, repo, path, method="GET", accept=None):
     if reg == "docker.io":
         tok_url = "https://auth.docker.io/token?service=registry.docker.io&scope=repository:%s:pull" % repo
@@ -2760,11 +2774,11 @@ def reg_get(reg, repo, path, method="GET", accept=None):
         tok_url, base = "https://ghcr.io/token?scope=repository:%s:pull" % repo, "https://ghcr.io"
     else:
         raise ValueError("registry not supported")
-    with _urlreq.urlopen(tok_url, timeout=10) as r:
-        tok = json.loads(r.read().decode())["token"]
+    with _urlreq.urlopen(tok_url, timeout=_lookup_timeout(10)) as r:
+        tok = json.loads(r.read(65536).decode())["token"]
     req = _urlreq.Request(base + "/v2/" + repo + path, method=method,
                           headers={"Authorization": "Bearer " + tok, "Accept": accept or "application/json"})
-    return _urlreq.urlopen(req, timeout=15)
+    return _urlreq.urlopen(req, timeout=_lookup_timeout(15))
 
 
 def remote_digest(ref):
@@ -2790,6 +2804,200 @@ def local_digests(ref):
         return []
 
 
+BASE_REF_RE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,199}(:[A-Za-z0-9._-]{1,128})?")
+
+
+PULL_LOCK = "/var/lib/argus/base-pull.lock"
+PULL_BUDGET_S = 30  # the pull phase of one check, within CHECK_BUDGET_S
+CHECK_BUDGET_S = 40  # registry lookups and pulls together, under DEADLINE_S (45)
+
+
+def base_present(ref, timeout=20):
+    """'yes' if Docker holds an image under this name, 'no' only when Docker says
+    there is no such image, and None when the question could not be answered."""
+    try:
+        p = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", ref],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode == 0:
+        return "yes"
+    if "No such image" in p.stderr or "No such object" in p.stderr:
+        return "no"
+    return None
+
+
+def ensure_base_local(ref, deadline):
+    """Make a Dockerfile base image available here so its digest can be compared.
+    Pulls only when Docker definitively reports the image absent, only for plain
+    image names, and never past the deadline. Returns 'yes', or the reason it
+    could not be made available."""
+    if not BASE_REF_RE.fullmatch(ref) or not plain_registry_ok(ref):
+        return "not a plain image name"
+    left = deadline - time.monotonic()
+    if left < 2:
+        return "not checked in time"
+    present = base_present(ref, min(20, left))
+    if present != "no":
+        return "yes" if present == "yes" else "could not ask Docker"
+    if deadline - time.monotonic() < 2:
+        return "not checked in time"
+    try:
+        size = manifest_size(ref, deadline)
+    except Exception:  # any malformed or failing registry answer just refuses the pull
+        size = None
+    if size is None or size > PULL_MAX_BYTES:
+        return "refused: its size is unknown or over the pull limit"
+    left = min(300, deadline - time.monotonic())
+    if left < 5:
+        return "not checked in time"
+    try:
+        p = subprocess.run(["docker", "pull", ref], capture_output=True, text=True, timeout=left)
+    except (OSError, subprocess.TimeoutExpired):
+        return "pull did not finish"
+    if p.returncode != 0:
+        return "pull failed"
+    after = base_present(ref, min(20, max(deadline - time.monotonic(), 2)))
+    if after == "yes":
+        return "yes"
+    return "could not ask Docker after the pull" if after is None else "pull failed"
+
+
+def pinned_base_here(ref):
+    """A base named with an exact digest (name@sha256:...): stored here or not.
+    Pinned bases are never pulled: the digest is what the Dockerfile asks for."""
+    name, digest = ref.split("@", 1)
+    if not DIGEST_RE.fullmatch(digest):
+        return False
+    return digest in local_digests(name) if BASE_REF_RE.fullmatch(name) else False
+
+
+PULL_MAX_BYTES = 2 * 1024 ** 3  # refuse any base pull whose layers total more than this
+_MANIFEST_ACCEPT = ("application/vnd.oci.image.index.v1+json, "
+                    "application/vnd.docker.distribution.manifest.list.v2+json, "
+                    "application/vnd.oci.image.manifest.v1+json, "
+                    "application/vnd.docker.distribution.manifest.v2+json")
+
+
+def _read_capped(r, deadline, cap=4_000_000):
+    """A registry response body of at most `cap` bytes, read in chunks; the deadline
+    is checked between chunks. Raises if the body is too large or the time is spent."""
+    out = b""
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError("manifest read ran past the pull budget")
+        piece = r.read(65536)
+        if not piece:
+            return out
+        out += piece
+        if len(out) > cap:
+            raise ValueError("manifest too large")
+
+
+def _size_field(entry):
+    """A layer or config size: a whole number, zero or more, or nothing usable."""
+    s = entry.get("size") if isinstance(entry, dict) else None
+    return s if type(s) is int and s >= 0 else None
+
+
+def manifest_size(ref, deadline):
+    """Total bytes of the image's layers and config for this host's platform, read
+    from the registry before any pull. None when it cannot be determined."""
+    reg, repo, tag = split_ref(ref)
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]{0,199}", repo) or ".." in repo or repo.endswith("/") \
+            or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}", tag):
+        raise ValueError("unsafe repository or tag")
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(os.uname().machine)
+    if not arch:
+        return None
+    with reg_get(reg, repo, "/manifests/" + tag, "GET", _MANIFEST_ACCEPT) as r:
+        doc = json.loads(_read_capped(r, deadline).decode())
+    if not isinstance(doc, dict):
+        return None
+    if "manifests" in doc:
+        picks = [m for m in (doc["manifests"] if isinstance(doc["manifests"], list) else [])
+                 if isinstance(m, dict) and isinstance(m.get("platform"), dict)
+                 and m["platform"].get("os") == "linux" and m["platform"].get("architecture") == arch
+                 and isinstance(m.get("digest"), str) and DIGEST_RE.fullmatch(m["digest"])]
+        if not picks:
+            return None
+        with reg_get(reg, repo, "/manifests/" + picks[0]["digest"], "GET", _MANIFEST_ACCEPT) as r:
+            doc = json.loads(_read_capped(r, deadline).decode())
+        if not isinstance(doc, dict):
+            return None
+    layers = doc.get("layers")
+    config = doc.get("config")
+    if not isinstance(layers, list) or not isinstance(config, dict):
+        return None
+    sizes = [_size_field(x) for x in layers] + [_size_field(config)]
+    if any(s is None for s in sizes):
+        return None
+    return sum(sizes)
+
+
+def plain_registry_ok(ref):
+    """Only names Docker Hub resolves: no registry host, no localhost, no port."""
+    host = ref.split("/", 1)[0] if "/" in ref else ""
+    return not host or ("." not in host and ":" not in host and host != "localhost")
+
+
+def read_dockerfile(df, wd):
+    """The text of a Dockerfile whose FROM lines may cause a pull, or None. Its compose
+    folder and its own folder must be root-owned, and the file itself must be a
+    regular file, root-owned and not writable by anyone else. The file is opened
+    once without following symlinks, and the checks and the read use that one
+    descriptor, so the text returned is the text that was checked."""
+    if not compose_dir_ok(wd):
+        return None
+    rp = os.path.realpath(df)
+    if not compose_dir_ok(os.path.dirname(rp)):
+        return None
+    fd = None
+    try:
+        fd = os.open(rp, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        st = os.fstat(fd)
+        if st.st_uid != 0 or st.st_mode & 0o022 or (st.st_mode & 0o170000) != 0o100000:
+            return None
+        chunks, total = [], 0
+        while True:
+            piece = os.read(fd, 65536)
+            if not piece:
+                break
+            chunks.append(piece)
+            total += len(piece)
+            if total > 1_000_000:
+                return None  # too large to trust a complete parse: refuse, never truncate
+        return b"".join(chunks).decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def final_base(text):
+    """The base the final build stage starts from; None for scratch or a stage name."""
+    lines = text.splitlines()
+    stages, last = set(), None
+    for line in lines:
+        m = re.match(r"\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?", line, re.I)
+        if m:
+            if m.group(2):
+                stages.add(m.group(2).lower())
+            last = m.group(1)
+    if last is None or last.lower() == "scratch" or last.lower() in stages or "$" in last or "@" in last:
+        return None
+    return last
+
+
+def layers_of(ref):
+    out = run(["docker", "image", "inspect", "--format", "{{json .RootFS.Layers}}", ref])
+    try:
+        return json.loads(out) if out else None
+    except ValueError:
+        return None
+
+
 def tag_shape(tag):
     """'2.11.7' -> (r'^(\\d+)\\.(\\d+)\\.(\\d+)$', (2,11,7)); '17-bookworm' -> ... ; None if no version."""
     m = re.fullmatch(r"v?(\d+(?:\.\d+)*)(-[a-z0-9.-]+)?", tag)
@@ -2811,13 +3019,17 @@ def newest_tag(ref):
     pat, cur = shape
     tags, path = [], "/tags/list?n=10000"
     for _ in range(10):
+        if _LOOKUP["deadline"] is not None and time.monotonic() > _LOOKUP["deadline"]:
+            break  # the check's budget is spent: keep the tags seen so far
         with reg_get(reg, repo, path) as r:
-            tags += json.loads(r.read().decode()).get("tags") or []
+            tags += json.loads(r.read(4_000_000).decode()).get("tags") or []
             link = r.headers.get("Link")
         m = re.search(r"<([^>]+)>", link or "")
         if not m:
             break
         path = m.group(1).split("/v2/" + repo, 1)[-1]
+        if not re.fullmatch(r"/tags/list\?[A-Za-z0-9_=&.-]{0,200}", path):
+            break  # a Link header that does not name the tag list is not followed
     # Only the same major version, or the very next one: registries carry odd
     # tags (dates, build numbers) that would otherwise look like huge versions.
     best = cur
@@ -2839,7 +3051,9 @@ _COMPOSE_CFG = {}
 def compose_cfg(workdir):
     if workdir not in _COMPOSE_CFG:
         try:
-            p = subprocess.run(["docker", "compose", "config", "--format", "json"], cwd=workdir, capture_output=True, text=True, timeout=30)
+            # Run from the resolved folder, the same one compose_dir_ok approved.
+            p = subprocess.run(["docker", "compose", "config", "--format", "json"], cwd=os.path.realpath(workdir),
+                               capture_output=True, text=True, timeout=30)
             _COMPOSE_CFG[workdir] = json.loads(p.stdout) if p.returncode == 0 else {}
         except (OSError, subprocess.TimeoutExpired, ValueError):
             _COMPOSE_CFG[workdir] = {}
@@ -2858,35 +3072,17 @@ def compose_dockerfile(workdir, service):
     return os.path.join(ctx, (b.get("dockerfile") if isinstance(b, dict) else None) or "Dockerfile")
 
 
-def compose_base_images(workdir, service, image=None):
-    """FROM images of a service built from a Dockerfile (its compose project's,
-    or LOCAL_BUILDS for images built by hand)."""
-    if image in LOCAL_BUILDS:
-        df = os.path.join(LOCAL_BUILDS[image], "Dockerfile")
-    else:
-        b = compose_build(workdir, service)
-        if not b:
-            return None
-        ctx = b.get("context") if isinstance(b, dict) else b
-        df = os.path.join(ctx, (b.get("dockerfile") if isinstance(b, dict) else None) or "Dockerfile")
-    bases = []
-    try:
-        with open(df) as f:
-            for line in f:
-                m = re.match(r"\s*FROM\s+(?:--platform=\S+\s+)?(\S+)", line, re.I)
-                if m and "$" not in m.group(1) and m.group(1).lower() != "scratch":
-                    bases.append(m.group(1))
-    except OSError:
-        return None
-    stages = set()
-    try:
-        with open(df) as f:
-            for line in f:
-                m = re.match(r"\s*FROM\s+.*\s+AS\s+(\S+)\s*$", line, re.I)
-                if m:
-                    stages.add(m.group(1).lower())
-    except OSError:
-        return None
+def compose_base_images(text):
+    """FROM images in a Dockerfile's text (the text read_dockerfile checked). The
+    file is never opened here: one read, one check, one parse."""
+    bases, stages = [], set()
+    for line in text.splitlines():
+        m = re.match(r"\s*FROM\s+(?:--platform=\S+\s+)?(\S+)", line, re.I)
+        if m and "$" not in m.group(1) and m.group(1).lower() != "scratch":
+            bases.append(m.group(1))
+        s = re.match(r"\s*FROM\s+.*\s+AS\s+(\S+)\s*$", line, re.I)
+        if s:
+            stages.add(s.group(1).lower())
     return [x for x in bases if x.lower() not in stages]
 
 
@@ -3032,17 +3228,26 @@ def how_to(kind, c, newer=None, major=False):
 
 def check_services():
     """The slow part: every container, its version, and what update (if any) exists."""
+    # One budget for the registry lookups and the pull phase together, started before
+    # any lookup. It is for service-updates; the status call never runs this.
+    check_deadline = time.monotonic() + CHECK_BUDGET_S
+    _LOOKUP["deadline"] = check_deadline
     rows = container_table()
     mc_cur, mc_latest = mailcow_versions()
     images = {r["image"] for r in rows if r["project"] != "mailcowdockerized"}
     built = {}
     for r in rows:
         if r["image"] in LOCAL_BUILDS or (r["project"] != "mailcowdockerized" and r["workdir"] and os.path.isdir(r["workdir"])
-                                          and (r["image"] == "hephaestus:local" or compose_build(r["workdir"], r["service"]))):
+                                          and (r["image"] == "hephaestus:local"
+                                               or (compose_dir_ok(r["workdir"]) and compose_build(r["workdir"], r["service"])))):
             built.setdefault(r["image"], r)
     remote, newer, bases = {}, {}, {}
 
     def look(ref):
+        if time.monotonic() > check_deadline:
+            remote[ref] = None
+            newer[ref] = "unknown"
+            return
         try:
             remote[ref] = remote_digest(ref)
         except Exception:
@@ -3053,12 +3258,62 @@ def check_services():
             newer[ref] = "unknown"
 
     targets = set(i for i in images if i not in built)
+    pullable = set()
+    final_bases = {}
     for img, r in built.items():
-        bl = compose_base_images(r["workdir"], r["service"], img) or []
+        if img == "hephaestus:local":
+            bases[img] = None  # own code, not a Dockerfile base: nothing to pull for it
+            continue
+        wd = LOCAL_BUILDS[img] if img in LOCAL_BUILDS else r["workdir"]
+        # Read a Dockerfile only from a folder root owns, and only if it is root-owned itself.
+        df = os.path.join(LOCAL_BUILDS[img], "Dockerfile") if img in LOCAL_BUILDS else (
+            compose_dockerfile(r["workdir"], r["service"]) if compose_dir_ok(r["workdir"]) else None)
+        text = read_dockerfile(df, wd) if df else None
+        if text is None:
+            bases[img] = None  # not readable, or not in a root-owned folder
+            continue
+        bl = compose_base_images(text)
         bases[img] = bl
         targets.update(bl)
+        final_bases[img] = final_base(text)
+        pullable.update(b for b in bl if "@" not in b and plain_registry_ok(b))
     with ThreadPoolExecutor(max_workers=6) as ex:
         list(ex.map(look, sorted(targets)))
+    # One pull phase at a time, under one shared time budget.
+    pull_result = {}
+    lock_fd = None
+    try:
+        lock_dir = os.path.dirname(PULL_LOCK)
+        os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+        dst = os.lstat(lock_dir)
+        if dst.st_uid != 0 or dst.st_mode & 0o022 or (dst.st_mode & 0o170000) != 0o040000:
+            raise OSError("pull lock folder is not root-only")
+        lock_fd = os.open(PULL_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        lst = os.fstat(lock_fd)
+        if lst.st_uid != 0 or (lst.st_mode & 0o170000) != 0o100000 or lst.st_nlink != 1 or lst.st_mode & 0o022:
+            raise OSError("pull lock is not a root-owned regular file")
+    except OSError:
+        pull_result = {b: "could not open the pull lock" for b in pullable}
+    else:
+        deadline = min(time.monotonic() + PULL_BUDGET_S, check_deadline)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            pull_result = {b: "another base check is running" for b in pullable}
+        else:
+            for b in sorted(pullable):
+                if remote.get(b):
+                    pull_result[b] = ensure_base_local(b, deadline)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+            lock_fd = None
+    digest_cache = {}
+
+    def digests(b):
+        if b not in digest_cache:
+            digest_cache[b] = local_digests(b)
+        return digest_cache[b]
 
     ids = {}
     out_rows = []
@@ -3094,24 +3349,54 @@ def check_services():
         elif r["image"] in built:
             item["kind"] = "built"
             item["version"] = tag + " · built here"
-            bl = bases.get(r["image"]) or []
-            stale = [b for b in bl if remote.get(b) and remote[b] not in local_digests(b)]
+            raw = bases.get(r["image"])
+            bl = raw or []
+            plain = [b for b in bl if "@" not in b]
+            fb = final_bases.get(r["image"])
+            pin_missing = [b for b in bl if "@" in b and not pinned_base_here(b)]
+            stale = [b for b in plain if remote.get(b) and digests(b) and remote[b] not in digests(b)]
             newer_base = [(b, newer.get(b)) for b in bl if isinstance(newer.get(b), tuple)]
-            if not bl:
-                item.update(status="unknown", detail="its Dockerfile could not be read")
+            unverified = [b for b in plain if remote.get(b) and not digests(b)]
+            # The newest base is the last FROM of the Dockerfile. The built image's
+            # layers must start with that base's layers, or it was built on an older one.
+            lineage_check = bool(fb and fb in plain and fb not in stale and fb not in unverified)
+            base_layers = layers_of(fb) if lineage_check else None
+            img_layers = layers_of(r["image"]) if lineage_check else None
+            lineage_unknown = lineage_check and (base_layers is None or img_layers is None)
+            older_build = bool(base_layers and img_layers and img_layers[:len(base_layers)] != base_layers)
+            if raw is None:
+                item.update(status="unknown", detail="its Dockerfile could not be read, or is not in a root-owned folder")
+            elif not bl:
+                item.update(status="unknown", detail="no base image to compare (scratch or stage names only)")
             elif stale:
                 shared = [u_[2] for u_ in image_users(r["image"])] if r["image"] in LOCAL_BUILDS else [r["name"]]
                 item.update(status="update", detail="patched base image: " + ", ".join(stale)
                             + ("; rebuilding restarts " + ", ".join(shared) if len(shared) > 1 else ""), can_update=True,
                             action="rebuild-image" if r["image"] in LOCAL_BUILDS else "rebuild",
                             how=how_to("rebuild-image" if r["image"] in LOCAL_BUILDS else "rebuild", r))
-            elif any(remote.get(b) is None for b in bl):
+            elif older_build:
+                shared = [u_[2] for u_ in image_users(r["image"])] if r["image"] in LOCAL_BUILDS else [r["name"]]
+                item.update(status="update", detail="built on an older copy of " + fb + "; rebuilding picks up the current one"
+                            + ("; rebuilding restarts " + ", ".join(shared) if len(shared) > 1 else ""), can_update=True,
+                            action="rebuild-image" if r["image"] in LOCAL_BUILDS else "rebuild",
+                            how=how_to("rebuild-image" if r["image"] in LOCAL_BUILDS else "rebuild", r))
+            elif lineage_unknown:
+                item.update(status="unknown", detail="could not read the layers of " + fb + " or " + r["image"])
+            elif unverified:
+                why = ", ".join(b + " (" + ("stored here without a registry digest" if pull_result.get(b) == "yes"
+                                           else pull_result.get(b, "not checked")) + ")" for b in unverified)
+                item.update(status="unknown", detail="could not check its base image: " + why)
+            elif pin_missing:
+                item.update(status="unknown", detail="pinned base " + ", ".join(pin_missing)
+                            + " is not stored here; pinned bases are not pulled")
+            elif any(remote.get(b) is None for b in plain):
                 item.update(status="unknown", detail="could not check its base image")
             else:
                 item.update(status="current", detail="base image " + ", ".join(bl) + " is current")
             if newer_base:
                 b, (nv, maj) = newer_base[0]
-                df = os.path.join(LOCAL_BUILDS[r["image"]], "Dockerfile") if r["image"] in LOCAL_BUILDS else compose_dockerfile(r["workdir"], r["service"])
+                df = os.path.join(LOCAL_BUILDS[r["image"]], "Dockerfile") if r["image"] in LOCAL_BUILDS else (
+                    compose_dockerfile(r["workdir"], r["service"]) if compose_dir_ok(r["workdir"]) else "")
                 item["newer"] = {"version": nv, "major": maj, "how": how_to("newer-base", dict(r, dockerfile=df), split_ref(b)[1].split("/")[-1] + ":" + nv, maj)}
                 item["detail"] += "; base " + split_ref(b)[1].split("/")[-1] + " " + nv + " exists"
         else:
@@ -3189,7 +3474,10 @@ def service_updates(args):
         age, cached = None, None
     if cached and not args and age is not None and age < SVC_MAX_AGE_S:
         return cached
-    data = check_services()
+    try:
+        data = check_services()
+    finally:
+        _LOOKUP["deadline"] = None  # the registry budget ends with this check
     os.makedirs(os.path.dirname(SVC_CACHE), mode=0o700, exist_ok=True)
     fd, tmp = _tempfile.mkstemp(dir=os.path.dirname(SVC_CACHE), prefix=".svc-")
     with os.fdopen(fd, "w") as f:
@@ -3218,13 +3506,21 @@ def service_update(args):
                   "if [ -n \"$bad\" ]; then echo \"Not running: $bad\"; exit 1; fi; "
                   "rm -f " + SVC_CACHE + "; echo 'mailcow updated.'")
         return start_job("svc-update", script, max_s=4 * 3600)
+    return start_job("svc-update", _container_update(target), max_s=4 * 3600)
+
+
+def _container_update(target):
+    """The shell script that updates one container. Refuses before anything runs."""
     if not CONTAINER_RE.fullmatch(target):
         raise UnexpectedArgs()
+    if target == "hephaestus-prod-migrate-1":
+        raise Refused("that job is a one-off migration and is never updated from here")
     try:
-        cached = json.load(open(SVC_CACHE))
+        with open(SVC_CACHE) as f:
+            cached = json.load(f)
     except (OSError, ValueError):
         raise Refused("check for updates first")
-    item = next((x for x in cached.get("services", []) if x["name"] == target), None)
+    item = next((x for x in cached.get("services", []) if x.get("name") == target), None)
     if not item or not item.get("can_update") or item.get("action") not in ("pull", "rebuild", "rebuild-image", "recreate"):
         raise Refused("Argus has no update to apply for " + target + "; see How to Update")
     row = next((r for r in container_table() if r["name"] == target), None)
@@ -3242,7 +3538,7 @@ def service_update(args):
         keep = img.split(":")[0] + ":before-update"
         restarts = "".join("(cd " + q(w) + " && docker compose up -d --no-deps --force-recreate " + q(sv) + "); " for w, sv, _ in users)
         names = " ".join(q(n) for _, _, n in users)
-        script = ("set -eE -o pipefail; trap 'echo FAILED at line $LINENO; echo \"To undo: docker tag " + keep + " " + img + ", then restart the same containers\"' ERR; "
+        script = ("set -eE -o pipefail; trap 'echo FAILED at line $LINENO; echo \"To undo: docker tag " + keep + " " + img + ", then restart: " + names + "\"' ERR; "
                   "echo '1/3 Rebuilding " + img + " on the newest base image (the current build is kept as " + keep + ")'; "
                   "docker tag " + q(img) + " " + q(keep) + "; echo \"before: $(docker image inspect --format '{{.Id}}' " + q(img) + ")\"; "
                   "docker build --pull -t " + q(img) + " " + q(LOCAL_BUILDS[img]) + "; "
@@ -3252,7 +3548,7 @@ def service_update(args):
                   "for c in " + names + "; do [ \"$(docker inspect --format '{{.State.Running}}' \"$c\")\" = true ] || bad=\"$bad $c\"; done; "
                   "if [ -n \"$bad\" ]; then echo \"Not running:$bad\"; false; fi; "
                   "rm -f " + SVC_CACHE + "; echo 'Updated.'")
-        return start_job("svc-update", script, max_s=4 * 3600)
+        return script
     keep = "argus-rollback/" + target.lower() + ":before-update"
     if item["action"] == "recreate":
         step = ("echo '1/3 Nothing to download: the current image is already here (the running one is kept as " + keep + ")'; "
@@ -3272,7 +3568,53 @@ def service_update(args):
               "echo '3/3 Checking it is running'; sleep 8; "
               "[ \"$(docker inspect --format '{{.State.Running}}' " + q(target) + ")\" = true ] || { echo 'It is not running; see the log above.'; false; }; "
               "rm -f " + SVC_CACHE + "; echo 'Updated.'")
-    return start_job("svc-update", script, max_s=4 * 3600)
+    return script
+
+
+def service_update_all(args):
+    """service-update-all: every container update Argus can make, one after another in one job.
+    Each container runs in its own shell so its own failure stops the run. Every container is
+    checked before the job starts; a hand-built image is rebuilt once for all its containers."""
+    if args:
+        raise UnexpectedArgs()
+    try:
+        with open(SVC_CACHE) as f:
+            cached = json.load(f)
+    except (OSError, ValueError):
+        raise Refused("check for updates first")
+    names, seen_images, seen_names = [], set(), set()
+    for x in cached.get("services", []):
+        n = x.get("name")
+        if not isinstance(n, str) or n in seen_names or not x.get("can_update") \
+                or x.get("action") not in ("pull", "rebuild", "rebuild-image", "recreate"):
+            continue
+        if n == "hephaestus-prod-migrate-1":   # a one-off migration job, never updated from here
+            continue
+        seen_names.add(n)
+        if x.get("action") == "rebuild-image":
+            row = next((r for r in container_table() if r["name"] == n), None)
+            img = row and row.get("image")
+            if img in seen_images:
+                continue                            # already covered by its image's rebuild
+            seen_images.add(img)
+        names.append(n)
+    if not names:
+        raise Refused("Argus has no service update to apply")
+    noted_before = len(NOTED)
+    parts = []
+    try:
+        for n in names:
+            sc = _container_update(n)   # refuses here, before any change, if one can't be done
+            parts.append("echo '== " + n + "'; if ! /bin/bash -c " + _shlex.quote(sc) + "; then echo 'Stopped at " + n
+                         + ". The updates after it were not run.'; exit 1; fi; ")
+    except Refused:
+        del NOTED[noted_before:]
+        raise
+    del NOTED[noted_before:]
+    NOTED.append(["service-update-all", ",".join(names)])   # one audit line for the whole run
+    parts.append("echo 'All service updates finished.'")
+    return start_job("svc-update", "".join(parts), max_s=4 * 3600 * len(names))
+
 
 # ---------- sign-in attacks: who is trying, from where, and the route there ----------
 # Sources: sshd's journal (refused SSH attempts) and mailcow's netfilter (mail
@@ -4503,6 +4845,7 @@ ACTIONS = {
     "heph-user": heph_user_op,
     "service-updates": service_updates,
     "service-update": service_update,
+    "service-update-all": service_update_all,
     "attacks": attacks,
     "trace": trace,
     "geo-update": geo_update,

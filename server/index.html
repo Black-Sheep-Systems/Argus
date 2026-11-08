@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Argus</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="shell">
+  <nav class="side" aria-label="Sections">
+    <div class="brand">
+      <svg width="30" height="30" viewBox="0 0 30 30" aria-hidden="true"><circle cx="15" cy="15" r="13" fill="none" stroke="currentColor" stroke-width="2" class="ring"></circle><ellipse cx="15" cy="15" rx="9" ry="5.5" fill="none" stroke="#FFFFFF" stroke-width="1.6"></ellipse><circle cx="15" cy="15" r="2.6" class="pupil"></circle></svg>
+      <div><div class="brand-name">Argus</div><div class="brand-sub">Black Sheep server</div></div>
+    </div>
+    <button class="nav current" type="button" data-view="dashboard" aria-current="page">Dashboard</button>
+    <button class="nav" type="button" data-view="server">Server</button>
+    <button class="nav" type="button" data-view="web">Websites</button>
+    <button class="nav" type="button" data-view="mail">Mail</button>
+    <button class="nav" type="button" data-view="accounts">Accounts</button>
+    <button class="nav" type="button" data-view="signins">Sign-In Attempts</button>
+    <button class="nav" type="button" data-view="hephaestus">Hephaestus</button>
+    <button class="nav" type="button" data-view="backups">Backups</button>
+    <button class="nav" type="button" data-view="files">Files</button>
+    <button class="nav" type="button" data-view="terminal">Terminal</button>
+    <button class="nav" type="button" data-view="activity">Activity Log</button>
+    <div class="side-foot">
+      <div class="app-ctl" role="group" aria-label="Argus">
+        <button class="ctl" type="button" id="app-reload" title="Redraw the screen; you stay signed in">Reload</button>
+        <button class="ctl" type="button" id="app-restart" title="Close and reopen Argus; sign in again afterwards">Restart</button>
+        <button class="ctl" type="button" id="app-exit" title="Sign out and close Argus">Exit</button>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <section id="signin" class="signin">
+      <h1>Sign In to the Server</h1>
+      <p class="muted" id="who"></p>
+      <form id="pass-form" autocomplete="off">
+        <label>Key passphrase<input id="pass" type="password" autocomplete="off" required></label>
+        <button class="btn primary" type="submit">Continue</button>
+      </form>
+      <form id="code-form" autocomplete="off" hidden>
+        <p>Key accepted. Now the code from your authenticator app.</p>
+        <label>Authenticator code<input id="code" inputmode="numeric" pattern="[0-9]{6,8}" maxlength="8" autocomplete="one-time-code" required></label>
+        <button class="btn primary" type="submit">Sign In</button>
+      </form>
+      <p id="signin-msg" class="msg" role="alert"></p>
+    </section>
+
+    <section id="dash" hidden>
+      <header class="top">
+        <div>
+          <h1 id="page-title">Everything at a Glance</h1>
+          <span class="muted" id="refreshed">Loading…</span>
+        </div>
+        <div class="top-right">
+          <span class="pill ok" id="conn">Connected</span>
+          <span class="mono muted" id="conn-detail"></span>
+          <label class="theme">Theme
+            <select id="theme">
+              <option value="system">Match Windows</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <button class="btn" id="refresh" type="button">Refresh</button>
+          <button class="btn" id="disconnect" type="button">Disconnect</button>
+        </div>
+      </header>
+      <section id="attention" class="attention" aria-label="Needs a look" hidden>
+        <strong id="attention-title"></strong>
+        <ul id="attention-list"></ul>
+      </section>
+      <p id="dash-msg" class="msg" role="alert"></p>
+      <div id="view-dashboard" class="view"><div id="tiles" class="tiles"></div></div>
+
+      <div id="view-server" class="view" hidden>
+        <div class="cards">
+          <section class="card wide">
+            <h3>Services</h3>
+            <p class="muted">Restarting a service stops it for a few seconds. Visitors to that site or service see an error while it starts again.</p>
+            <div class="row-actions"><button class="btn primary" type="button" id="svc-update-all" disabled>Update All</button></div>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Service</th><th scope="col">Version</th><th scope="col">Update Available</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="svc-rows"></tbody></table></div>
+            <p class="muted small" id="svc-checked"></p>
+          </section>
+          <section class="card">
+            <h3>Updates</h3>
+            <h4>System Packages</h4>
+            <div id="upd-list"></div>
+            <button class="btn primary" type="button" id="upd-apply">Apply Updates</button>
+            <div id="upd-job" class="job" hidden></div>
+            <div class="card-head"><h4>Service Updates</h4><button class="btn small" type="button" id="su-check">Check Now</button></div>
+            <div id="su-list"></div>
+            <div id="su-job" class="job" hidden></div>
+          </section>
+          <section class="card">
+            <h3>Restart the Server</h3>
+            <p class="muted">Everything on the server goes offline for about two minutes: websites, mail and Hephaestus. Argus disconnects and you sign in again afterwards.</p>
+            <p id="reboot-state"></p>
+            <div class="btns"><button class="btn danger" type="button" id="reboot">Restart in One Minute</button>
+            <button class="btn" type="button" id="reboot-cancel" hidden>Cancel the Restart</button></div>
+          </section>
+        </div>
+      </div>
+
+      <div id="view-backups" class="view" hidden>
+        <div class="cards" id="bk-cards"></div>
+      </div>
+
+      <div id="view-hephaestus" class="view" hidden>
+        <div class="cards">
+          <section class="card wide">
+            <h3>Roll Back</h3>
+            <p class="muted">Puts an earlier version of the app live. The database is left as it is: columns added by newer versions stay, which does no harm. What is live now is kept, so a rollback can itself be undone. Server checks run afterwards.</p>
+            <p>Live now: <span class="mono" id="hp-live"></span></p>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Earlier Version</th><th scope="col">Built</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="hp-rows"></tbody></table></div>
+            <div id="hp-job" class="job" hidden></div>
+          </section>
+          <section class="card wide">
+            <h3>Deploy</h3>
+            <div id="dp-source"><p class="muted">Reading the source on this PC…</p></div>
+            <div class="btns"><button class="btn primary" type="button" id="dp-prepare" disabled>Prepare This Version</button></div>
+            <div id="dp-staged" hidden></div>
+            <div id="dp-job" class="job" hidden></div>
+          </section>
+        </div>
+      </div>
+
+      <div id="view-files" class="view" hidden>
+        <p class="muted files-help">Drag a file across to copy it, or select it and use the arrow button. Files dragged in from Windows Explorer upload too. Uploads keep the right owner and permissions; an overwritten file is copied to /var/backups/argus first.</p>
+        <div class="panes">
+          <section class="pane" id="pane-pc" aria-label="This PC">
+            <div class="pane-head">
+              <strong>This PC</strong>
+              <div class="path-row"><button class="btn small" type="button" id="pc-up" title="Up one folder">Up</button><input id="pc-path" class="mono" aria-label="Folder on this PC"></div>
+            </div>
+            <div class="pane-list" id="pc-list" tabindex="0"></div>
+            <div class="pane-preview" id="pc-preview" hidden></div>
+            <div class="pane-foot"><span id="pc-sel" class="muted"></span><button class="btn small primary" type="button" id="do-upload" disabled>Upload to Server →</button></div>
+          </section>
+          <section class="pane" id="pane-srv" aria-label="Server">
+            <div class="pane-head">
+              <strong>Server</strong>
+              <div class="path-row"><button class="btn small" type="button" id="srv-up" title="Up one folder">Up</button><input id="srv-path" class="mono" aria-label="Folder on the server"><button class="btn small" type="button" id="srv-mkdir">New Folder</button></div>
+              <p id="srv-web" class="warn-text" hidden>This folder is served by a website: anything put here can be seen by anyone.</p>
+            </div>
+            <div class="pane-list" id="srv-list" tabindex="0"></div>
+            <div class="pane-preview" id="srv-preview" hidden></div>
+            <div class="pane-foot"><button class="btn small primary" type="button" id="do-download" disabled>← Download to PC</button><span id="srv-sel" class="muted"></span></div>
+          </section>
+        </div>
+      </div>
+
+      <div id="view-web" class="view" hidden>
+        <div class="cards">
+          <section class="card wide">
+            <h3>Sites</h3>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Name</th><th scope="col">What It Is</th><th scope="col">Answering</th><th scope="col">Certificate</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="ws-rows"></tbody></table></div>
+          </section>
+          <section class="card">
+            <h3>Web Server Configuration</h3>
+            <p id="wc-state" class="muted"></p>
+            <p class="muted small">To change it, edit the files in /opt/web on the Files page (the old version is kept). Then Check, and Apply. Apply restarts the web server: every site blips for a second or two. If a site that worked stops working, the last good configuration is put back by itself.</p>
+            <div class="btns"><button class="btn" type="button" id="wc-open">Open /opt/web in Files</button><button class="btn" type="button" id="wc-check">Check</button><button class="btn primary" type="button" id="wc-apply">Apply Changes</button></div>
+            <div id="wc-check-out"></div>
+            <details id="wc-files"><summary>Show the configuration files</summary><div id="wc-files-out"></div></details>
+            <details id="wc-hist"><summary>Earlier configurations</summary><div id="wc-hist-out"></div></details>
+            <div id="wc-job" class="job" hidden></div>
+          </section>
+          <section class="card">
+            <h3>Add a Site</h3>
+            <fieldset class="pw-choice">
+              <legend>What Should It Be?</legend>
+              <label class="inline"><input type="radio" name="sk" value="static" checked> A website (a folder of pages on the server)</label>
+              <label class="inline"><input type="radio" name="sk" value="redirect"> A redirect to another address</label>
+              <label class="inline"><input type="radio" name="sk" value="proxy"> An app running on the server (a local port)</label>
+            </fieldset>
+            <label>Domain (without www)<input id="sa-domain" class="mono" placeholder="example.com"></label>
+            <label id="sa-target-l" hidden><span id="sa-target-label"></span><input id="sa-target" class="mono"></label>
+            <button class="btn primary" type="button" id="sa-go">Add Site</button>
+            <div id="sa-dns"></div>
+          </section>
+        </div>
+      </div>
+
+      <div id="view-mail" class="view" hidden>
+        <div class="cards">
+          <section class="card wide">
+            <div class="card-head"><h3>Mailboxes</h3><button class="btn small primary" type="button" id="mb-new">New Mailbox</button></div>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Address</th><th scope="col">Used</th><th scope="col">Webmail Two-Factor</th><th scope="col">App Passwords</th><th scope="col">Last Sign-In</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="mb-rows"></tbody></table></div>
+            <p class="muted small">Mail apps use app passwords, one per device, so a lost phone is revoked without changing the main password. Two-factor is set up by each person in webmail; resetting it (for a lost phone) is done in mailcow's admin pages.</p>
+          </section>
+          <section class="card">
+            <h3>Domains</h3>
+            <div id="dm-rows"></div>
+          </section>
+          <section class="card full" data-collapse="mail-aliases">
+            <div class="card-head"><h3>Aliases and Forwarding</h3><div class="btns"><button class="btn small" type="button" id="al-new">New Alias</button><button class="btn small" type="button" data-toggle aria-expanded="true">Hide</button></div></div>
+            <div class="table-wrap collapsible"><table class="aliases"><thead><tr><th scope="col">Alias Address</th><th scope="col">Delivers To</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="al-rows"></tbody></table></div>
+          </section>
+          <section class="card wide" data-collapse="mail-queue">
+            <div class="card-head"><h3>Queue and Quarantine</h3><div class="btns"><button class="btn small" type="button" id="mq-flush">Retry All Now</button><button class="btn small" type="button" data-toggle aria-expanded="true">Hide</button></div></div>
+            <div class="collapsible">
+            <div id="mq-rows"></div>
+            <div class="card-head"><h3>Quarantine</h3><div class="btns"><span class="muted small" id="qt-count"></span><button class="btn small" type="button" id="qt-release" disabled>Release Selected</button><button class="btn small danger" type="button" id="qt-delete" disabled>Delete Selected</button></div></div>
+            <div class="table-wrap"><table><thead><tr><th scope="col" class="pick"><input type="checkbox" id="qt-all" aria-label="Select every held message"></th><th scope="col">From</th><th scope="col">To</th><th scope="col">Subject</th><th scope="col">Score</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="qt-rows"></tbody></table></div>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div id="view-accounts" class="view" hidden>
+        <div class="cards">
+          <section class="card full" id="ac-setup" hidden>
+            <h3>Server Setup Still Needed</h3>
+            <p>Upload accounts can't be made until the server's one-time setup is finished. The server chat does this; these parts are missing:</p>
+            <ul class="setup-list" id="ac-setup-list"></ul>
+          </section>
+          <section class="card full">
+            <div class="card-head"><h3>Upload Accounts</h3><button class="btn small primary" type="button" id="ac-new">New Upload Account</button></div>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Account</th><th scope="col">Folder</th><th scope="col">Used</th><th scope="col">Sign-In</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="ac-rows"></tbody></table></div>
+            <p class="muted small">Each account can only upload and download, only in its own folder, and signs in with its own key plus an authenticator code. It has no terminal and can't see anything else on the server.</p>
+          </section>
+          <section class="card">
+            <div class="card-head"><h3>Your Sign-In Keys</h3><button class="btn small" type="button" id="ak-add">Add Key</button></div>
+            <p class="muted small">The keys that may sign in as <span class="mono">mattridge</span> (always with your authenticator code as well).</p>
+            <div id="ak-rows"></div>
+          </section>
+          <section class="card wide">
+            <div class="card-head"><h3>Hephaestus Users</h3><div class="btns"><button class="btn small" type="button" id="hu-find">Manage a User</button><button class="btn small" type="button" id="hu-user">New Company User</button><button class="btn small" type="button" id="hu-company">New Company</button><button class="btn small primary" type="button" id="hu-staff">New Staff Account</button></div></div>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Staff</th><th scope="col">Role</th><th scope="col">Status</th><th scope="col">Two-Factor</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="hu-rows"></tbody></table></div>
+            <h3>Companies</h3>
+            <div class="table-wrap"><table class="plain"><thead><tr><th scope="col">Short Name</th><th scope="col">Company</th></tr></thead><tbody id="hc-rows"></tbody></table></div>
+            <p class="muted small">Company users aren't listed here; use Manage a User with their email address.</p>
+          </section>
+        </div>
+      </div>
+
+      <div id="view-signins" class="view" hidden>
+        <div class="cards">
+          <section class="card full">
+            <div class="card-head"><h3>Where the Attempts Come From</h3>
+              <div class="btns"><label class="inline-label">Period <select id="si-days"><option value="1">Last 24 Hours</option><option value="7" selected>Last 7 Days</option><option value="30">Last 30 Days</option></select></label><button class="btn small" type="button" id="si-refresh">Refresh</button></div></div>
+            <p id="si-summary" class="muted">Loading…</p>
+            <div class="map-wrap"><svg id="si-map" viewBox="0 20 1000 410" role="img" aria-label="World map of where refused sign-ins came from"></svg></div>
+            <p class="muted small map-legend"><span class="dot ssh"></span> SSH attempts <span class="dot mail"></span> Mail login failures <span class="dot here"></span> This server · Larger dots: more tries. <span id="si-credit"></span></p>
+            <p id="si-countries" class="small"></p>
+          </section>
+          <section class="card full" id="si-detail" hidden>
+            <div class="card-head"><h3 id="si-detail-title">Address</h3><div class="btns" id="si-detail-btns"></div></div>
+            <div class="detail-grid">
+              <div><h4>Who It Is</h4><dl class="facts" id="si-who"></dl></div>
+              <div><h4>When It Came</h4><svg id="si-timeline" viewBox="0 0 300 70" role="img" aria-label="Attempts per day over the last 30 days"></svg><p class="muted small" id="si-timeline-note"></p></div>
+            </div>
+            <div class="table-wrap"><table class="plain"><thead><tr><th scope="col">Visit</th><th scope="col">Lasted</th><th scope="col">Attempts</th><th scope="col">What</th><th scope="col">Tried As</th></tr></thead><tbody id="si-visits"></tbody></table></div>
+            <div id="si-route" hidden>
+              <h4 id="si-route-title">Route</h4>
+              <p class="muted small" id="si-route-note"></p>
+              <div class="table-wrap"><table><thead><tr><th scope="col">Hop</th><th scope="col">Address</th><th scope="col">Location</th><th scope="col">Network</th><th scope="col">Time</th></tr></thead><tbody id="si-hops"></tbody></table></div>
+            </div>
+          </section>
+          <section class="card full">
+            <div class="card-head"><h3>Blocked Addresses</h3><div class="btns"><span class="muted small" id="bl-state"></span><button class="btn small" type="button" id="bl-add">Block an Address</button></div></div>
+            <p class="muted small">Blocked addresses can't reach anything on the server: SSH, mail, websites. The block is applied before anything else sees the traffic and is restored at every start. Your own addresses and this server can't be blocked. An address where a mailbox or upload account has signed in can be, after you confirm.</p>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Address or Network</th><th scope="col">Where</th><th scope="col">Note</th><th scope="col">Blocked Since</th><th scope="col">Dropped</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="bl-rows"></tbody></table></div>
+          </section>
+          <section class="card full">
+            <div class="card-head"><h3>Addresses</h3><div class="btns"><span class="muted small" id="si-count"></span><button class="btn small" type="button" id="si-sort-reset" hidden>Default Order</button><span class="sr" aria-live="polite" id="si-sort-say"></span></div></div>
+            <p class="muted small">Every one of these was refused. SSH needs your key and your code; mail failures are wrong passwords. Your own addresses (where you sign in over SSH as mattridge or root, and any listed in /etc/argus/own-addresses on the server) are left out. Used Your SSH Key means your key was accepted there but the code was never right: if that wasn't you, your key has been copied; replace it and block the address. Addresses where a mailbox or upload account has signed in are only listed if they were also refused, marked Has Signed In: usually a mistyped password, but it could be a stolen one.</p>
+            <div class="table-wrap"><table id="si-table"><thead><tr><th scope="col" data-sort="ip" aria-sort="none"><button class="th-sort" type="button">Address<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="place" aria-sort="none"><button class="th-sort" type="button">Location<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="network" aria-sort="none"><button class="th-sort" type="button">Network<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="tries" aria-sort="none"><button class="th-sort" type="button">Tries<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="visits" aria-sort="none"><button class="th-sort" type="button">Visits<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="users" aria-sort="none"><button class="th-sort" type="button">Tried As<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="last" aria-sort="none"><button class="th-sort" type="button">Last Seen<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="si-rows"></tbody></table></div>
+          </section>
+        </div>
+      </div>
+
+      <div id="view-terminal" class="view" hidden>
+        <div class="term-bar">
+          <span class="muted">Signed in as mattridge. <span class="mono">sudo</span> works without a password, so take care. Copy: select, then Ctrl+Shift+C. Paste: Ctrl+Shift+V.</span>
+          <span id="term-state" class="pill unknown">Not open</span>
+          <button class="btn small" type="button" id="term-new">New Session</button>
+        </div>
+        <div id="term" class="term"></div>
+      </div>
+
+      <div id="view-activity" class="view" hidden>
+        <p class="muted">Everything Argus has asked the server to do, newest first. What the server sent back is not recorded.</p>
+        <div class="table-wrap"><table><thead><tr><th scope="col">Time</th><th scope="col">Action</th><th scope="col">Details</th><th scope="col">Result</th><th scope="col">Session</th></tr></thead><tbody id="act-rows"></tbody></table></div>
+      </div>
+    </section>
+
+    <dialog id="ask" aria-labelledby="ask-title">
+      <form method="dialog" class="dialog-body">
+        <h2 id="ask-title"></h2>
+        <label><span id="ask-label"></span><input id="ask-input" autocomplete="off"></label>
+        <div class="btns"><button class="btn" value="cancel" type="button" data-cancel>Cancel</button><button class="btn primary" value="ok" type="submit" id="ask-ok"></button></div>
+      </form>
+    </dialog>
+
+    <dialog id="pwd" aria-labelledby="pwd-title">
+      <form method="dialog" class="dialog-body">
+        <h2 id="pwd-title"></h2>
+        <div id="pwd-extra"></div>
+        <fieldset class="pw-choice">
+          <legend>Password</legend>
+          <label class="inline"><input type="radio" name="pwmode" value="generate" checked> Generate one and show it once</label>
+          <label class="inline"><input type="radio" name="pwmode" value="type"> I'll type one</label>
+        </fieldset>
+        <div id="pwd-typed" hidden class="pw-typed">
+          <label>New password (12 characters or more)<input id="pwd-input" type="password" autocomplete="new-password"></label>
+          <label>Type it again<input id="pwd-input2" type="password" autocomplete="new-password"></label>
+        </div>
+        <p class="muted small">The password goes to the server on its own channel. It is never put on a command line and never written to a log.</p>
+        <div class="btns"><button class="btn" value="cancel" type="button" data-cancel>Cancel</button><button class="btn primary" value="ok" type="submit" id="pwd-ok"></button></div>
+      </form>
+    </dialog>
+
+    <dialog id="once" aria-labelledby="once-title">
+      <form method="dialog" class="dialog-body">
+        <h2 id="once-title"></h2>
+        <p id="once-text"></p>
+        <p class="secret mono" id="once-secret"></p>
+        <p class="warn-text">This is the only time it is shown. Copy it now; Argus clears the clipboard again after 30 seconds.</p>
+        <div class="btns"><button class="btn" type="button" id="once-copy">Copy</button><button class="btn primary" value="ok" type="submit">Done</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="qr" aria-labelledby="qr-title" class="wide">
+      <form method="dialog" class="dialog-body">
+        <h2 id="qr-title"></h2>
+        <p id="qr-text"></p>
+        <div class="qr-box">
+          <img id="qr-img" alt="Authenticator QR code">
+          <div>
+            <p class="small muted">Or type this key into the authenticator app:</p>
+            <p class="secret mono" id="qr-secret"></p>
+            <p class="small muted">Emergency codes (each works once, for a lost phone):</p>
+            <div class="codes mono" id="qr-codes"></div>
+          </div>
+        </div>
+        <p class="warn-text">This is the only time these are shown. Hand them over now; Argus clears the clipboard again after 30 seconds.</p>
+        <div class="btns"><button class="btn" type="button" id="qr-copy">Copy Key and Codes</button><button class="btn primary" value="ok" type="submit">Done</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="confirm" aria-labelledby="confirm-title">
+      <form method="dialog" class="dialog-body">
+        <h2 id="confirm-title"></h2>
+        <p id="confirm-text"></p>
+        <div id="confirm-extra"></div>
+        <label id="confirm-type-label" hidden><span>Type <span class="mono" id="confirm-word"></span> to confirm</span><input id="confirm-type" autocomplete="off"></label>
+        <div class="btns">
+          <button class="btn" value="cancel" type="button" data-cancel>Cancel</button>
+          <button class="btn danger" value="ok" type="submit" id="confirm-ok"></button>
+        </div>
+      </form>
+    </dialog>
+  </main>
+</div>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script src="vendor/qrcode.js"></script>
+<script src="world-map.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

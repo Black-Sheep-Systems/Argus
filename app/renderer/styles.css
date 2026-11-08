@@ -35,6 +35,8 @@ main { flex: 1; min-width: 0; overflow-y: auto; padding: 26px 32px 40px; }
   background: var(--panel); color: var(--text); border: 1px solid var(--field-line); }
 .btn.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-text); }
 .btn:disabled { opacity: .6; cursor: wait; }
+/* Prepare is unavailable when nothing new has come down the pike: show a red "not allowed" cursor. */
+#dp-prepare:disabled { cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='9' fill='none' stroke='%23d32f2f' stroke-width='2.5'/%3E%3Cline x1='5.6' y1='5.6' x2='18.4' y2='18.4' stroke='%23d32f2f' stroke-width='2.5'/%3E%3C/svg%3E") 12 12, not-allowed; }
 :focus-visible { outline: 3px solid var(--link); outline-offset: 2px; }
 input, select { font: inherit; padding: 9px 10px; border: 1px solid var(--field-line); border-radius: 5px; background: var(--field); color: var(--text); }
 label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-weight: 500; }
@@ -195,3 +197,5 @@ table.plain td:last-child { text-align: left; }
 th[aria-sort="ascending"] .sort-mark::after { content: "▲"; font-size: 10px; }
 th[aria-sort="descending"] .sort-mark::after { content: "▼"; font-size: 10px; }
 th[aria-sort="ascending"], th[aria-sort="descending"] { color: var(--text, inherit); }
+
+.row-actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }

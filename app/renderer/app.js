@@ -492,7 +492,10 @@ async function loadServiceUpdates(refresh) {
   $('su-check').disabled = false;
   const byName = new Map((suData.services || []).map((x) => [x.name, x]));
   const running = arr(obj(lastStatus?.services)?.names) || [];
-  $('svc-rows').replaceChildren(...running.map((n) => {
+  // Updates first, then the rest; alphabetical inside each group.
+  const rank = (x) => ({ update: 0, newer: 1, unknown: 2, own: 3, current: 4 })[x?.status] ?? 5;
+  const ordered = [...running].sort((a, b) => rank(byName.get(a)) - rank(byName.get(b)) || a.localeCompare(b));
+  $('svc-rows').replaceChildren(...ordered.map((n) => {
     const x = byName.get(n);
     const p = SU_PILL[x?.status] || SU_PILL.unknown;
     const pill = el('span', p[1], 'pill ' + p[0]);
@@ -500,8 +503,15 @@ async function loadServiceUpdates(refresh) {
     const cell = el('div', null, 'su-cell');
     cell.append(pill);
     if (x?.status === 'update' && x.newer) cell.append(el('span', `also ${x.newer.version} (manual)`, 'muted small'));
-    return row([el('span', n, 'mono'), el('span', x?.version || 'unknown', 'mono'), cell, button('Restart', '', () => restartService(n))]);
+    const actions = el('div', null, 'row-actions');
+    if (x?.status === 'update' && x.can_update && x.action !== 'mailcow' && n !== 'hephaestus-prod-migrate-1') {
+      actions.append(button('Update', 'primary', () => applyServiceUpdate({ title: n, target: n, detail: (x.detail || '') + (x.action === 'rebuild-image' ? '. Every container that uses this image restarts too' : ''), count: 2 })));
+    }
+    actions.append(button('Restart', '', () => restartService(n)));
+    return row([el('span', n, 'mono'), el('span', x?.version || 'unknown', 'mono'), cell, actions]);
   }));
+  const anyUpdate = bulkUpdates().length > 0;
+  $('svc-update-all').disabled = !anyUpdate;
   $('svc-checked').textContent = suData.checked ? `Checked with each publisher ${new Date(suData.checked).toLocaleString()}; checked again every 6 hours or with Check Now.` : '';
   renderServiceUpdates();
   watchJob('svc-update', $('su-job'), true);
@@ -566,6 +576,21 @@ async function applyServiceUpdate(i) {
   catch (err) { say('The update did not start: ' + errText(err)); }
 }
 $('su-check').addEventListener('click', () => loadServiceUpdates(true));
+// Container updates Update All runs: mail has its own button; the migration job is never updated here.
+function bulkUpdates() {
+  return (suData?.services || []).filter((x) => x.can_update && x.status === 'update'
+    && x.action !== 'mailcow' && x.name !== 'hephaestus-prod-migrate-1');
+}
+$('svc-update-all').addEventListener('click', async () => {
+  const names = bulkUpdates().map((x) => x.name);
+  if (!names.length) return;
+  const ok = await confirmAction({ title: 'Update All Services?',
+    text: `Argus updates ${names.length} ${names.length === 1 ? 'service' : 'services'} one after another: ${names.join(', ')}. Each one restarts for a few seconds. If one fails, the rest are not started. Mail has its own update button and is not included.`,
+    ok: 'Update All' });
+  if (!ok) return;
+  try { await call('service-update-all'); watchJob('svc-update', $('su-job')); }
+  catch (err) { say('The updates did not start: ' + errText(err)); }
+});
 
 async function restartService(name) {
   const ok = await confirmAction({ title: `Restart ${name}?`,
@@ -637,6 +662,8 @@ async function watchJob(job, box, quietIfNone) {
   try { st = await call('job-status', [job]); } catch (err) { box.hidden = false; box.replaceChildren(el('p', 'Could not read progress: ' + errText(err))); return; }
   if (!st.log.length && quietIfNone) { box.hidden = true; return; }
   box.hidden = false;
+  // A finished deploy or rollback changes what is live, so re-check Prepare.
+  if (!st.running && (job === 'heph-deploy' || job === 'heph-rollback')) refreshDeployState();
   const label = st.running ? ['warn', 'Running'] : st.result === 'ok' ? ['ok', 'Finished'] : st.result === 'failed' ? ['bad', 'Failed'] : ['warn', 'Interrupted'];
   const pill = el('span', label[1], 'pill ' + label[0]);
   const head = el('p', { updates: 'Last update run: ', 'heph-rollback': 'Last rollback: ', 'heph-deploy': 'Last deploy: ', web: 'Last web server change: ', 'svc-update': 'Last service update: ' }[job]);
@@ -693,8 +720,17 @@ async function loadHephaestus() {
     el('span', c.created, 'mono'), button('Roll Back to This', 'danger', () => rollback(c.tag))]))
     : [row(['No earlier versions are kept.', '', ''])]));
   watchJob('heph-rollback', $('hp-job'), true);
-  await loadDeploySource();
+  await loadDeploySource(rl.live_version);
   watchJob('heph-deploy', $('dp-job'), true);
+}
+
+// Re-reads the live version and updates the Deploy panel. Does not call watchJob, so it cannot loop.
+async function refreshDeployState() {
+  try {
+    const rl = await call('rollback-list');
+    $('hp-live').textContent = rl.live_version || UNKNOWN;
+    await loadDeploySource(rl.live_version);
+  } catch (err) { say('Could not refresh the Deploy panel: ' + errText(err)); }
 }
 
 async function rollback(tag) {
@@ -721,7 +757,9 @@ async function loadActivity() {
 
 // ---------- deploy ----------
 let dpSource = null;
-async function loadDeploySource() {
+let dpLive = false;
+let dpPreparing = false;
+async function loadDeploySource(liveVersion) {
   const box = $('dp-source');
   try {
     const src = await window.argus.deploySource();
@@ -734,10 +772,15 @@ async function loadDeploySource() {
     const parts = [dl];
     if (src.uncommitted) parts.push(el('p', `${src.uncommitted} file(s) have changes that are not committed. They are not included; commit them first if they should go live.`, 'warn-text'));
     parts.push(el('p', 'Only committed work is deployed, and only the usual set: Cargo files, crates, migrations, deploy (never .env) and the RLS test. "Prepare" sends it to the server and shows what would change. Nothing goes live until you confirm.', 'muted small'));
+    // Prepare is only useful when the latest commit differs from the live one.
+    const isLive = !!liveVersion && (src.commit.startsWith(liveVersion) || liveVersion.startsWith(src.commit));
+    if (isLive) parts.push(el('p', `${src.commit} is already live. There is nothing new to prepare.`, 'muted'));
     box.replaceChildren(...parts);
-    $('dp-prepare').disabled = false;
+    dpLive = isLive;
+    $('dp-prepare').disabled = isLive || dpPreparing;
   } catch (err) {
     dpSource = null;
+    dpLive = false;
     box.replaceChildren(el('p', 'Could not read the Hephaestus source on this PC: ' + errText(err), 'muted'));
     $('dp-prepare').disabled = true;
   }
@@ -746,6 +789,7 @@ async function loadDeploySource() {
 $('dp-prepare').addEventListener('click', async () => {
   if (!dpSource) return;
   const commit = dpSource.commit;
+  dpPreparing = true;
   $('dp-prepare').disabled = true;
   const out = $('dp-staged');
   out.hidden = false;
@@ -756,7 +800,8 @@ $('dp-prepare').addEventListener('click', async () => {
   } catch (err) {
     out.replaceChildren(el('p', 'Could not prepare it: ' + errText(err), 'warn-text'));
   } finally {
-    $('dp-prepare').disabled = false;
+    dpPreparing = false;
+    $('dp-prepare').disabled = dpLive;
   }
 });
 

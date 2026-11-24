@@ -117,7 +117,7 @@ const ACTIONS: &[&str] = &[
     "alias-add", "alias-delete", "mailq-flush", "mailq-delete", "mailq-deliver",
     "sites-list", "caddy-show", "caddy-check", "caddy-apply", "caddy-history", "caddy-rollback", "cert-renew", "site-add", "quarantine-release", "quarantine-delete",
     "acct-list", "acct-folders", "acct-add", "acct-set", "acct-delete", "key-add", "key-remove",
-    "heph-people", "heph-company-add", "heph-user", "service-updates", "service-update", "attacks", "trace", "ip-info", "block-list", "block-add", "block-remove",
+    "heph-people", "heph-company-add", "heph-user", "service-updates", "service-update", "service-update-all", "service-newer", "db-list", "db-pg-databases", "db-pg-roles", "db-pg-users", "db-public-revoke", "db-public-allow", "db-drop", "db-revoke", "db-choice-get", "db-choice-set", "db-user-drop", "db-backup-files", "db-backup-databases", "db-restore", "db-backup", "db-schedule-list", "db-schedule-set", "db-adopt", "db-create", "db-user-create", "db-grant", "attacks", "attack-groups", "trace", "ip-info", "block-list", "block-add", "block-remove", "helper-hash",
 ];
 
 /// Arguments go onto the server's command line, so only plain names pass.
@@ -337,7 +337,7 @@ async fn helper_internal(action: &str, args: &[String]) -> Result<String> {
     let (session, id) = connected_session().await?;
     let mut cmd = format!("{HELPER} --session {id} {action}");
     for a in args {
-        if !a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_') {
+        if !a.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'z' | b'-' | b'.' | b'_')) {
             return Err(Error::from_reason("internal: unsafe argument"));
         }
         cmd.push(' ');
@@ -436,6 +436,73 @@ pub async fn files_mkdir(dir: String, name: String) -> Result<String> {
     helper_internal("file-mkdir", &[hex(&real), hex(&name)]).await
 }
 
+/// Move a file or folder on the server to the trash (it is removed for good only from there).
+#[napi]
+pub async fn files_trash(dir: String, name: String) -> Result<String> {
+    let real = try_files!(files().await?.canonical(&dir).await);
+    argus_core::files::check_name(&name).map_err(err)?;
+    helper_internal("file-trash", &[hex(&real), hex(&name)]).await
+}
+
+/// Move or rename a file or folder on the server. `new_name` is the name it
+/// takes in `dest_dir`; for a plain move it is the same as `name`, for a rename
+/// `dest_dir` is the same folder. `replace` allows overwriting a plain file
+/// already there (a copy of it is kept first); a folder is never overwritten.
+#[napi]
+pub async fn files_move(
+    src_dir: String,
+    name: String,
+    dest_dir: String,
+    new_name: String,
+    replace: bool,
+) -> Result<String> {
+    let f = files().await?;
+    let real_src = try_files!(f.canonical(&src_dir).await);
+    let real_dest = try_files!(f.canonical(&dest_dir).await);
+    argus_core::files::check_name(&name).map_err(err)?;
+    argus_core::files::check_name(&new_name).map_err(err)?;
+    helper_internal(
+        "file-move",
+        &[
+            hex(&real_src),
+            hex(&name),
+            hex(&real_dest),
+            hex(&new_name),
+            if replace { "1" } else { "0" }.to_string(),
+        ],
+    )
+    .await
+}
+
+/// What is in the server's trash, newest first (JSON).
+/// Which shares are served from this item (read only). Used to warn before a move or delete.
+#[napi]
+pub async fn files_shares(dir: String, name: String) -> Result<String> {
+    let real = try_files!(files().await?.canonical(&dir).await);
+    argus_core::files::check_name(&name).map_err(err)?;
+    helper_internal("file-shares-under", &[hex(&real), hex(&name)]).await
+}
+
+#[napi]
+pub async fn trash_list() -> Result<String> {
+    helper_internal("file-trash-list", &[]).await
+}
+
+/// Remove one item from the server's trash for good. `id` is the item's id from `trash_list`.
+#[napi]
+pub async fn trash_delete(id: String) -> Result<String> {
+    helper_internal("file-trash-delete", &[id]).await
+}
+
+/// Restore one item from the server's trash to where it came from. `id` is the item's id from
+/// `trash_list`. With `replace` false, a destination that is already taken comes back as a
+/// `{conflict:true,...}` report instead of moving; with `replace` true an existing plain file is
+/// overwritten (its old copy kept first).
+#[napi]
+pub async fn trash_restore(id: String, replace: bool) -> Result<String> {
+    helper_internal("file-trash-restore", &[id, if replace { "1" } else { "0" }.to_string()]).await
+}
+
 /// Send a Hephaestus package built on this PC to the server and stage it
 /// (checked and unpacked beside the live source; nothing live changes).
 #[napi]
@@ -452,6 +519,27 @@ pub async fn deploy_stage(local_tar: String, commit: String) -> Result<String> {
         f.remove_temp("/var/lib/argus/deploy", &tmp).await;
     }
     r
+}
+
+/// Send a new copy of the server helper from this PC and have the running
+/// helper check it against the hash Matt confirmed and put it in place.
+#[napi]
+pub async fn helper_install(local_path: String, sha256: String) -> Result<String> {
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return Err(Error::from_reason("not a sha256 hash"));
+    }
+    let f = files().await?;
+    let tmp = try_files!(f.put_temp(std::path::Path::new(&local_path), "/var/lib/argus/deploy").await);
+    match helper_internal("helper-install", &[tmp.clone(), sha256]).await {
+        Ok(out) => Ok(out),
+        // The install may have finished; the screen asks the server for the installed hash again.
+        Err(e) if e.reason.contains("took too long") => Err(e),
+        Err(e) => {
+            // the helper removes the upload itself; this covers a refusal before it got that far
+            f.remove_temp("/var/lib/argus/deploy", &tmp).await;
+            Err(e)
+        }
+    }
 }
 
 #[napi(object)]

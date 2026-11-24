@@ -1,6 +1,6 @@
 // Argus main process. Holds the only link to the server (the Rust module);
 // the window gets a short, fixed list of calls through preload.js.
-const { app, BrowserWindow, clipboard, ipcMain, nativeTheme, session, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, session, shell } = require('electron');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const os = require('os');
@@ -207,8 +207,279 @@ handle('argus:filesDownload', async (remotePath, localDir, overwrite) => {
 });
 handle('argus:filesMkdir', async (dir, name) => JSON.parse(await native.filesMkdir(str(dir), str(name, 255))));
 
+// ---------- folder and many-file uploads ----------
+// A batch is looked over first, so one confirmation can describe the whole
+// thing, and then run from that stored scan. The window never hands the file
+// list back, so what goes up is what was scanned and confirmed.
+const UPLOAD_MAX_FILES = 5000;
+const UPLOAD_MAX_DEPTH = 32;
+const UPLOAD_MAX_ROOTS = UPLOAD_MAX_FILES; // dropping a folder's contents is one item each
+let uploadScan = null; // what the last scan found, waiting to be confirmed
+let uploadBatch = null; // the run in progress, or the last one that finished
+
+// The same rule the server side uses, applied here so a bad name is reported
+// in the summary instead of failing halfway through the batch.
+const okName = (n) => typeof n === 'string' && !!n && n !== '.' && n !== '..'
+  && n.length <= 255 && !n.includes('/') && !n.includes('\\') && !n.includes('\0');
+const joinRemote = (dir, rel) => (dir === '/' ? '' : dir.replace(/\/+$/, '')) + '/' + rel;
+const splitRel = (rel) => {
+  const i = rel.lastIndexOf('/');
+  return i < 0 ? ['', rel] : [rel.slice(0, i), rel.slice(i + 1)];
+};
+const why = (err) => String((err && err.message) || err).slice(0, 300);
+
+// Everything under one dropped folder. Breadth first, so a folder always
+// comes out before the folders inside it and can be created in that order.
+async function walkLocal(rootPath, rootRel, out) {
+  const queue = [[rootPath, rootRel, 0]];
+  while (queue.length) {
+    const [dirPath, rel, depth] = queue.shift();
+    out.dirs.push(rel);
+    if (depth >= UPLOAD_MAX_DEPTH) { out.skipped.push({ name: rel, why: 'folders nested deeper than this are left alone' }); continue; }
+    let ents;
+    try { ents = await fs.promises.readdir(dirPath, { withFileTypes: true }); }
+    catch (err) { out.skipped.push({ name: rel, why: why(err) }); continue; }
+    for (const e of ents) {
+      const childRel = rel + '/' + e.name;
+      if (!okName(e.name)) { out.skipped.push({ name: childRel, why: 'this name cannot be used on the server' }); continue; }
+      if (e.isSymbolicLink()) { out.skipped.push({ name: childRel, why: 'a shortcut, not a real file' }); continue; }
+      const full = path.join(dirPath, e.name);
+      if (e.isDirectory()) { queue.push([full, childRel, depth + 1]); continue; }
+      if (!e.isFile()) { out.skipped.push({ name: childRel, why: 'not an ordinary file' }); continue; }
+      if (out.files.length >= UPLOAD_MAX_FILES) { out.capped = true; continue; }
+      let st;
+      try { st = await fs.promises.stat(full); }
+      catch (err) { out.skipped.push({ name: childRel, why: why(err) }); continue; }
+      out.files.push({ local: full, rel: childRel, size: st.size });
+      out.bytes += st.size;
+    }
+  }
+}
+
+// What is being uploaded and what is already there, for the one confirmation.
+handle('argus:uploadScan', async (localPaths, remoteDir) => {
+  // Crossing the bridge can turn the list into something array-like rather
+  // than an array, so take it as it comes. Said plainly, so a refusal here
+  // names what was wrong instead of 'bad input'.
+  if (localPaths && typeof localPaths === 'object' && !Array.isArray(localPaths)) {
+    try { localPaths = Array.from(localPaths); } catch { /* reported next */ }
+  }
+  if (!Array.isArray(localPaths)) throw new Error(`what was dropped did not arrive as a list (${typeof localPaths})`);
+  if (!localPaths.length) throw new Error('nothing was dropped');
+  if (localPaths.length > UPLOAD_MAX_ROOTS) throw new Error(`${localPaths.length} things at once is too many; ${UPLOAD_MAX_ROOTS} is the limit`);
+  if (typeof remoteDir !== 'string' || !remoteDir) throw new Error('no folder is open on the server to upload into');
+  if (remoteDir.length > 4096 || remoteDir.includes('\0')) throw new Error(`the server folder is not a usable path: ${JSON.stringify(remoteDir.slice(0, 120))}`);
+  const dir = remoteDir;
+  const out = { files: [], dirs: [], bytes: 0, skipped: [], capped: false };
+  for (const given of localPaths) {
+    if (typeof given !== 'string' || !given || given.includes('\0')) {
+      out.skipped.push({ name: String(given).slice(0, 120), why: 'this is not a path on this PC' });
+      continue;
+    }
+    if (!path.isAbsolute(given)) {
+      out.skipped.push({ name: given.slice(0, 120), why: 'Windows did not give a full path for this' });
+      continue;
+    }
+    const full = path.resolve(given);
+    const name = path.basename(full);
+    if (!okName(name)) { out.skipped.push({ name, why: 'this name cannot be used on the server' }); continue; }
+    let st;
+    try { st = await fs.promises.lstat(full); }
+    catch (err) { out.skipped.push({ name, why: why(err) }); continue; }
+    if (st.isSymbolicLink()) { out.skipped.push({ name, why: 'a shortcut, not a real file' }); continue; }
+    if (st.isDirectory()) { await walkLocal(full, name, out); continue; }
+    if (!st.isFile()) { out.skipped.push({ name, why: 'not an ordinary file' }); continue; }
+    if (out.files.length >= UPLOAD_MAX_FILES) { out.capped = true; continue; }
+    out.files.push({ local: full, rel: name, size: st.size });
+    out.bytes += st.size;
+  }
+
+  // One listing per destination folder, rather than a question per file.
+  const listed = new Map();
+  const namesIn = async (relDir) => {
+    if (listed.has(relDir)) return listed.get(relDir);
+    let names = null;
+    try {
+      const l = JSON.parse(await native.filesList(relDir ? joinRemote(dir, relDir) : dir));
+      names = new Set((l.entries || []).map((e) => e.name));
+    } catch { names = null; } // not there yet, so nothing in it is being replaced
+    listed.set(relDir, names);
+    return names;
+  };
+  let replacing = 0;
+  for (const f of out.files) {
+    const [relDir, base] = splitRel(f.rel);
+    const names = await namesIn(relDir);
+    if (names && names.has(base)) replacing++;
+  }
+  const newDirs = [];
+  for (const d of out.dirs) {
+    const [relDir, base] = splitRel(d);
+    const names = await namesIn(relDir);
+    if (!names || !names.has(base)) newDirs.push(d);
+  }
+
+  // Owner and the public-website warning come from the folder itself. The
+  // permissions of each file are worked out again as it goes up, so they are
+  // described rather than promised here.
+  let probe = {};
+  try { probe = JSON.parse(await native.filesPlan(dir, '.argus-upload-check')); } catch { /* described as unknown */ }
+
+  uploadScan = { dir, files: out.files, dirs: newDirs, bytes: out.bytes };
+  return {
+    dir,
+    count: out.files.length,
+    bytes: out.bytes,
+    folders: newDirs.length,
+    replacing,
+    skipped: out.skipped.slice(0, 50),
+    skippedCount: out.skipped.length,
+    capped: out.capped,
+    owner: probe.owner || null,
+    group: probe.group || null,
+    publicWeb: !!probe.public_web,
+  };
+});
+
+// Run the batch that was just confirmed. `mode` says what to do with the
+// files already on the server: replace them (old copy backed up, as for a
+// single file) or leave them alone.
+handle('argus:uploadRun', async (mode) => {
+  if (mode !== 'replace' && mode !== 'skip') throw new Error('bad input');
+  if (uploadBatch && !uploadBatch.finished) throw new Error('an upload is already running');
+  if (!uploadScan) throw new Error('nothing has been looked over to upload');
+  const s = uploadScan;
+  uploadScan = null; // one run per confirmation
+  const b = {
+    total: s.files.length, bytesTotal: s.bytes, done: 0, bytesDone: 0, current: '',
+    uploaded: 0, replaced: 0, left: 0, failures: [], cancelled: false, finished: false,
+  };
+  uploadBatch = b;
+  try {
+    for (const rel of s.dirs) {
+      if (b.cancelled) break;
+      const [relDir, base] = splitRel(rel);
+      b.current = rel + '/';
+      try { await native.filesMkdir(relDir ? joinRemote(s.dir, relDir) : s.dir, base); }
+      catch (err) { b.failures.push({ name: rel, why: why(err) }); }
+    }
+    for (const f of s.files) {
+      if (b.cancelled) break;
+      b.current = f.rel;
+      const [relDir, base] = splitRel(f.rel);
+      const destDir = relDir ? joinRemote(s.dir, relDir) : s.dir;
+      try {
+        // Worked out again right before the file goes up, so the owner and
+        // permissions are the folder's own and nothing stale is used.
+        const plan = JSON.parse(await native.filesPlan(destDir, base));
+        if (plan.exists && mode === 'skip') {
+          b.left++;
+        } else {
+          await native.filesUpload(f.local, plan.dir, base, plan.exists, plan.uid, plan.gid, plan.mode);
+          b.uploaded++;
+          if (plan.exists) b.replaced++;
+        }
+      } catch (err) {
+        // One bad file does not abandon the rest; they are all reported at the end.
+        b.failures.push({ name: f.rel, why: why(err) });
+      }
+      b.done++;
+      b.bytesDone += f.size;
+    }
+  } finally {
+    b.current = '';
+    b.finished = true;
+  }
+  return {
+    total: b.total, done: b.done, uploaded: b.uploaded, replaced: b.replaced, left: b.left,
+    bytesDone: b.bytesDone, cancelled: b.cancelled,
+    failures: b.failures.slice(0, 50), failureCount: b.failures.length,
+  };
+});
+
+handle('argus:uploadProgress', async () => (uploadBatch ? {
+  total: uploadBatch.total, bytesTotal: uploadBatch.bytesTotal, done: uploadBatch.done,
+  bytesDone: uploadBatch.bytesDone, current: uploadBatch.current, uploaded: uploadBatch.uploaded,
+  replaced: uploadBatch.replaced, left: uploadBatch.left, failureCount: uploadBatch.failures.length,
+  cancelled: uploadBatch.cancelled, finished: uploadBatch.finished,
+} : null));
+
+// Stops after the file being copied finishes, so nothing is left half written.
+handle('argus:uploadCancel', async () => {
+  if (uploadBatch && !uploadBatch.finished) uploadBatch.cancelled = true;
+  return true;
+});
+// Deleted items go to the server's trash; only trashDelete removes them for good.
+handle('argus:filesDelete', async (dir, name) => {
+  name = str(name, 255);
+  if (!name || name === '.' || name === '..' || /[\/\\\0]/.test(name)) throw new Error('bad name');
+  return JSON.parse(await native.filesTrash(str(dir), name));
+});
+handle('argus:filesShares', async (dir, name) => JSON.parse(await native.filesShares(str(dir), str(name, 255))));
+// Move or rename on the server. new name is where it lands in destDir (same as
+// name for a plain move; destDir equals srcDir for a rename).
+handle('argus:filesMove', async (srcDir, name, destDir, newName, replace) => {
+  const badName = (n) => !n || n === '.' || n === '..' || /[\/\\\0]/.test(n);
+  name = str(name, 255);
+  newName = str(newName, 255);
+  if (badName(name) || badName(newName)) throw new Error('bad name');
+  return JSON.parse(await native.filesMove(str(srcDir), name, str(destDir), newName, replace === true));
+});
+handle('argus:trashList', async () => JSON.parse(await native.trashList()));
+handle('argus:trashDelete', async (id) => {
+  if (typeof id !== 'string' || !/^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$/.test(id)) throw new Error('bad input');
+  return JSON.parse(await native.trashDelete(id));
+});
+handle('argus:trashRestore', async (id, replace) => {
+  if (typeof id !== 'string' || !/^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$/.test(id)) throw new Error('bad input');
+  return JSON.parse(await native.trashRestore(id, replace === true));
+});
+
 // ---------- Hephaestus deploy (source on this PC) ----------
 const { execFile } = require('child_process');
+// ---------- server helper update ----------
+// A new helper is dropped here (by Matt or Claude). Argus offers to install it only
+// while this file exists and differs from the helper on the server.
+const HELPER_UPDATE = 'D:\\Argus\\helper-update\\argus-helper.new';
+const HELPER_MAX = 4 * 1024 * 1024;
+const crypto = require('crypto');
+let helperFileCache = null;   // re-hashed only when its size or time changes
+async function helperUpdateFile(fresh) {
+  let st;
+  try { st = await fs.promises.lstat(HELPER_UPDATE); } catch { helperFileCache = null; return null; }
+  if (!st.isFile() || st.size === 0 || st.size > HELPER_MAX) { helperFileCache = null; return null; }
+  const key = st.size + ':' + st.mtimeMs;
+  if (!fresh && helperFileCache && helperFileCache.key === key) return helperFileCache.info;
+  const data = await fs.promises.readFile(HELPER_UPDATE);
+  if (data.length === 0 || data.length > HELPER_MAX) { helperFileCache = null; return null; }
+  const info = { path: HELPER_UPDATE, size: data.length, mtime: Math.floor(st.mtimeMs / 1000),
+                 sha256: crypto.createHash('sha256').update(data).digest('hex') };
+  helperFileCache = { key, info };
+  return info;
+}
+handle('argus:helperUpdateLocal', () => helperUpdateFile(false));
+// Installing runs root code on the server, so the confirmation is a native dialog here,
+// not something the window can answer for itself.
+handle('argus:helperInstall', async (sha256) => {
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256)) throw new Error('bad input');
+  const now = await helperUpdateFile(true);
+  if (!now || now.sha256 !== sha256) throw new Error('the file in ' + HELPER_UPDATE + ' changed; look again');
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'warning',
+    title: 'Install the new server helper?',
+    message: 'Replace the helper on the server with this file?',
+    detail: `${HELPER_UPDATE}\n${now.size} bytes\n\nsha256:\n${sha256}\n\n`
+      + 'Compare this hash with the one you were given before you install. The server checks the file against it '
+      + 'and keeps the current helper as a backup.',
+    buttons: ['Cancel', 'Install Helper'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  if (response !== 1) return { cancelled: true };
+  return JSON.parse(await native.helperInstall(HELPER_UPDATE, sha256));
+});
+
 const HEPH_REPO = 'D:\\Github\\Hephaestus-MSP';
 const PACKAGE_PATHS = ['Cargo.toml', 'Cargo.lock', 'crates', 'migrations', 'deploy', 'tools/test/rls_invariants.sql'];
 function git(args) {

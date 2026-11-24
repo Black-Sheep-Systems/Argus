@@ -36,7 +36,7 @@ main { flex: 1; min-width: 0; overflow-y: auto; padding: 26px 32px 40px; }
 .btn.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-text); }
 .btn:disabled { opacity: .6; cursor: wait; }
 /* Prepare is unavailable when nothing new has come down the pike: show a red "not allowed" cursor. */
-#dp-prepare:disabled { cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='9' fill='none' stroke='%23d32f2f' stroke-width='2.5'/%3E%3Cline x1='5.6' y1='5.6' x2='18.4' y2='18.4' stroke='%23d32f2f' stroke-width='2.5'/%3E%3C/svg%3E") 12 12, not-allowed; }
+#dp-prepare:disabled, #svc-update-all:disabled { cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='9' fill='none' stroke='%23d32f2f' stroke-width='2.5'/%3E%3Cline x1='5.6' y1='5.6' x2='18.4' y2='18.4' stroke='%23d32f2f' stroke-width='2.5'/%3E%3C/svg%3E") 12 12, not-allowed; }
 :focus-visible { outline: 3px solid var(--link); outline-offset: 2px; }
 input, select { font: inherit; padding: 9px 10px; border: 1px solid var(--field-line); border-radius: 5px; background: var(--field); color: var(--text); }
 label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-weight: 500; }
@@ -54,6 +54,8 @@ label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-w
 .unknown { color: var(--unk-fg); background: var(--unk-bg); }
 .attention { background: var(--att-bg); border: 1px solid var(--att-line); border-radius: 6px; padding: 14px 18px; margin-bottom: 18px; }
 .attention ul { margin: 8px 0 0; padding-left: 20px; }
+/* Scrollbars use the layout's own colours instead of the system default (light and dark). */
+* { scrollbar-width: thin; scrollbar-color: var(--line) var(--panel); }
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
 .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .tile h2 { margin: 0; font-size: 15px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
@@ -199,3 +201,50 @@ th[aria-sort="descending"] .sort-mark::after { content: "▼"; font-size: 10px; 
 th[aria-sort="ascending"], th[aria-sort="descending"] { color: var(--text, inherit); }
 
 .row-actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+
+/* Top tabs inside a sidebar area */
+.subtabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--line); margin: 0 0 18px; }
+.subtab { font: inherit; font-size: 13px; font-weight: 500; color: var(--muted); background: none; border: 0; border-bottom: 3px solid transparent; padding: 9px 12px; margin-bottom: -1px; cursor: pointer; }
+.subtab:hover { color: var(--text); }
+.subtab[aria-current="page"] { color: var(--text); border-bottom-color: var(--primary); }
+
+/* Updates page: restart bar across the top, System Packages below it */
+.restart-bar { flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
+.restart-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1 1 360px; }
+.restart-text h3 { margin: 0; }
+.updates-stack { display: flex; flex-direction: column; gap: 16px; }
+/* Long lists and logs scroll inside their box instead of making the page longer */
+#upd-list, #su-list { max-height: 360px; overflow: auto; }
+#view-updates .job pre, #view-server .job pre { max-height: 200px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* How far along a folder upload is. */
+.up-prog { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: .55rem .75rem; margin: 0 0 .6rem; }
+.up-prog-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.up-prog progress { width: 100%; height: .55rem; margin: .45rem 0 .25rem; }
+.up-prog p { margin: 0; overflow-wrap: anywhere; }
+.up-summary dt { font-weight: 600; }
+.up-choice { border: 1px solid var(--line); border-radius: 6px; padding: .4rem .7rem .55rem; margin: .6rem 0 0; }
+.up-choice legend { padding: 0 .3rem; font-weight: 600; }
+.up-choice label { display: block; margin: .2rem 0; }
+#up-fail ul { margin: .4rem 0 0; padding-left: 1.2rem; }
+
+/* ---------- file move: drop highlight, right-click menu, destination picker ---------- */
+.frow.dropinto { outline: 2px solid var(--link); outline-offset: -2px; background: var(--rule); }
+#srv-up.dropinto { outline: 2px solid var(--link); outline-offset: 1px; }
+.ctxmenu { position: fixed; z-index: 1000; min-width: 170px; padding: 4px; display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 22px rgba(0, 0, 0, .35); }
+.ctxmenu .ctxitem { font: inherit; font-size: 13px; text-align: left; background: none; border: 0; color: var(--text);
+  padding: 7px 12px; border-radius: 4px; cursor: pointer; }
+.ctxmenu .ctxitem:hover:not(:disabled) { background: var(--side-current); color: #FFFFFF; }
+.ctxmenu .ctxitem:disabled { opacity: .5; cursor: default; }
+dialog.pickfolder { max-width: 560px; }
+.pickfolder-body { padding: 20px 22px; display: flex; flex-direction: column; gap: 12px; }
+.pickfolder-body h3 { margin: 0; font-size: 17px; }
+.pickfolder-path { color: var(--muted); word-break: break-all; }
+.pickfolder-list { border: 1px solid var(--line); border-radius: 6px; max-height: 320px; overflow: auto; }
+.pickfolder-row { padding: 8px 12px; border-bottom: 1px solid var(--rule); cursor: pointer; }
+.pickfolder-row:last-child { border-bottom: 0; }
+.pickfolder-row::before { content: "\25B8 "; color: var(--link); }
+.pickfolder-row:hover { background: var(--rule); }
+.pickfolder-bar { display: flex; gap: 10px; justify-content: flex-end; margin-top: 4px; }
+.trash-actions { display: flex; gap: 8px; justify-content: flex-end; }

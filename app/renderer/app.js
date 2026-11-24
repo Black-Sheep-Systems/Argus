@@ -88,6 +88,41 @@ $('refresh').addEventListener('click', () => refresh());
 function stop() {
   if (timer) clearInterval(timer);
   timer = null;
+  clearIdleLock();
+  forgetHelperUpdate();
+}
+
+// ---------- idle lock ----------
+// After 30 minutes with no user activity, lock: drop the connection and return to sign-in
+// (a fresh passphrase + code is required). The SSH link itself no longer idles out - liveness
+// is handled by keepalives - so this app-level lock is the only thing that ends an idle session,
+// by design: it separates "user walked away" (this) from "network died" (keepalives).
+const IDLE_MS = 30 * 60 * 1000;
+let idleTimer = null;
+function armIdleLock() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(lockForIdle, IDLE_MS);
+}
+function clearIdleLock() {
+  if (idleTimer !== null) clearTimeout(idleTimer);
+  idleTimer = null;
+}
+async function teardownToSignIn(message) {
+  // Real teardown (not a UI swap): kill timers, close the shell, drop the SSH session,
+  // and return to the passphrase + code screen so a fresh sign-in is required.
+  stop();
+  closeTerminal();
+  lastStatus = null;
+  showView('dashboard');
+  try { await window.argus.disconnect(); } catch { /* returning to sign-in regardless */ }
+  signinStep('pass', message);
+}
+function lockForIdle() {
+  return teardownToSignIn('Argus locked after 30 minutes of inactivity. Sign in again.');
+}
+// Real user activity rearms the timer, but only while signed in (i.e. while it is armed).
+for (const ev of ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart']) {
+  document.addEventListener(ev, () => { if (idleTimer !== null) armIdleLock(); }, { passive: true, capture: true });
 }
 
 function clean(err) {
@@ -106,6 +141,7 @@ async function refresh() {
     if (refreshMsgShown) { $('dash-msg').textContent = ''; refreshMsgShown = false; }
     $('conn').className = 'pill ok';
     $('conn').textContent = 'Connected';
+    checkHelperUpdate();
   } catch (err) {
     const m = clean(err);
     if (m.startsWith('HELPER:')) {
@@ -123,6 +159,81 @@ async function refresh() {
     $('refresh').disabled = false;
   }
 }
+
+// ---------- server helper update ----------
+// Shown only while D:\Argus\helper-update\argus-helper.new exists and differs from the installed helper.
+// The installed helper's hash is asked again when the PC file changes, every 5 minutes, and after an install;
+// after a failed ask (an older helper without helper-hash), only every 10 minutes.
+let helperServerSha = null;
+let helperServerAt = 0;
+let helperServerFailedAt = 0;
+let helperUpdate = null;
+let helperChecking = false;
+let helperRecheck = false;
+async function checkHelperUpdate(force) {
+  if (helperChecking) { helperRecheck = helperRecheck || !!force; return; }
+  helperChecking = true;
+  try {
+    const before = helperUpdate && helperUpdate.sha256;
+    try { helperUpdate = await window.argus.helperUpdateLocal(); } catch { helperUpdate = null; }
+    const now = Date.now();
+    const changed = !!helperUpdate && helperUpdate.sha256 !== before;
+    const due = force || changed || (!helperServerSha && now - helperServerFailedAt > 10 * 60 * 1000)
+      || (helperServerSha && now - helperServerAt > 5 * 60 * 1000);
+    if (helperUpdate && due) {
+      try {
+        const r = await window.argus.helper('helper-hash', []);
+        helperServerSha = r && typeof r.sha256 === 'string' ? r.sha256 : null;
+        helperServerAt = now;
+      } catch {
+        helperServerSha = null;
+        helperServerFailedAt = now;
+      }
+    }
+  } finally {
+    helperChecking = false;
+  }
+  showHelperUpdate();
+  if (helperRecheck) { helperRecheck = false; checkHelperUpdate(true); }
+}
+function showHelperUpdate() {
+  const show = !!(helperUpdate && helperServerSha && helperUpdate.sha256 !== helperServerSha);
+  $('helper-update').hidden = !show;
+  if (show) {
+    $('helper-update-text').textContent = `${helperUpdate.path} (${(helperUpdate.size / 1024).toFixed(0)} KB) differs from the helper on the server. `
+      + `New ${helperUpdate.sha256.slice(0, 12)}…, installed ${helperServerSha.slice(0, 12)}….`;
+  }
+}
+function forgetHelperUpdate() {
+  helperServerSha = null;
+  helperServerAt = 0;
+  helperServerFailedAt = 0;
+  $('helper-update').hidden = true;
+}
+$('helper-update-install').addEventListener('click', async () => {
+  const u = helperUpdate;
+  if (!u) return;
+  // The confirmation is a Windows dialog from the main process, showing the full hash.
+  $('helper-update-install').disabled = true;
+  say('Waiting for you to confirm the helper install…');
+  let cancelled = false;
+  try {
+    const r = await window.argus.helperInstall(u.sha256);
+    if (r && r.cancelled) { cancelled = true; say(''); return; }
+    helperServerSha = r.installed;
+    helperServerAt = Date.now();
+    showHelperUpdate();
+    say(`The new helper is installed (${String(r.installed).slice(0, 12)}…). The previous one was kept as ${r.backup}.`);
+  } catch (err) {
+    const m = errText(err);
+    say(/took too long/.test(m)
+      ? 'The server did not say in time whether the helper was installed. Argus is checking the installed helper now.'
+      : 'The helper was not installed: ' + m);
+  } finally {
+    $('helper-update-install').disabled = false;
+    if (!cancelled) await checkHelperUpdate(true);
+  }
+});
 
 const UNKNOWN = 'unknown';
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -184,7 +295,7 @@ const TILES = [
     const memPct = mu != null && mt ? mu / mt : null, diskPct = du != null && dt ? du / dt : null;
     const reboot = typeof sv.reboot_needed === 'boolean' ? sv.reboot_needed : null;
     if (diskPct != null && diskPct > 0.85) issues.push([`Disk is ${Math.round(diskPct * 100)}% full. Old backups and files are the usual cause.`, 'files', 'Open Files']);
-    if (reboot) issues.push(['The server needs a restart to finish an update.', 'server', 'Go to Restart', 'reboot']);
+    if (reboot) issues.push(['The server needs a restart to finish an update.', 'updates', 'Go to Restart', 'reboot']);
     const known = memPct != null && diskPct != null && load != null && cpus != null;
     const busy = known && (memPct > 0.9 || diskPct > 0.85 || load > cpus * 1.5);
     return tile('Server', !known ? UNK_PILL : busy ? ['warn', 'Busy'] : ['ok', 'Healthy'], [
@@ -236,7 +347,7 @@ const TILES = [
   ['Hephaestus', (s, issues) => {
     const he = obj(s.hephaestus); if (!he) return null;
     const health = str(he.app_health);
-    if (health && health !== 'healthy') issues.push([`Hephaestus reports ${health}.`, 'hephaestus', 'Go to Hephaestus']);
+    if (health && health !== 'healthy') issues.push([`Hephaestus reports ${health}.`, 'deploy', 'Go to Hephaestus']);
     return tile('Hephaestus', health == null ? UNK_PILL : health === 'healthy' ? ['ok', 'Live'] : ['bad', health], [
       ['Version', str(he.version)],
       ['App health', health],
@@ -267,7 +378,7 @@ const TILES = [
   ['Updates', (s, issues) => {
     const up = obj(s.updates); if (!up) return null;
     const sec = num(up.security), waiting = num(up.waiting);
-    if (sec) issues.push([`${sec} security ${sec === 1 ? 'update is' : 'updates are'} waiting.`, 'server', 'Go to Updates', 'upd-apply']);
+    if (sec) issues.push([`${sec} security ${sec === 1 ? 'update is' : 'updates are'} waiting.`, 'updates', 'Go to Updates', 'upd-apply']);
     return tile('Updates', sec == null ? UNK_PILL : sec ? ['warn', `${sec} security`] : ['ok', 'No security updates'], [
       ['Waiting', waiting],
       ['Security', sec],
@@ -312,7 +423,18 @@ function render(s) {
 // ---------- views (phase 2) ----------
 let lastStatus = null;
 let currentView = 'dashboard';
-const VIEWS = ['dashboard', 'server', 'backups', 'hephaestus', 'activity', 'terminal', 'files', 'mail', 'web', 'accounts', 'signins'];
+// Sidebar areas and the pages (tabs) in each. The first page is what a click on the area opens.
+const GROUPS = {
+  overview: { tabs: [['dashboard', 'Dashboard']] },
+  server: { tabs: [['server', 'Services'], ['updates', 'Updates'], ['databases', 'Databases'], ['backups', 'Backups'], ['signins', 'Sign-In Attempts']] },
+  web: { tabs: [['web', 'Sites'], ['caddy', 'Caddy']] },
+  mail: { tabs: [['mail', 'Mailboxes'], ['accounts', 'Accounts']] },
+  hephaestus: { tabs: [['deploy', 'Deploy'], ['rollback', 'Roll Back']] },
+  tools: { tabs: [['files', 'Files'], ['terminal', 'Terminal'], ['activity', 'Activity Log']] },
+};
+const VIEW_GROUP = {};
+for (const [g, def] of Object.entries(GROUPS)) for (const [v] of def.tabs) VIEW_GROUP[v] = g;
+const VIEWS = Object.keys(VIEW_GROUP);
 
 function el(tag, text, cls) {
   const e = document.createElement(tag);
@@ -355,6 +477,10 @@ async function call(action, args = []) {
   }
 }
 
+// The name typed into the last confirmation that was accepted, with spaces at the ends removed. The helper
+// checks it again on the server, so the typed name is sent with the action, not just the name shown.
+let lastTyped = '';
+
 // Confirmation dialog. `word`, when given, must be typed to enable the button.
 function confirmAction({ title, text, ok, word, extra, wide }) {
   return new Promise((resolve) => {
@@ -369,31 +495,57 @@ function confirmAction({ title, text, ok, word, extra, wide }) {
     $('confirm-word').textContent = word || '';
     $('confirm-type').value = '';
     $('confirm-ok').disabled = !!word;
+    // Spaces at either end of a pasted name are ignored; the name itself must match exactly.
     $('confirm-type').oninput = () => { $('confirm-ok').disabled = $('confirm-type').value.trim() !== word; };
     // A close event left over from the dialog's previous use arrives after it
     // has reopened; only a real close (dialog no longer open) counts.
-    d.onclose = () => { if (!d.open) resolve(d.returnValue === 'ok'); };
+    d.onclose = () => {
+      if (d.open) return;
+      if (d.returnValue === 'ok') lastTyped = $('confirm-type').value.trim();
+      resolve(d.returnValue === 'ok');
+    };
     d.returnValue = 'cancel';
     d.showModal();
     (word ? $('confirm-type') : d.querySelector('button[value="cancel"]')).focus();
   });
 }
 
+function titleOf(v) {
+  if (v === 'dashboard') return 'Everything at a Glance';
+  const tab = GROUPS[VIEW_GROUP[v]].tabs.find(([view]) => view === v);
+  return tab ? tab[1] : '';
+}
+// The top tabs for the area that holds this page.
+function showTabs(group, v) {
+  const tabs = GROUPS[group].tabs;
+  const bar = $('subtabs');
+  bar.hidden = tabs.length < 2;
+  bar.replaceChildren(...tabs.map(([view, label]) => {
+    const b = el('button', label, 'subtab');
+    b.type = 'button';
+    if (view === v) b.setAttribute('aria-current', 'page');
+    b.addEventListener('click', () => showView(view));
+    return b;
+  }));
+}
 function showView(v) {
   currentView = v;
-  $('page-title').textContent = { dashboard: 'Everything at a Glance', server: 'Server', backups: 'Backups', hephaestus: 'Hephaestus', activity: 'Activity Log', terminal: 'Terminal', files: 'Files', mail: 'Mail', web: 'Websites', accounts: 'Accounts', signins: 'Sign-In Attempts' }[v];
+  const group = VIEW_GROUP[v];
+  $('page-title').textContent = titleOf(v);
   $('refreshed').hidden = v !== 'dashboard';
   for (const name of VIEWS) $('view-' + name).hidden = name !== v;
   for (const b of document.querySelectorAll('button.nav')) {
-    const on = b.dataset.view === v;
+    const on = b.dataset.group === group;
     b.classList.toggle('current', on);
     if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
   }
+  showTabs(group, v);
   $('attention').hidden = v !== 'dashboard' || $('attention-list').children.length === 0;
   say('');
   return loadView(v);
 }
-for (const b of document.querySelectorAll('button.nav')) b.addEventListener('click', () => showView(b.dataset.view));
+// A sidebar click opens the area's first page.
+for (const b of document.querySelectorAll('button.nav')) b.addEventListener('click', () => showView(GROUPS[b.dataset.group].tabs[0][0]));
 
 // From a dashboard warning: open the page that deals with it and bring the
 // right part into view once the page has loaded.
@@ -415,14 +567,15 @@ async function goTo(view, focusId) {
 
 async function loadView(v) {
   try {
-    if (v === 'server') await loadServer();
+    if (v === 'server' || v === 'updates') await loadServer();
     else if (v === 'backups') await loadBackups();
-    else if (v === 'hephaestus') await loadHephaestus();
+    else if (v === 'databases') await loadDatabases();
+    else if (v === 'deploy' || v === 'rollback') await loadHephaestus();
     else if (v === 'activity') await loadActivity();
     else if (v === 'terminal') await openTerminal(false);
     else if (v === 'files') await openFiles();
     else if (v === 'mail') await loadMail();
-    else if (v === 'web') await loadWeb();
+    else if (v === 'web' || v === 'caddy') await loadWeb();
     else if (v === 'accounts') await loadAccounts();
     else if (v === 'signins') await loadSignins();
   } catch (err) {
@@ -451,28 +604,39 @@ async function loadServer() {
   } else {
     const count = (lv) => pkgs.filter((p) => p.level === lv).length;
     const high = count('high'), medium = count('medium'), low = count('low');
-    const other = pkgs.length - high - medium - low;
-    const summary = [high && `${high} high`, medium && `${medium} medium`, low && `${low} low`, other && `${other} not rated`].filter(Boolean).join(', ');
+    const held = pkgs.filter((p) => p.why === 'held-back').length;
+    const other = pkgs.length - high - medium - low - held;
+    const summary = [high && `${high} high`, medium && `${medium} medium`, low && `${low} low`, other && `${other} not rated`, held && `${held} held back`].filter(Boolean).join(', ');
     const advice = high ? 'Apply soon: at least one fixes a security problem or is marked urgent.'
       : medium ? 'Time-sensitive fixes. Apply when convenient, within a few days.'
       : 'Routine. These can wait for your next update round.';
-    const items = pkgs.map((p) => {
-      const item = el('div', null, 'upd-item');
-      const head = el('div', null, 'upd-head');
-      head.append(el('strong', p.name, 'mono'), levelPill(p));
-      item.append(head);
-      if (p.description) item.append(el('p', p.description));
-      item.append(el('p', `${p.from || '?'} → ${p.to}${p.source ? ' · ' + p.source : ''}`, 'mono muted small'));
+    const rows = pkgs.map((p) => {
+      const nameCell = el('td');
+      nameCell.append(el('strong', p.name, 'mono'));
+      if (p.description) nameCell.append(el('div', p.description, 'muted small'));
       if (p.changes && p.changes.length) {
         const d = document.createElement('details');
         d.append(el('summary', 'What this update changes'), el('pre', p.changes.join('\n'), 'changes'));
-        item.append(d);
-      } else {
-        item.append(el('p', 'Change details are not available.', 'muted small'));
+        nameCell.append(d);
       }
-      return item;
+      const version = p.why === 'held-back' ? 'Held back by apt' : `${p.from || '?'} → ${p.to}`;
+      return row([nameCell, version, levelPill(p), p.source || '']);
     });
-    list.replaceChildren(el('p', `${pkgs.length} waiting: ${summary}.`), el('p', advice, high ? 'warn-text' : 'muted'), ...items);
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    for (const h of ['Package', 'Version', 'Priority', 'Source']) {
+      const th = el('th', h);
+      th.scope = 'col';
+      headRow.append(th);
+    }
+    thead.append(headRow);
+    const table = el('table');
+    const tbody = el('tbody');
+    tbody.append(...rows);
+    table.append(thead, tbody);
+    const tableWrap = el('div', null, 'table-wrap');
+    tableWrap.append(table);
+    list.replaceChildren(el('p', `${pkgs.length} waiting: ${summary}.`), el('p', advice, high ? 'warn-text' : 'muted'), tableWrap);
     if (updatesIncludeDocker) {
       list.append(el('p', 'This includes Docker. Installing it restarts every service on the server, mail included, for a minute or two.', 'warn-text'));
     }
@@ -502,10 +666,14 @@ async function loadServiceUpdates(refresh) {
     pill.title = x?.detail || '';
     const cell = el('div', null, 'su-cell');
     cell.append(pill);
-    if (x?.status === 'update' && x.newer) cell.append(el('span', `also ${x.newer.version} (manual)`, 'muted small'));
+    if (x?.status === 'update' && x.newer && !x.newer.ref) cell.append(el('span', `also ${x.newer.version} (manual)`, 'muted small'));
+    if (x?.newer?.ref) cell.append(el('span', `newer: ${x.newer.version}`, 'muted small'));
     const actions = el('div', null, 'row-actions');
     if (x?.status === 'update' && x.can_update && x.action !== 'mailcow' && n !== 'hephaestus-prod-migrate-1') {
       actions.append(button('Update', 'primary', () => applyServiceUpdate({ title: n, target: n, detail: (x.detail || '') + (x.action === 'rebuild-image' ? '. Every container that uses this image restarts too' : ''), count: 2 })));
+    }
+    if (x?.newer?.ref && n !== 'hephaestus-prod-migrate-1') {
+      actions.append(button('Update to ' + x.newer.version, 'primary', () => applyServiceUpdate({ title: n, target: n, newer: true, detail: 'Moves ' + n + ' from ' + x.version + ' to ' + x.newer.version + (x.image && /^(mysql|mariadb|postgres)[:@]/.test(x.image) ? '. The database is dumped, and the dump is test-restored into the new version first' : ''), count: 1 })));
     }
     actions.append(button('Restart', '', () => restartService(n)));
     return row([el('span', n, 'mono'), el('span', x?.version || 'unknown', 'mono'), cell, actions]);
@@ -537,7 +705,14 @@ function renderServiceUpdates() {
       seen.add('manual:' + x.name);
       items.push({ title: x.name, detail: x.detail, how: x.how, manual: true });
     }
-    if (x.newer) {
+    if (x.newer?.ref) {
+      const key = 'newer:' + x.name;
+      if (!seen.has(key) && x.name !== 'hephaestus-prod-migrate-1') {
+        seen.add(key);
+        const isDb = /^(mysql|mariadb|postgres)[:@]/.test(x.image || '');
+        items.push({ title: x.name, detail: `Newer version ${x.newer.version} (you have ${x.version}). ` + (isDb ? 'The database is dumped, and the dump is test-restored into the new version before anything changes.' : 'It is applied in place, and the previous version is kept for rollback.'), how: x.newer.how, target: x.name, newer: true, manual: false, count: 1 });
+      }
+    } else if (x.newer) {
       const key = 'newer:' + x.image;
       if (!seen.has(key)) {
         seen.add(key);
@@ -572,10 +747,15 @@ async function applyServiceUpdate(i) {
       : `${i.detail}. ${i.count > 1 ? 'Each of these restarts' : 'It restarts'} for a few seconds; anything using ${i.count > 1 ? 'them' : 'it'} sees an error meanwhile.`,
     ok: mail ? 'Update Mail System' : 'Update' });
   if (!ok) return;
-  try { await call('service-update', [i.target]); watchJob('svc-update', $('su-job')); }
+  // Show progress at once: the server checks the new image before it starts the job, which can take a minute.
+  const box = $('su-job');
+  box.hidden = false;
+  box.replaceChildren(el('p', `Starting the update to ${i.newer ? 'the newer version' : 'the new build'}. Argus is checking the new image first; this can take a minute.`, 'muted'));
+  try { await call(i.newer ? 'service-newer' : 'service-update', [i.target]); watchJob('svc-update', $('su-job')); }
   catch (err) { say('The update did not start: ' + errText(err)); }
 }
 $('su-check').addEventListener('click', () => loadServiceUpdates(true));
+$('upd-check').addEventListener('click', () => loadServer());
 // Container updates Update All runs: mail has its own button; the migration job is never updated here.
 function bulkUpdates() {
   return (suData?.services || []).filter((x) => x.can_update && x.status === 'update'
@@ -606,6 +786,11 @@ async function restartService(name) {
 
 let updatesIncludeDocker = false;
 function levelPill(p) {
+  if (p.why === 'held-back') {
+    const held = el('span', 'Held back', 'pill unknown');
+    held.title = 'apt keeps this package back, so a normal upgrade does not install it. It needs a decision by hand.';
+    return held;
+  }
   const map = {
     high: ['bad', p.why === 'urgent' ? 'High · marked urgent' : 'High · security fix'],
     medium: ['warn', 'Medium · time-sensitive fix'],
@@ -666,7 +851,7 @@ async function watchJob(job, box, quietIfNone) {
   if (!st.running && (job === 'heph-deploy' || job === 'heph-rollback')) refreshDeployState();
   const label = st.running ? ['warn', 'Running'] : st.result === 'ok' ? ['ok', 'Finished'] : st.result === 'failed' ? ['bad', 'Failed'] : ['warn', 'Interrupted'];
   const pill = el('span', label[1], 'pill ' + label[0]);
-  const head = el('p', { updates: 'Last update run: ', 'heph-rollback': 'Last rollback: ', 'heph-deploy': 'Last deploy: ', web: 'Last web server change: ', 'svc-update': 'Last service update: ' }[job]);
+  const head = el('p', { updates: 'Last update run: ', 'heph-rollback': 'Last rollback: ', 'heph-deploy': 'Last deploy: ', web: 'Last web server change: ', 'svc-update': 'Last service update: ', 'db-backup': 'Last database backup: ' }[job]);
   head.append(pill);
   const lines = st.log.filter((l) => !l.startsWith('ARGUS-RESULT'));
   // A plain last line, so the end of the log says how it ended.
@@ -676,7 +861,7 @@ async function watchJob(job, box, quietIfNone) {
   // Always show the end of the log (after layout, so the height is known).
   requestAnimationFrame(() => { pre.scrollTop = pre.scrollHeight; });
   if (st.running) jobTimers[job] = setTimeout(() => watchJob(job, box), 3000);
-  else if (!quietIfNone) { refresh(); if (job === 'svc-update') loadServiceUpdates(false); }
+  else if (!quietIfNone) { refresh(); if (job === 'svc-update') loadServiceUpdates(false); if (job === 'db-backup') loadDatabases(); }
 }
 
 // --- backups
@@ -685,18 +870,27 @@ async function loadBackups() {
   const cards = [];
   for (const [key, label] of [['mail', 'Mail'], ['hephaestus', 'Hephaestus Database']]) {
     const c = el('section', null, 'card');
-    c.append(el('h3', label));
+    c.dataset.collapse = 'backups-' + key;
+    const toggle = el('button', 'Hide', 'btn small');
+    toggle.type = 'button';
+    toggle.dataset.toggle = '';
+    const head = el('div', null, 'card-head');
+    const btns = el('div', null, 'btns');
+    btns.append(toggle);
+    head.append(el('h3', label), btns);
+    const body = el('div', null, 'collapsible');
+    c.append(head, body);
     const items = arr(bk[key]);
-    if (!items) c.append(el('p', 'Could not read this folder.', 'muted'));
-    else if (!items.length) c.append(el('p', 'None kept yet.', 'muted'));
+    if (!items) body.append(el('p', 'Could not read this folder.', 'muted'));
+    else if (!items.length) body.append(el('p', 'None kept yet.', 'muted'));
     else {
       const t = el('table');
       const tb = el('tbody');
       for (const i of items) tb.append(row([el('span', i.time, 'mono'), el('span', (i.size_b / 1e6).toFixed(1) + ' MB', 'mono')]));
       t.append(tb);
-      c.append(el('p', `${items.length} kept. Older copies are removed automatically.`, 'muted'), t);
+      body.append(el('p', `${items.length} kept. Older copies are removed automatically.`, 'muted'), t);
     }
-    c.append(button('Back Up Now', '', async () => {
+    body.append(button('Back Up Now', '', async () => {
       const ok = await confirmAction({ title: `Back Up ${label} Now?`,
         text: key === 'mail'
           ? 'A copy of all mail, plus the websites\' files, is made now. It takes a few minutes; mail and the websites keep working meanwhile. Copies past the kept number of days are removed.'
@@ -706,9 +900,414 @@ async function loadBackups() {
       try { await call('backup-run', [key]); say(`${label} backup started. It appears here when it finishes; refresh this page in a minute or two.`); }
       catch (err) { say(`Could not start the ${label} backup: ` + errText(err)); }
     }));
+    setupCollapse(c);
     cards.push(c);
   }
   $('bk-cards').replaceChildren(...cards);
+}
+
+// Saves one database's scheduled backup (on or off, and its time HH:MM), then redraws the list.
+async function saveSchedule(name, enabled, time) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(time);
+  if (!m) { say('Enter the backup time as HH:MM.'); return; }
+  try {
+    await call('db-schedule-set', [name, String(enabled), m[1], m[2]]);
+    say(enabled ? `Scheduled backup of ${name} is on, at ${time}.` : `Scheduled backup of ${name} is off.`);
+  } catch (err) { say(`Could not save the schedule for ${name}: ` + errText(err)); }
+  loadDatabases();
+}
+
+// The On/Off toggle and time field for one database. Turning it off asks first.
+function scheduleCell(name, s) {
+  const on = !!(s && s.enabled);
+  const time = s && s.hour != null ? String(s.hour).padStart(2, '0') + ':' + String(s.minute).padStart(2, '0') : '03:00';
+  const toggle = button(on ? 'On' : 'Off', on ? 'primary' : '', async () => {
+    if (on) {
+      const ok = await confirmAction({ title: `Turn Off the Scheduled Backup of ${name}?`,
+        text: 'This database will no longer be backed up on its schedule. Copies already kept are not removed, and you can still back it up by hand.',
+        ok: 'Turn Off' });
+      if (!ok) return;
+    }
+    await saveSchedule(name, !on, input.value);
+  });
+  toggle.setAttribute('aria-pressed', String(on));
+  const input = el('input');
+  input.type = 'time';
+  input.value = time;
+  input.setAttribute('aria-label', `Scheduled backup time of ${name}`);
+  input.addEventListener('change', () => saveSchedule(name, on, input.value));
+  const next = on && s.next_run ? el('span', 'Next: ' + s.next_run.slice(0, 16).replace('T', ' '), 'muted') : el('span', 'Off', 'muted');
+  const cell = el('span');
+  cell.append(toggle, ' ', input, ' ', next);
+  return cell;
+}
+
+// Lists the database containers, their scheduled backups, and lets each one be backed up now.
+async function loadDatabases() {
+  loadWarningsChoice();
+  let dl, sl;
+  try { dl = await call('db-list'); sl = await call('db-schedule-list'); }
+  catch (err) { $('db-rows').replaceChildren(row(['Could not read databases: ' + errText(err), '', '', '', '', ''])); return; }
+  $('db-keep').textContent = dl.keep;
+  const dbs = arr(dl.databases) || [];
+  const schedules = new Map((arr(sl.schedules) || []).map((s) => [s.name, s]));
+  const kinds = { postgres: 'PostgreSQL', mysql: 'MySQL', mariadb: 'MariaDB', unsupported: 'Not supported' };
+  $('db-rows').replaceChildren(...(dbs.length ? dbs.map((d) => {
+    const can = d.kind !== 'unsupported';
+    return row([
+      el('span', d.name, 'mono'),
+      el('span', (kinds[d.kind] || d.kind) + (d.running === false ? ' (stopped)' : '')),
+      el('span', d.last_backup ? `${d.last_backup} (${d.backups} kept)` : 'None yet', 'mono'),
+      el('span', d.last_size_b != null ? (d.last_size_b / 1e6).toFixed(1) + ' MB' : '', 'mono'),
+      can ? scheduleCell(d.name, schedules.get(d.name)) : el('span'),
+      actionsCell(can && d.running !== false ? button('Back Up Now', '', async () => {
+        const ok = await confirmAction({ title: `Back Up ${d.name} Now?`,
+          text: 'A full copy of this database is made now. The database keeps running. Older copies beyond the kept number are removed once this one succeeds.',
+          ok: 'Back Up Now' });
+        if (!ok) return;
+        try { await call('db-backup', [d.name]); watchJob('db-backup', $('db-job')); }
+        catch (err) { say(`Could not start the ${d.name} backup: ` + errText(err)); }
+      }) : el('span', 'Not available', 'muted'),
+      d.kind === 'postgres' && d.running !== false ? button('Grant Access', '', () => grantAccess(d.name)) : el('span')),
+    ]);
+  }) : [row(['No database containers found.', '', '', '', '', ''])]));
+  dbPgNames = dbs.filter((d) => d.kind === 'postgres').map((d) => d.name);
+  wireDatabaseTools();
+  watchJob('db-backup', $('db-job'), true);
+  loadDatabaseList();
+  loadDatabaseUsers();
+}
+
+// Drops a login: takes its rights in every database on the container, then removes it. Two steps; the second
+// needs the user's name typed in full. The first step is the picker itself, so it always shows.
+async function dropUser() {
+  if (!dbPgNames.length) return say('There is no PostgreSQL container to drop a user from.');
+  const server = dbSelect(dbPgNames), user = dbSelect([]);
+  const fillUsers = async () => {
+    user.replaceChildren();
+    try {
+      const users = arr((await call('db-pg-roles', [server.value])).users) || [];
+      if (!users.length) { const o = document.createElement('option'); o.value = ''; o.textContent = 'No login users'; user.append(o); }
+      for (const u of users) { const o = document.createElement('option'); o.value = u; o.textContent = u; user.append(o); }
+    } catch (err) { say('Could not read the users: ' + errText(err)); }
+  };
+  server.addEventListener('change', fillUsers);
+  await fillUsers();
+  const extra = document.createElement('div');
+  extra.append(dbField('Container', server), dbField('User to drop', user));
+  const ok1 = await confirmAction({ title: 'Drop User', ok: 'Continue', extra,
+    text: 'Takes away this user\'s rights in every database on the container, then removes the login. A user who still owns something cannot be dropped; Argus says why. Hephaestus\'s own roles are refused, and on the Hephaestus container a user with rights in the Hephaestus database is refused.' });
+  if (!ok1) return;
+  const who = user.value;
+  if (!who) return say('Choose a user to drop.');
+  const ok2 = await confirmAction({ title: `Drop ${who}?`, ok: 'Drop User', word: who,
+    text: `Type ${who} to confirm. The login is removed from ${server.value}.` });
+  if (!ok2) return;
+  try {
+    await call('db-user-drop', [server.value, who, lastTyped]);
+    say(`Dropped ${who}.`);
+    loadDatabases();
+  } catch (err) { say('Could not drop the user: ' + errText(err)); }
+}
+
+// The row buttons for one database: take a user's access away, or drop the database.
+// One Actions cell holding several buttons, so each row has exactly one cell per header.
+function actionsCell(...buttons) {
+  const cell = el('span');
+  cell.style.display = 'inline-flex';
+  cell.style.gap = '8px';
+  cell.append(...buttons);
+  return cell;
+}
+
+function dbRowActions(d) {
+  const cell = el('span');
+  cell.style.display = 'inline-flex';
+  cell.style.gap = '8px';
+  cell.append(button('Remove Access', '', () => revokeAccess(d.container, d.name)),
+    ...publicButtons(d),
+    button('Drop', 'danger', () => dropDatabase(d.container, d.name)));
+  return cell;
+}
+
+// The postgres database can't be removed or emptied here, so its row only offers the public-connect buttons.
+function postgresRowActions(d) {
+  const cell = el('span');
+  cell.style.display = 'inline-flex';
+  cell.style.gap = '8px';
+  cell.append(...publicButtons(d));
+  return cell;
+}
+
+function publicButtons(d) {
+  return [button('Block Public Connect', '', () => blockPublicConnect(d.container, d.name)),
+    button('Allow Public Connect', '', () => allowPublicConnect(d.container, d.name))];
+}
+
+// Gives back the default CONNECT for PUBLIC on one database. Undoes Block Public Connect.
+async function allowPublicConnect(container, name) {
+  const ok = await confirmAction({ title: `Allow public connect to ${name}?`, ok: 'Allow Public Connect', word: name,
+    text: `Type ${name} to confirm. Every login can connect to ${name} on ${container} again by default. Table access still needs a grant.` });
+  if (!ok) return;
+  try {
+    await call('db-public-allow', [container, name, lastTyped]);
+    say(`Public connect to ${name} is allowed again.`);
+    loadDatabases();
+  } catch (err) { say('Could not allow public connect: ' + errText(err)); }
+}
+
+// Takes away the default CONNECT that PUBLIC has on one database. Nothing changes until the admin does this for
+// that database. Logins that were relying on the default can no longer connect; the owner still can.
+async function blockPublicConnect(container, name) {
+  const ok = await confirmAction({ title: `Block public connect to ${name}?`, ok: 'Block Public Connect', word: name,
+    text: `Type ${name} to confirm. Logins that connect through the default (not through a grant) lose the ability to connect to ${name} on ${container}. Check that no application depends on it first. Grant Access puts a login back.` });
+  if (!ok) return;
+  try {
+    await call('db-public-revoke', [container, name, lastTyped]);
+    say(`Public connect to ${name} is blocked.`);
+    loadDatabases();
+  } catch (err) { say('Could not block public connect: ' + errText(err)); }
+}
+
+// Takes every right one user has in one database. Two confirmations; the second needs the user's name typed in full.
+async function revokeAccess(container, name) {
+  let users;
+  try { users = arr((await call('db-pg-roles', [container])).users) || []; }
+  catch (err) { say('Could not read the users: ' + errText(err)); return; }
+  if (!users.length) { say(`No login users exist on ${container}.`); return; }
+  const user = dbSelect(users);
+  const extra = document.createElement('div');
+  extra.append(dbField(`User to remove access to ${name}`, user));
+  // The picker always shows: with warnings hidden, the user must still be chosen, not the first in the list.
+  const ok1 = await confirmAction({ title: `Remove access to ${name}?`, ok: 'Continue', extra,
+    text: 'Takes away every right this user has in this database, including rights for tables created later. The user keeps their login. The Hephaestus database and Hephaestus\'s own roles are refused.' });
+  if (!ok1) return;
+  const who = user.value;
+  const ok2 = await confirmAction({ title: `Remove ${who}'s access?`, ok: 'Remove Access', word: who,
+    text: `Type ${who} to confirm. ${who} loses access to ${name} on ${container}.` });
+  if (!ok2) return;
+  try {
+    await call('db-revoke', [container, name, who, lastTyped]);
+    say(`${who} no longer has access to ${name}.`);
+    offerSkipWarnings();
+  } catch (err) { say('Could not remove access: ' + errText(err)); }
+}
+
+// Every database inside each PostgreSQL container. Read-only.
+async function loadDatabaseList() {
+  let dl;
+  try { dl = await call('db-pg-databases'); }
+  catch (err) { $('db-pg-rows').replaceChildren(row(['Could not read databases: ' + errText(err), '', '', '', '', ''])); return; }
+  const list = arr(dl.databases) || [];
+  $('db-pg-rows').replaceChildren(...(list.length ? list.map((d) => d.error ? row([el('span', d.container, 'mono'), el('span', d.error, 'muted'), el('span'), el('span'), el('span'), el('span')]) : row([
+    el('span', d.container, 'mono'),
+    el('span', d.name, 'mono'),
+    el('span', d.owner, 'mono'),
+    el('span', (d.size_b / 1e6).toFixed(1) + ' MB', 'mono'),
+    el('span', d.connectable ? 'Yes' : 'No'),
+    d.name !== 'postgres' ? dbRowActions(d) : postgresRowActions(d),
+  ])) : [row(['No databases found.', '', '', '', '', ''])]));
+}
+
+// Every login user in each PostgreSQL container, with the databases it can connect to. Read-only.
+async function loadDatabaseUsers() {
+  let du;
+  try { du = await call('db-pg-users'); }
+  catch (err) { $('db-user-rows').replaceChildren(row(['Could not read users: ' + errText(err), '', '', ''])); return; }
+  const list = arr(du.users) || [];
+  $('db-user-rows').replaceChildren(...(list.length ? list.map((u) => u.error ? row([el('span', u.container, 'mono'), el('span', u.error, 'muted'), el('span'), el('span')]) : row([
+    el('span', u.container, 'mono'),
+    el('span', u.name, 'mono'),
+    el('span', u.owner ? 'Yes' : 'No'),
+    el('span', u.databases.length ? u.databases.join(', ') : 'None', u.databases.length ? 'mono' : 'muted'),
+  ])) : [row(['No users found.', '', '', ''])]));
+}
+
+// Two confirmations: the first says what happens, the second needs the database name typed in full.
+// The helper takes a fresh backup first and refuses the drop if that backup fails.
+async function dropDatabase(container, name) {
+  const ok1 = skipWarnings || await confirmAction({ title: `Drop ${name}?`, ok: 'Continue',
+    text: `This deletes ${name} on ${container}. A fresh backup is taken first. If that backup fails, nothing is dropped.` });
+  if (!ok1) return;
+  const ok2 = await confirmAction({ title: `Drop ${name} permanently?`, ok: 'Drop Database', word: name,
+    text: `Type ${name} to confirm. Anyone connected to it is disconnected, and the database is removed from the server.` });
+  if (!ok2) return;
+  try {
+    await call('db-drop', [container, name, lastTyped]);
+    say(`Dropped ${name}. A backup was taken first.`);
+    loadDatabases();
+    offerSkipWarnings();
+  } catch (err) { say('Could not drop the database: ' + errText(err)); }
+}
+
+// Restore one database from a whole-server backup. A live database is never overwritten: the copy gets a new name.
+async function restoreDatabase() {
+  if (!dbPgNames.length) return say('There is no PostgreSQL container to restore into.');
+  const server = dbSelect(dbPgNames), backup = dbSelect([]);
+  const fillBackups = async () => {
+    backup.replaceChildren();
+    try {
+      const files = arr((await call('db-backup-files', [server.value])).files) || [];
+      if (!files.length) { const o = document.createElement('option'); o.value = ''; o.textContent = 'No backups yet'; backup.append(o); }
+      for (const f of files) { const o = document.createElement('option'); o.value = f; o.textContent = f; backup.append(o); }
+    } catch (err) { say('Could not read the backups: ' + errText(err)); }
+  };
+  const dbs = dbSelect([]);
+  // The databases come from the chosen backup, so only databases that backup holds can be picked.
+  const fillDatabases = async () => {
+    dbs.replaceChildren();
+    if (!backup.value) return;
+    try {
+      const names = arr((await call('db-backup-databases', [server.value, backup.value])).databases) || [];
+      if (!names.length) { const o = document.createElement('option'); o.value = ''; o.textContent = 'No databases in this backup'; dbs.append(o); }
+      for (const n of names) { const o = document.createElement('option'); o.value = n; o.textContent = n; dbs.append(o); }
+    } catch (err) { say('Could not read the backup: ' + errText(err)); }
+  };
+  const refresh = async () => { await fillBackups(); await fillDatabases(); };
+  server.addEventListener('change', refresh);
+  backup.addEventListener('change', fillDatabases);
+  await refresh();
+  const extra = document.createElement('div');
+  extra.append(dbField('Container', server), dbField('Backup', backup), dbField('Database to restore', dbs));
+  const ok = await confirmAction({ title: 'Restore Database', ok: 'Continue', extra,
+    text: 'If the database still exists, a fresh backup of it is taken first, and the restore goes under a new name. The live database is not touched.' });
+  if (!ok) return;
+  const db = dbs.value, file = backup.value;
+  if (!db) return say('Choose the database to restore.');
+  if (!file) return say('There is no backup to restore from.');
+  const ok2 = await confirmAction({ title: `Restore ${db}?`, ok: 'Restore', word: db,
+    text: `Type ${db} to confirm the restore.` });
+  if (!ok2) return;
+  try {
+    const r = await call('db-restore', [server.value, db, file, lastTyped]);
+    say(`Restored to ${r.restored} from ${r.from}. ${r.tables} tables checked.`);
+    loadDatabases();
+  } catch (err) { say('Could not restore: ' + errText(err)); }
+}
+
+// --- database manager (PostgreSQL). Each action is one helper call; the helper does the checks and logs it.
+let dbPgNames = [];
+let dbToolsWired = false;
+// true: the first warning for drop and remove access is hidden (the stored choice; the typed-name step stays)
+let skipWarnings = false;
+
+function setWarningsLabel() {
+  $('db-warnings-toggle').textContent = skipWarnings ? 'Show Warnings' : 'Hide Warnings';
+}
+
+async function loadWarningsChoice() {
+  try { skipWarnings = !!(await call('db-choice-get')).skip_warnings; setWarningsLabel(); }
+  catch (err) { say('Could not read the warnings setting: ' + errText(err)); }
+}
+
+// Hiding or showing needs a fresh sign-in: the helper checks the SSH log for one in the last 5 minutes.
+async function toggleWarnings() {
+  const hide = !skipWarnings;
+  const ok = await confirmAction({ title: hide ? 'Hide the first warning?' : 'Show the first warning again?',
+    ok: hide ? 'Hide Warnings' : 'Show Warnings',
+    text: 'This needs a fresh sign-in. Disconnect from Argus, connect again, then come back here. Argus refuses the change if you have not signed in within the last 5 minutes.' });
+  if (!ok) return;
+  try {
+    await call('db-choice-set', [hide ? 'on' : 'off']);
+    skipWarnings = hide;
+    setWarningsLabel();
+    say(hide ? 'The first warning is hidden for drop and remove access. The typed-name confirmation stays.'
+             : 'The first warning is shown again.');
+  } catch (err) { say('Could not change the warning: ' + errText(err)); }
+}
+
+// After a drop or remove-access finishes, offer to hide the first warning from now on.
+async function offerSkipWarnings() {
+  if (skipWarnings) return;
+  const ok = await confirmAction({ title: 'Stop showing this warning?', ok: 'Yes, Hide It',
+    text: 'Hide the first warning for drop and remove access? The typed-name confirmation stays. This needs a fresh sign-in: Disconnect, connect again, then answer Yes.' });
+  if (!ok) return;
+  try {
+    await call('db-choice-set', ['on']);
+    skipWarnings = true;
+    setWarningsLabel();
+    say('The first warning is hidden for drop and remove access.');
+  } catch (err) { say('Could not hide the warning: ' + errText(err)); }
+}
+
+function dbInput(placeholder) {
+  const i = document.createElement('input');
+  i.type = 'text'; i.placeholder = placeholder; i.spellcheck = false; i.autocomplete = 'off';
+  return i;
+}
+
+function dbSelect(names) {
+  const s = document.createElement('select');
+  for (const n of names) { const o = document.createElement('option'); o.value = n; o.textContent = n; s.append(o); }
+  return s;
+}
+
+function dbField(label, input) {
+  const p = document.createElement('p');
+  const l = document.createElement('label');
+  l.append(label + ' ', input);
+  p.append(l);
+  return p;
+}
+
+function wireDatabaseTools() {
+  if (dbToolsWired) return;
+  dbToolsWired = true;
+  $('db-new-db').addEventListener('click', newDatabase);
+  $('db-new-user').addEventListener('click', newDatabaseUser);
+  $('db-restore-db').addEventListener('click', restoreDatabase);
+  $('db-warnings-toggle').addEventListener('click', toggleWarnings);
+  $('db-drop-user').addEventListener('click', dropUser);
+}
+
+async function newDatabase() {
+  if (!dbPgNames.length) return say('There is no PostgreSQL database container to create a database in.');
+  const server = dbSelect(dbPgNames), name = dbInput('new_database_name');
+  const extra = document.createElement('div');
+  extra.append(dbField('Container', server), dbField('Database name', name));
+  const ok = await confirmAction({ title: 'New Database', ok: 'Create Database', extra,
+    text: 'Creates an empty database. Nobody can connect to it until you grant access to it.' });
+  if (!ok) return;
+  try {
+    await call('db-create', [server.value, name.value.trim()]);
+    say(`Created ${name.value.trim()}.`);
+    loadDatabases();
+  } catch (err) { say('Could not create the database: ' + errText(err)); }
+}
+
+async function newDatabaseUser() {
+  if (!dbPgNames.length) return say('There is no PostgreSQL database container to add a user to.');
+  const server = dbSelect(dbPgNames), name = dbInput('new_user_name');
+  const extra = document.createElement('div');
+  extra.append(dbField('Container', server), dbField('User name', name));
+  const ok = await confirmAction({ title: 'New Database User', ok: 'Create User', extra,
+    text: 'Creates a login with no access yet, and a new password. The password is shown once and is not kept anywhere.' });
+  if (!ok) return;
+  try {
+    const r = await call('db-user-create', [server.value, name.value.trim()]);
+    await showOnce('New Database User Password', `For ${r.user}. Copy it now: it is not shown again. The user has no access to databases Argus made until you grant some. Databases Argus did not make, such as postgres, still let any login connect by default.`, r.password);
+  } catch (err) { say('Could not create the user: ' + errText(err)); }
+}
+
+async function grantAccess(container) {
+  let dbs, users;
+  try {
+    const dl = await call('db-pg-databases');
+    dbs = (arr(dl.databases) || []).filter((d) => d.container === container && !d.error && d.name !== 'postgres').map((d) => d.name);
+    users = arr((await call('db-pg-roles', [container])).users) || [];
+  } catch (err) { say('Could not read the databases and users: ' + errText(err)); return; }
+  if (!dbs.length) { say(`No database inside ${container} can be granted yet.`); return; }
+  if (!users.length) { say(`No login users exist on ${container} yet. Create one first.`); return; }
+  const db = dbSelect(dbs), user = dbSelect(users), level = dbSelect(['read', 'write']);
+  const extra = document.createElement('div');
+  extra.append(dbField('Database inside this server', db), dbField('User', user), dbField('Access', level));
+  const ok = await confirmAction({ title: `Grant Access on ${container}`, ok: 'Grant Access', extra,
+    text: 'Read lets the user see the data. Write also lets them change rows. Neither lets them create tables.' });
+  if (!ok) return;
+  try {
+    const r = await call('db-grant', [container, db.value.trim(), user.value.trim(), level.value]);
+    say(`${r.user} now has ${r.level} access to ${r.db}.`);
+  } catch (err) { say('Could not grant access: ' + errText(err)); }
 }
 
 // --- hephaestus
@@ -1230,6 +1829,22 @@ function drawMap(rows, server, route) {
   svg.replaceChildren(...parts);
 }
 
+// Severity: the helper ranks every address (Critical, High, Medium, Low) and
+// gives the rule behind each rank. Shown above the Addresses list.
+// Rank per address for the period on screen: null while ranking, a Map once done.
+let siRank = null, siRankFailed = false;
+const RANK_PILL = { Critical: 'bad', High: 'bad', Medium: 'warn', Low: 'unknown' };
+const RANK_ORDER = { Critical: 0, High: 1, Medium: 2, Low: 3 };   // Rank sorts Critical first
+async function loadSeverity(days, my) {
+  siRank = null; siRankFailed = false;
+  let d;
+  try { d = await call('attack-groups', [days]); }
+  catch (err) { if (my === siSeq) { siRank = new Map(); siRankFailed = true; renderSiRows(); } return; }
+  if (my !== siSeq) return;
+  siRank = new Map(d.rows.map((r) => [r.ip, r]));
+  renderSiRows();
+}
+
 // resort: the same period again in a new order. Details, a route being traced
 // and the block list stay as they are.
 async function loadSignins({ resort = false } = {}) {
@@ -1242,9 +1857,9 @@ async function loadSignins({ resort = false } = {}) {
     loadBlocked();
   }
   $('si-summary').textContent = 'Reading the server logs…';
-  $('si-rows').replaceChildren(row([el('span', 'Loading…', 'muted'), '', '', '', '', '', '', '']));
+  $('si-rows').replaceChildren(row([el('span', 'Loading…', 'muted'), '', '', '', '', '', '', '', '']));
   let d;
-  try { d = await call('attacks', siSort ? [days, siSort.key, siSort.dir === 1 ? 'asc' : 'desc'] : [days]); }
+  try { d = await call('attacks', siSort && siSort.key !== 'rank' ? [days, siSort.key, siSort.dir === 1 ? 'asc' : 'desc'] : [days]); }
   catch (err) { if (my === siSeq) { siData = null; $('si-summary').textContent = 'Could not read the sign-in logs: ' + errText(err); $('si-rows').replaceChildren(); } return; }
   if (my !== siSeq) return;                  // a newer request has been made since
   siData = d;
@@ -1260,6 +1875,7 @@ async function loadSignins({ resort = false } = {}) {
     : d.sort ? `First ${d.rows.length} of ${t.addresses.toLocaleString()} by ${sortName} (${d.sort.dir === 'asc' ? 'ascending' : 'descending'})${t.key_ok ? ', plus any that used your key' : ''}, shown here and on the map`
     : `Top ${d.rows.length} of ${t.addresses.toLocaleString()} shown here and on the map (your key used and signed-in addresses first, then the busiest)`;
   drawMap(d.rows, d.server, null);
+  loadSeverity(days, my);
   renderSiRows();
 }
 
@@ -1283,6 +1899,7 @@ const SI_SORTS = {
   visits: { first: -1, val: (r) => [r.visits || 0, r.days || 0] },
   users: { first: 1, val: (r) => (r.users?.[0] || '').toLowerCase() },
   last: { first: -1, val: (r) => r.last || 0 },
+  rank: { first: 1, val: (r) => RANK_ORDER[siRank?.get(r.ip)?.rank] ?? 4 },   // sorted here, never sent to the server
 };
 function cmp(a, b) {
   if (Array.isArray(a)) { for (let i = 0; i < a.length; i++) { const c = cmp(a[i], b[i]); if (c) return c; } return 0; }
@@ -1306,7 +1923,7 @@ function setSiSort(key) {
   else siSort = null;                        // third click: back to the server's order
   sayHowSorted();
   showSortState();
-  if (!siData || siData.rows.length < siData.total.addresses) loadSignins({ resort: true });
+  if (key !== 'rank' && (!siData || siData.rows.length < siData.total.addresses)) loadSignins({ resort: true });
   else renderSiRows();
 }
 function sayHowSorted() {
@@ -1345,11 +1962,14 @@ function renderSiRows() {
     if (r.blocked) vis.append(el('span', 'Blocked', 'pill bad'));
     if (r.signed_in) vis.append(el('span', 'Has Signed In', 'pill unknown'));
     if (r.key_ok) vis.append(el('span', 'Used Your SSH Key', 'pill bad'));
-    return row([el('span', r.ip, 'mono'), placeText(r), el('span', r.network || '', 'small'), tries, vis,
+    const ranked = siRank && siRank.get(r.ip);
+    const rank = ranked ? el('span', ranked.rank, 'pill ' + RANK_PILL[ranked.rank]) : el('span', siRankFailed ? 'Not ranked' : (siRank ? '—' : 'Ranking…'), 'muted small');
+    if (ranked) rank.title = ranked.reason;                // the rule that set the rank
+    return row([rank, el('span', r.ip, 'mono'), placeText(r), el('span', r.network || '', 'small'), tries, vis,
       el('span', (r.users || []).join(', '), 'mono small'), el('span', new Date(r.last * 1000).toLocaleString(), 'small'),
       button('Details', '', () => showAddress(r))]);
   }));
-  if (!d.rows.length) $('si-rows').replaceChildren(row([el('span', 'No refused sign-ins in this period.', 'muted'), '', '', '', '', '', '', '']));
+  if (!d.rows.length) $('si-rows').replaceChildren(row([el('span', 'No refused sign-ins in this period.', 'muted'), '', '', '', '', '', '', '', '']));
 }
 
 let detailSeq = 0, detailRow = null;
@@ -1530,10 +2150,12 @@ $('si-refresh').addEventListener('click', () => loadSignins());
 $('bl-add').addEventListener('click', () => blockByHand());
 
 // ---------- collapsible sections (remembered on this PC) ----------
-for (const sec of document.querySelectorAll('[data-collapse]')) {
+// A section marked data-collapse="name" gets a Hide/Show button (data-toggle).
+// Sections built later (the Backups cards) call setupCollapse as they are made.
+function setupCollapse(sec) {
   const key = 'argus-collapse-' + sec.dataset.collapse;
   const btn = sec.querySelector('[data-toggle]');
-  if (!btn) continue;
+  if (!btn) return;
   const set = (hidden) => {
     sec.classList.toggle('collapsed', hidden);
     btn.textContent = hidden ? 'Show' : 'Hide';
@@ -1545,6 +2167,7 @@ for (const sec of document.querySelectorAll('[data-collapse]')) {
   set(start);
   btn.addEventListener('click', () => set(!sec.classList.contains('collapsed')));
 }
+for (const sec of document.querySelectorAll('[data-collapse]')) setupCollapse(sec);
 
 // ---------- websites ----------
 const KIND_TEXT = { site: 'Website', app: 'App on the server', redirect: 'Redirect', other: 'Other' };
@@ -2155,7 +2778,8 @@ async function showPreview(side, e) {
 
 function fileRow(e, side) {
   const r = el('div', null, 'frow');
-  r.draggable = e.kind === 'file';
+  // Files can always be dragged; on the server, folders can be dragged too (to move them).
+  r.draggable = e.kind === 'file' || (side === srv && e.kind === 'dir');
   const name = el('span', e.name, 'fname' + (e.kind === 'dir' ? ' dir' : ''));
   const meta = el('span', e.kind === 'file' ? sizeText(e.size) : e.kind === 'link' ? 'link' : '', 'meta');
   r.append(name, meta);
@@ -2166,10 +2790,170 @@ function fileRow(e, side) {
     if (e.kind === 'dir' || (side === srv && e.kind === 'link')) navigate(side, childPath(side, e.name));
   });
   r.addEventListener('dragstart', (ev) => {
-    ev.dataTransfer.setData('application/x-argus', JSON.stringify({ from: side === pc ? 'pc' : 'srv', name: e.name, path: childPath(side, e.name) }));
-    ev.dataTransfer.effectAllowed = 'copy';
+    ev.dataTransfer.setData('application/x-argus', JSON.stringify({ from: side === pc ? 'pc' : 'srv', name: e.name, kind: e.kind, path: childPath(side, e.name) }));
+    ev.dataTransfer.effectAllowed = side === srv ? 'copyMove' : 'copy';
   });
+  if (side === srv) {
+    // Right-click: move or rename this item.
+    r.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      select(side, e, r);
+      showContextMenu(ev.clientX, ev.clientY, [
+        { label: 'Move to…', onClick: () => moveToDialog(e) },
+        { label: 'Rename…', onClick: () => renameItem(e) },
+      ]);
+    });
+    // A folder is a drop target: dropping a server item onto it moves it inside.
+    if (e.kind === 'dir') {
+      r.addEventListener('dragover', (ev) => {
+        if (![...ev.dataTransfer.types].includes('application/x-argus')) return;
+        ev.preventDefault(); ev.stopPropagation();
+        ev.dataTransfer.dropEffect = 'move';
+        r.classList.add('dropinto');
+      });
+      r.addEventListener('dragleave', () => r.classList.remove('dropinto'));
+      r.addEventListener('drop', async (ev) => {
+        r.classList.remove('dropinto');
+        const raw = ev.dataTransfer.getData('application/x-argus');
+        if (!raw) return;                               // external files: let the pane upload them
+        let d; try { d = JSON.parse(raw); } catch { return; }
+        if (d.from !== 'srv') return;                   // PC -> server: bubble to the pane's upload
+        ev.preventDefault(); ev.stopPropagation();      // only now claim it for a server-side move
+        const destDir = childPath(srv, e.name);
+        if (d.path === destDir) return;                 // dropped onto itself: nothing to do
+        await moveItem(srv.path, { name: d.name, kind: d.kind }, destDir, d.name);
+      });
+    }
+  }
   return r;
+}
+
+// ---------- right-click menu ----------
+let ctxMenuEl = null;
+function closeContextMenu() {
+  if (!ctxMenuEl) return;
+  ctxMenuEl.remove();
+  ctxMenuEl = null;
+  document.removeEventListener('mousedown', onDocMenuDismiss, true);
+  document.removeEventListener('keydown', onMenuKey, true);
+  window.removeEventListener('blur', closeContextMenu);
+}
+function onDocMenuDismiss(ev) { if (ctxMenuEl && !ctxMenuEl.contains(ev.target)) closeContextMenu(); }
+function onMenuKey(ev) { if (ev.key === 'Escape') closeContextMenu(); }
+function showContextMenu(x, y, items) {
+  closeContextMenu();
+  const m = el('div', null, 'ctxmenu');
+  for (const it of items) {
+    const b = el('button', it.label, 'ctxitem');
+    b.type = 'button';
+    if (it.disabled) b.disabled = true;
+    else b.addEventListener('click', () => { closeContextMenu(); it.onClick(); });
+    m.append(b);
+  }
+  m.style.left = x + 'px';
+  m.style.top = y + 'px';
+  document.body.append(m);
+  ctxMenuEl = m;
+  // Keep it on screen.
+  const box = m.getBoundingClientRect();
+  if (box.right > window.innerWidth) m.style.left = Math.max(0, window.innerWidth - box.width - 4) + 'px';
+  if (box.bottom > window.innerHeight) m.style.top = Math.max(0, window.innerHeight - box.height - 4) + 'px';
+  // Added next tick so the opening click/right-click doesn't immediately dismiss it.
+  setTimeout(() => {
+    if (!ctxMenuEl) return;
+    document.addEventListener('mousedown', onDocMenuDismiss, true);
+    document.addEventListener('keydown', onMenuKey, true);
+    window.addEventListener('blur', closeContextMenu);
+  }, 0);
+}
+
+// ---------- move / rename ----------
+// Move or rename a server item. destDir === srcDir with a new name is a rename.
+async function moveItem(srcDir, entry, destDir, newName) {
+  if (destDir === srcDir && newName === entry.name) return;
+  // Warn if the item serves a web share: moving it changes what that share shows.
+  let shares = [];
+  try { shares = (await window.argus.filesShares(srcDir, entry.name)).shares || []; } catch { shares = []; }
+  if (shares.length) {
+    const renaming = destDir === srcDir;
+    const ok = await confirmAction({ title: `${renaming ? 'Rename' : 'Move'} ${entry.name}?`,
+      text: `${entry.name} serves: ${shares.join(', ')}. ${renaming ? 'Renaming' : 'Moving'} it changes what those show right away.`,
+      ok: renaming ? 'Rename It' : 'Move It' });
+    if (!ok) { say(''); return; }
+  }
+  const run = (replace) => window.argus.filesMove(srcDir, entry.name, destDir, newName, replace);
+  try {
+    await run(false);
+  } catch (err) {
+    const m = errText(err);
+    if (/already there/i.test(m)) {
+      if (entry.kind !== 'file') { say(`Could not move ${entry.name}: ${m}`); return; }
+      const ok = await confirmAction({ title: `Replace ${newName}?`,
+        text: `${destDir} already has a file called ${newName}. Its old copy is kept in the server backups first.`, ok: 'Replace' });
+      if (!ok) { say(''); return; }
+      try { await run(true); } catch (e2) { say(`Could not move ${entry.name}: ` + errText(e2)); return; }
+    } else {
+      say(`Could not move ${entry.name}: ` + m);
+      return;
+    }
+  }
+  say(destDir === srcDir ? `Renamed to ${newName}.` : `Moved ${entry.name}.`);
+  await navigate(srv, srv.path);
+}
+
+async function moveToDialog(entry) {
+  const dest = await pickFolder(srv.path, `Move ${entry.name} to…`);
+  if (dest == null) return;
+  await moveItem(srv.path, entry, dest, entry.name);
+}
+
+async function renameItem(entry) {
+  const newName = await ask({ title: `Rename ${entry.name}`, label: 'New name', ok: 'Rename' });
+  if (!newName || newName === entry.name) return;
+  await moveItem(srv.path, entry, srv.path, newName);
+}
+
+// A navigable picker for a destination folder on the server. Resolves to the
+// chosen folder path, or null if cancelled.
+function pickFolder(startPath, title) {
+  return new Promise((resolve) => {
+    const dlg = document.createElement('dialog');
+    dlg.className = 'pickfolder';
+    let cur = startPath;
+    const h = el('h3', title || 'Move to…');
+    const pathLine = el('div', startPath, 'pickfolder-path mono');
+    const list = el('div', null, 'pickfolder-list');
+    const note = el('div', '', 'muted small');
+    const upBtn = button('Up', '', () => load(parentOf(cur)));
+    const okBtn = button('Move Here', 'primary', () => { dlg.returnValue = 'ok'; dlg.close(); });
+    const cancelBtn = button('Cancel', '', () => { dlg.returnValue = 'cancel'; dlg.close(); });
+    function parentOf(p) { return p === '/' ? '/' : (p.replace(/\/[^/]+$/, '') || '/'); }
+    async function load(p) {
+      note.textContent = 'Loading…';
+      try {
+        const r = await window.argus.filesList(p);
+        cur = r.path;
+        pathLine.textContent = r.path;
+        note.textContent = '';
+        const dirs = (r.entries || []).filter((x) => x.kind === 'dir');
+        list.replaceChildren(...(dirs.length ? dirs.map((x) => {
+          const b = el('div', x.name, 'pickfolder-row');
+          b.addEventListener('click', () => load((r.path === '/' ? '' : r.path) + '/' + x.name));
+          return b;
+        }) : [el('div', '(no subfolders here)', 'muted small')]));
+      } catch (e) { note.textContent = errText(e); }
+    }
+    dlg.onclose = () => { resolve(dlg.returnValue === 'ok' ? cur : null); dlg.remove(); };
+    const bar = el('div', null, 'pickfolder-bar');
+    bar.append(upBtn, okBtn, cancelBtn);
+    const body = el('div', null, 'pickfolder-body');
+    body.append(h, pathLine, list, note, bar);
+    dlg.append(body);
+    document.body.append(dlg);
+    dlg.returnValue = 'cancel';
+    dlg.showModal();
+    load(startPath);
+  });
 }
 
 function childPath(side, name) {
@@ -2185,8 +2969,9 @@ function select(side, e, row) {
   showPreview(side, e);
 }
 function updateFileButtons() {
-  $('do-upload').disabled = !(pc.sel && pc.sel.kind === 'file');
+  $('do-upload').disabled = !(pc.sel && (pc.sel.kind === 'file' || pc.sel.kind === 'dir'));
   $('do-download').disabled = !(srv.sel && srv.sel.kind === 'file' && pc.path);
+  $('do-delete').disabled = !srv.sel;
   $('pc-sel').textContent = pc.sel ? pc.sel.name : '';
   $('srv-sel').textContent = srv.sel ? srv.sel.name : '';
 }
@@ -2233,17 +3018,141 @@ async function openFiles() {
 
 $('pc-up').addEventListener('click', () => { if (pc.path) navigate(pc, pc.parent ?? ''); });
 $('srv-up').addEventListener('click', () => { if (srv.path !== '/') navigate(srv, srv.path.replace(/\/[^/]+$/, '') || '/'); });
+$('pc-reload').addEventListener('click', () => navigate(pc, pc.path ?? ''));
+$('srv-reload').addEventListener('click', () => navigate(srv, srv.path));
+
+// Dropping a server item onto "Up" moves it to the parent folder.
+(() => {
+  const up = $('srv-up');
+  up.addEventListener('dragover', (ev) => {
+    if (srv.path === '/' || ![...ev.dataTransfer.types].includes('application/x-argus')) return;
+    ev.preventDefault(); ev.stopPropagation();
+    ev.dataTransfer.dropEffect = 'move';
+    up.classList.add('dropinto');
+  });
+  up.addEventListener('dragleave', () => up.classList.remove('dropinto'));
+  up.addEventListener('drop', async (ev) => {
+    up.classList.remove('dropinto');
+    const raw = ev.dataTransfer.getData('application/x-argus');
+    if (!raw) return;                                   // external files: let the pane upload them
+    let d; try { d = JSON.parse(raw); } catch { return; }
+    if (d.from !== 'srv' || srv.path === '/') return;   // PC -> server: bubble to the pane's upload
+    ev.preventDefault(); ev.stopPropagation();
+    const parent = srv.path.replace(/\/[^/]+$/, '') || '/';
+    if (parent === srv.path) return;
+    await moveItem(srv.path, { name: d.name, kind: d.kind }, parent, d.name);
+  });
+})();
+
+// ---------- delete (moves to the server's trash) and the trash ----------
+$('do-delete').addEventListener('click', async () => {
+  if (!srv.sel) return;
+  const name = srv.sel.name;
+  let shares = [];
+  try { shares = (await window.argus.filesShares(srv.path, name)).shares || []; } catch (err) { shares = []; }
+  const shareNote = shares.length
+    ? ` Served from it: ${shares.join(', ')}. Those shares lose these files as soon as it moves.` : '';
+  const ok = await confirmAction({ title: `Move ${name} to the Trash?`,
+    text: `${name} is moved to the trash on the server. It stays there until you delete it for good. A folder goes with everything inside it.${shareNote}`,
+    ok: 'Move to Trash' });
+  if (!ok) return;
+  try {
+    await window.argus.filesDelete(srv.path, name);
+    say(`${name} is in the trash.`);
+    await navigate(srv, srv.path);
+  } catch (err) { say(`Could not move ${name} to the trash: ` + errText(err)); }
+});
+
+async function loadTrashRows() {
+  $('trash-rows').replaceChildren(row(['Loading…', '', '', '', '']));
+  let items = [];
+  try { items = (await window.argus.trashList()).items || []; }
+  catch (err) { $('trash-rows').replaceChildren(row(['Could not read the trash: ' + errText(err), '', '', '', ''])); $('trash-empty').disabled = true; return; }
+  $('trash-empty').disabled = items.length === 0;
+  $('trash-rows').replaceChildren(...(items.length ? items.map((it) => row([
+    el('span', it.name, 'mono'),
+    el('span', it.original, 'mono muted small'),
+    el('span', it.kind === 'folder' ? 'Folder' : 'File'),
+    el('span', (it.size_b / 1e3).toFixed(1) + ' KB', 'mono'),
+    trashActions(it),
+  ])) : [row(['The trash is empty.', '', '', '', ''])]));
+}
+
+function trashDeleteButton(it) {
+  return button('Delete for Good', 'danger', async () => {
+    const ok = await confirmAction({ title: `Delete ${it.name} for Good?`,
+      text: 'It is removed from the server and cannot be recovered.', ok: 'Delete for Good', word: 'delete' });
+    if (!ok) return;
+    try { await window.argus.trashDelete(it.id); say(`${it.name} was deleted for good.`); }
+    catch (err) { say(`Could not delete ${it.name}: ` + errText(err)); }
+    loadTrashRows();
+  });
+}
+
+// Restore puts a trashed item back where it came from. If the spot is free it
+// just moves back; if it's taken the server reports a conflict so we can ask,
+// and only replaces a plain file after confirmation (keeping a backup first).
+async function restoreItem(it) {
+  let r;
+  try { r = await window.argus.trashRestore(it.id, false); }
+  catch (err) { say(`Could not restore ${it.name}: ` + errText(err)); return; }
+  // The spot is taken: either refuse (a folder is in the way) or offer to replace.
+  if (r && r.conflict) {
+    if (!r.replaceable) {
+      say(`Can't restore ${it.name}: ${r.dest} is already taken by a folder (or the trashed item is a folder). Move or rename what's there first.`);
+      return;
+    }
+    const newer = r.newer ? ' The one there is newer than the copy in the trash.' : '';
+    const ok = await confirmAction({ title: `Replace ${it.name}?`,
+      text: `There is already something named ${it.name} at ${r.dest}.${newer} Replacing it keeps a backup of the current file first. Replace it?`,
+      ok: 'Replace' });
+    if (!ok) { say(''); return; }
+    try { r = await window.argus.trashRestore(it.id, true); }
+    catch (err) { say(`Could not restore ${it.name}: ` + errText(err)); return; }
+  }
+  say(`${it.name} restored to ${r.restored}.${r.backup ? ' The file that was there was backed up first.' : ''}`);
+  loadTrashRows();
+  try { if (srv.path) await navigate(srv, srv.path); } catch { /* the trash view is what matters */ }
+}
+function restoreButton(it) {
+  return button('Restore', '', () => restoreItem(it));
+}
+function trashActions(it) {
+  const wrap = el('span', null, 'trash-actions');
+  wrap.append(restoreButton(it), trashDeleteButton(it));
+  return wrap;
+}
+
+function openTrash() {
+  $('trash-dlg').showModal();
+  loadTrashRows();
+}
+$('srv-trash').addEventListener('click', openTrash);
+$('trash-empty').addEventListener('click', async () => {
+  const ok = await confirmAction({ title: 'Empty the Trash?',
+    text: 'Everything in the trash is deleted for good and cannot be recovered.', ok: 'Empty Trash', word: 'empty' });
+  if (!ok) return;
+  let done = 0;
+  try {
+    const items = (await window.argus.trashList()).items || [];
+    for (const it of items) { await window.argus.trashDelete(it.id); done++; }
+    say(`The trash was emptied (${done} ${done === 1 ? 'item' : 'items'}).`);
+  } catch (err) { say(`Removed ${done} before an error. Could not empty the trash: ` + errText(err)); }
+  loadTrashRows();
+});
 $('pc-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') navigate(pc, $('pc-path').value.trim()); });
 $('srv-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') navigate(srv, $('srv-path').value.trim()); });
 
 async function upload(localPath, name) {
   const dir = srv.path; // the folder on screen when the upload started
   let plan, local;
-  try {
-    local = await window.argus.localStat(localPath);
-    if (local.kind !== 'file') { say(`${name} is a folder; only files can be uploaded for now.`); return; }
-    plan = await window.argus.filesPlan(dir, name);
-  } catch (err) { say('Cannot upload: ' + errText(err)); return; }
+  // Each step says so by name, so a refusal is not just 'cannot upload'.
+  try { local = await window.argus.localStat(localPath); }
+  catch (err) { say(`Cannot read ${name} on this PC: ` + errText(err)); return; }
+  if (local.kind === 'dir') { await uploadMany([localPath]); return; }
+  if (local.kind !== 'file') { say(`${name} is not an ordinary file.`); return; }
+  try { plan = await window.argus.filesPlan(dir, name); }
+  catch (err) { say(`Cannot upload ${name} to ${dir}: ` + errText(err)); return; }
 
   const box = el('div');
   // Side by side: what is on the server now, and what will replace it.
@@ -2290,6 +3199,135 @@ async function upload(localPath, name) {
   } catch (err) { say(`Upload of ${name} failed: ` + errText(err)); }
 }
 
+// A folder, or several things at once. Everything inside is looked over
+// first so one confirmation can describe the whole batch, and then it runs
+// with a progress bar instead of a question per file.
+async function uploadMany(localPaths) {
+  const dir = srv.path; // the folder on screen when the upload started
+  let scan;
+  say('Looking over what is being uploaded…');
+  try { scan = await window.argus.uploadScan(localPaths.slice(), dir); }
+  catch (err) {
+    const t = errText(err);
+    // The window and the main process are updated separately; 'bad input' can
+    // only come from a main process older than this window.
+    say(t === 'bad input'
+      ? 'Argus needs a full restart: the window has the new upload code and the rest of the app does not. Exit and open it again.'
+      : `Cannot work out what to upload into ${dir || '(no folder open)'}: ` + t);
+    return;
+  }
+  if (!scan.count) {
+    say(scan.skippedCount ? `Nothing to upload: ${scan.skipped[0].name} ${scan.skipped[0].why}.` : 'There are no files to upload.');
+    return;
+  }
+
+  const box = el('div');
+  const dl = el('dl', null, 'plan up-summary');
+  const add = (k, v) => dl.append(el('dt', k), el('dd', v));
+  add('Files', `${scan.count} (${sizeText(scan.bytes)})`);
+  if (scan.folders) add('New folders', String(scan.folders));
+  add('Into', scan.dir);
+  if (scan.owner) add('Owner', `${scan.owner}:${scan.group}`);
+  add('Permissions', 'set for each file from the folder it goes into');
+  if (scan.replacing) add('Already there', `${scan.replacing} of them; a copy of each is kept in /var/backups/argus first`);
+  box.append(dl);
+
+  // One choice for the whole batch, rather than a question per file.
+  let mode = 'skip';
+  if (scan.replacing) {
+    const fs_ = el('fieldset', null, 'up-choice');
+    fs_.append(el('legend', `The ${scan.replacing} already on the server`));
+    for (const [value, label] of [['skip', 'Leave them alone and upload the rest'], ['replace', 'Replace them (the old copy is backed up)']]) {
+      const lab = el('label');
+      const r = el('input');
+      r.type = 'radio'; r.name = 'up-mode'; r.value = value; r.checked = value === mode;
+      r.addEventListener('change', () => { if (r.checked) mode = value; });
+      lab.append(r, el('span', ' ' + label));
+      fs_.append(lab);
+    }
+    box.append(fs_);
+  }
+  if (scan.capped) box.append(el('p', `Only the first ${scan.count} files are included; upload the rest separately.`, 'warn-text'));
+  if (scan.skippedCount) {
+    const d = el('details');
+    d.append(el('summary', `${scan.skippedCount} left out`));
+    const ul = el('ul');
+    for (const sk of scan.skipped) ul.append(el('li', `${sk.name} — ${sk.why}`));
+    if (scan.skippedCount > scan.skipped.length) ul.append(el('li', `…and ${scan.skippedCount - scan.skipped.length} more`));
+    d.append(ul);
+    box.append(d);
+  }
+  if (scan.publicWeb) box.append(el('p', 'This folder is served by a website: anyone will be able to see these files.', 'warn-text'));
+
+  const ok = await confirmAction({
+    title: `Upload ${scan.count} ${scan.count === 1 ? 'file' : 'files'}?`,
+    text: scan.folders ? 'The folders are created on the server and the files copied into them.' : 'The files are copied to the server.',
+    ok: 'Upload',
+    extra: box,
+    wide: true,
+  });
+  if (!ok) { say('Upload cancelled.'); return; }
+  await runUpload(mode, dir, scan);
+}
+
+function showUploadProgress(p) {
+  const total = p.total || 1;
+  $('up-bar').value = Math.round((p.done / total) * 1000);
+  $('up-prog-title').textContent = p.cancelled ? 'Stopping after this file…' : 'Uploading…';
+  const bits = [`${p.done} of ${p.total}`, `${sizeText(p.bytesDone)} of ${sizeText(p.bytesTotal)}`];
+  if (p.current) bits.push(p.current);
+  if (p.failureCount) bits.push(`${p.failureCount} failed`);
+  $('up-prog-text').textContent = bits.join(' · ');
+}
+
+async function runUpload(mode, dir, scan) {
+  const panel = $('up-prog');
+  const cancel = $('up-cancel');
+  $('up-fail').replaceChildren();
+  $('up-fail').hidden = true;
+  cancel.textContent = 'Cancel';
+  showUploadProgress({ total: scan.count, done: 0, bytesTotal: scan.bytes, bytesDone: 0, current: '', failureCount: 0 });
+  panel.hidden = false;
+  cancel.disabled = false;
+  cancel.onclick = async () => { cancel.disabled = true; await window.argus.uploadCancel(); };
+  say(`Uploading ${scan.count} files…`);
+  // There is no push channel from the main process, so progress is polled,
+  // the same way a running job is watched elsewhere in this window.
+  const poll = setInterval(async () => {
+    try { const p = await window.argus.uploadProgress(); if (p && !p.finished) showUploadProgress(p); } catch { /* the run itself reports */ }
+  }, 400);
+  let r;
+  try { r = await window.argus.uploadRun(mode); }
+  catch (err) { clearInterval(poll); panel.hidden = true; cancel.onclick = null; say('Upload failed: ' + errText(err)); return; }
+  clearInterval(poll);
+  panel.hidden = true;
+  cancel.onclick = null;
+
+  const parts = [];
+  parts.push(`${r.uploaded} of ${r.total} uploaded`);
+  if (r.replaced) parts.push(`${r.replaced} replaced (old copies in /var/backups/argus)`);
+  if (r.left) parts.push(`${r.left} already there and left alone`);
+  if (r.failureCount) parts.push(`${r.failureCount} failed`);
+  if (r.cancelled) parts.push('stopped early');
+  say(parts.join('; ') + '.');
+  // What failed stays on screen until it is dismissed, rather than going by
+  // in a message line.
+  if (r.failureCount) {
+    const ul = el('ul');
+    for (const f of r.failures) ul.append(el('li', `${f.name} — ${f.why}`));
+    if (r.failureCount > r.failures.length) ul.append(el('li', `…and ${r.failureCount - r.failures.length} more`));
+    $('up-fail').replaceChildren(ul);
+    $('up-fail').hidden = false;
+    $('up-prog-title').textContent = `${r.failureCount} of ${r.total} did not upload`;
+    $('up-prog-text').textContent = parts.join('; ') + '.';
+    cancel.textContent = 'Close';
+    cancel.disabled = false;
+    cancel.onclick = () => { panel.hidden = true; cancel.textContent = 'Cancel'; cancel.onclick = null; };
+    panel.hidden = false;
+  }
+  if (srv.path === dir) await navigate(srv, dir);
+}
+
 async function download(remotePath, name) {
   if (!pc.path) { say('Choose a folder on this PC first.'); return; }
   say(`Downloading ${name}…`);
@@ -2333,10 +3371,28 @@ for (const [paneId, side] of [['pane-pc', pc], ['pane-srv', srv]]) {
       return;
     }
     if (side === srv) {
-      for (const f of e.dataTransfer.files) {
-        const p = window.argus.pathForFile(f);
-        if (p) await upload(p, f.name);
+      // Read before anything is awaited: the drop's own data does not survive
+      // the first await. `items` says which of them are folders, which
+      // `files` alone does not, so a dropped folder stays one folder here
+      // instead of arriving as everything inside it.
+      const dropped = [];
+      const items = e.dataTransfer.items ? [...e.dataTransfer.items] : [];
+      const entries = items.map((it) => (it.kind === 'file' && it.webkitGetAsEntry ? it.webkitGetAsEntry() : null));
+      if (entries.some(Boolean)) {
+        items.forEach((it, i) => {
+          if (it.kind !== 'file') return;
+          const f = it.getAsFile();
+          const p = f && window.argus.pathForFile(f);
+          if (p) dropped.push([p, (entries[i] && entries[i].name) || f.name]);
+        });
+      } else {
+        for (const f of e.dataTransfer.files) {
+          const p = window.argus.pathForFile(f);
+          if (p) dropped.push([p, f.name]);
+        }
       }
+      if (dropped.length === 1) await upload(dropped[0][0], dropped[0][1]);
+      else if (dropped.length) await uploadMany(dropped.map(([p]) => p));
     }
   });
 }
@@ -2356,9 +3412,17 @@ $('app-exit').addEventListener('click', async () => {
 async function enterDashboard() {
   stop();
   show('dash');
-  $('conn-detail').textContent = (await window.argus.label()) + ' · key and code · server key matched';
-  await refresh();
+  // Arm polling and the 30-minute idle lock BEFORE any fallible await, so a session is never
+  // left running with no idle bound if setup below throws.
   timer = setInterval(refresh, REFRESH_MS);
+  armIdleLock();
+  try {
+    $('conn-detail').textContent = (await window.argus.label()) + ' · key and code · server key matched';
+    await refresh();
+  } catch (err) {
+    // Session is up but the dashboard could not load: tear it down rather than orphan it.
+    await teardownToSignIn('Could not load the dashboard: ' + clean(err) + ' Sign in again.');
+  }
 }
 
 // ---------- start ----------

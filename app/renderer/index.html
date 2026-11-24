@@ -11,20 +11,15 @@
 <div class="shell">
   <nav class="side" aria-label="Sections">
     <div class="brand">
-      <img class="brand-mark" src="assets/argus-mark.png" width="34" height="34" alt="">
+      <img class="brand-mark" src="assets/argus-mark.png" width="43" height="43" alt="">
       <div><div class="brand-name">Argus</div><div class="brand-sub">Black Sheep Server</div></div>
     </div>
-    <button class="nav current" type="button" data-view="dashboard" aria-current="page">Dashboard</button>
-    <button class="nav" type="button" data-view="server">Server</button>
-    <button class="nav" type="button" data-view="web">Websites</button>
-    <button class="nav" type="button" data-view="mail">Mail</button>
-    <button class="nav" type="button" data-view="accounts">Accounts</button>
-    <button class="nav" type="button" data-view="signins">Sign-In Attempts</button>
-    <button class="nav" type="button" data-view="hephaestus">Hephaestus</button>
-    <button class="nav" type="button" data-view="backups">Backups</button>
-    <button class="nav" type="button" data-view="files">Files</button>
-    <button class="nav" type="button" data-view="terminal">Terminal</button>
-    <button class="nav" type="button" data-view="activity">Activity Log</button>
+    <button class="nav current" type="button" data-group="overview" aria-current="page">Overview</button>
+    <button class="nav" type="button" data-group="server">Server</button>
+    <button class="nav" type="button" data-group="web">Websites</button>
+    <button class="nav" type="button" data-group="mail">Mail</button>
+    <button class="nav" type="button" data-group="hephaestus">Hephaestus</button>
+    <button class="nav" type="button" data-group="tools">Tools</button>
     <div class="side-foot">
       <div class="app-ctl" role="group" aria-label="Argus">
         <button class="ctl" type="button" id="app-reload" title="Redraw the screen; you stay signed in">Reload</button>
@@ -74,7 +69,13 @@
         <strong id="attention-title"></strong>
         <ul id="attention-list"></ul>
       </section>
+      <section id="helper-update" class="attention" aria-label="New server helper" hidden>
+        <strong>A new server helper is ready to install</strong>
+        <p id="helper-update-text"></p>
+        <button class="btn primary" id="helper-update-install" type="button">Install Helper</button>
+      </section>
       <p id="dash-msg" class="msg" role="alert"></p>
+      <nav class="subtabs" id="subtabs" aria-label="Pages in this area" hidden></nav>
       <div id="view-dashboard" class="view"><div id="tiles" class="tiles"></div></div>
 
       <div id="view-server" class="view" hidden>
@@ -87,30 +88,60 @@
             <p class="muted small" id="svc-checked"></p>
           </section>
           <section class="card">
-            <h3>Updates</h3>
-            <h4>System Packages</h4>
-            <div id="upd-list"></div>
-            <button class="btn primary" type="button" id="upd-apply">Apply Updates</button>
-            <div id="upd-job" class="job" hidden></div>
-            <div class="card-head"><h4>Service Updates</h4><button class="btn small" type="button" id="su-check">Check Now</button></div>
+            <div class="card-head"><h3>Service Updates</h3><button class="btn small" type="button" id="su-check">Check Now</button></div>
             <div id="su-list"></div>
             <div id="su-job" class="job" hidden></div>
           </section>
-          <section class="card">
+        </div>
+      </div>
+
+      <div id="view-updates" class="view" hidden>
+        <section class="card wide restart-bar">
+          <div class="restart-text">
             <h3>Restart the Server</h3>
             <p class="muted">Everything on the server goes offline for about two minutes: websites, mail and Hephaestus. Argus disconnects and you sign in again afterwards.</p>
             <p id="reboot-state"></p>
-            <div class="btns"><button class="btn danger" type="button" id="reboot">Restart in One Minute</button>
-            <button class="btn" type="button" id="reboot-cancel" hidden>Cancel the Restart</button></div>
+          </div>
+          <div class="btns"><button class="btn danger" type="button" id="reboot">Restart in One Minute</button>
+          <button class="btn" type="button" id="reboot-cancel" hidden>Cancel the Restart</button></div>
+        </section>
+        <div class="updates-stack">
+          <section class="card">
+            <div class="card-head"><h3>System Packages</h3><button class="btn small" type="button" id="upd-check">Check Now</button></div>
+            <div id="upd-list"></div>
+            <button class="btn primary" type="button" id="upd-apply">Apply Updates</button>
+            <div id="upd-job" class="job" hidden></div>
+          </section>
+        </div>
+      </div>
+
+      <div id="view-databases" class="view" hidden>
+        <div class="cards">
+          <section class="card wide" data-collapse="backups-databases">
+            <div class="card-head"><h3>Databases</h3><div class="btns"><button class="btn small" type="button" data-toggle aria-expanded="true">Hide</button></div></div>
+            <div class="collapsible">
+            <p class="muted">Every database on this server. A backup is a full copy of the database, saved as a compressed file. The newest <span id="db-keep"></span> copies per database are kept; older ones are removed after a new backup succeeds.</p>
+            <div class="btns" style="margin-bottom:10px"><button class="btn small" type="button" id="db-new-db">New Database</button><button class="btn small" type="button" id="db-new-user">New Database User</button><button class="btn small" type="button" id="db-restore-db">Restore Database</button><button class="btn small" type="button" id="db-warnings-toggle">Hide Warnings</button><button class="btn small" type="button" id="db-drop-user">Drop User</button></div>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Database</th><th scope="col">Type</th><th scope="col">Last Backup</th><th scope="col">Size</th><th scope="col">Scheduled Backup</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="db-rows"></tbody></table></div>
+            <div id="db-job" class="job" hidden></div>
+            <h4>Databases inside each PostgreSQL container</h4>
+            <p class="muted">Read-only. Lists the databases each container holds, with their owner and size.</p>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Container</th><th scope="col">Database</th><th scope="col">Owner</th><th scope="col">Size</th><th scope="col">Accepts Connections</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="db-pg-rows"></tbody></table></div>
+            <h4>Database users</h4>
+            <p class="muted">Read-only. Lists every login user in each PostgreSQL container and the databases it can connect to.</p>
+            <div class="table-wrap"><table><thead><tr><th scope="col">Container</th><th scope="col">User</th><th scope="col">Owner</th><th scope="col">Can Connect To</th></tr></thead><tbody id="db-user-rows"></tbody></table></div>
+            </div>
           </section>
         </div>
       </div>
 
       <div id="view-backups" class="view" hidden>
         <div class="cards" id="bk-cards"></div>
+        <div class="cards">
+        </div>
       </div>
 
-      <div id="view-hephaestus" class="view" hidden>
+      <div id="view-rollback" class="view" hidden>
         <div class="cards">
           <section class="card wide">
             <h3>Roll Back</h3>
@@ -119,6 +150,11 @@
             <div class="table-wrap"><table><thead><tr><th scope="col">Earlier Version</th><th scope="col">Built</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="hp-rows"></tbody></table></div>
             <div id="hp-job" class="job" hidden></div>
           </section>
+        </div>
+      </div>
+
+      <div id="view-deploy" class="view" hidden>
+        <div class="cards">
           <section class="card wide">
             <h3>Deploy</h3>
             <div id="dp-source"><p class="muted">Reading the source on this PC…</p></div>
@@ -130,12 +166,18 @@
       </div>
 
       <div id="view-files" class="view" hidden>
-        <p class="muted files-help">Drag a file across to copy it, or select it and use the arrow button. Files dragged in from Windows Explorer upload too. Uploads keep the right owner and permissions; an overwritten file is copied to /var/backups/argus first.</p>
+        <p class="muted files-help">Drag a file or a whole folder across to copy it, or select it and use the arrow button. Anything dragged in from Windows Explorer uploads too, and a folder is confirmed once rather than file by file. Uploads keep the right owner and permissions; an overwritten file is copied to /var/backups/argus first.</p>
+        <div id="up-prog" class="up-prog" hidden>
+          <div class="up-prog-row"><strong id="up-prog-title">Uploading…</strong><button class="btn small danger" type="button" id="up-cancel">Cancel</button></div>
+          <progress id="up-bar" max="1000" value="0"></progress>
+          <p class="muted mono" id="up-prog-text"></p>
+          <div id="up-fail" hidden></div>
+        </div>
         <div class="panes">
           <section class="pane" id="pane-pc" aria-label="This PC">
             <div class="pane-head">
               <strong>This PC</strong>
-              <div class="path-row"><button class="btn small" type="button" id="pc-up" title="Up one folder">Up</button><input id="pc-path" class="mono" aria-label="Folder on this PC"></div>
+              <div class="path-row"><button class="btn small" type="button" id="pc-up" title="Up one folder">Up</button><input id="pc-path" class="mono" aria-label="Folder on this PC"><button class="btn small" type="button" id="pc-reload" title="Show what is in this folder now">Reload</button></div>
             </div>
             <div class="pane-list" id="pc-list" tabindex="0"></div>
             <div class="pane-preview" id="pc-preview" hidden></div>
@@ -144,12 +186,12 @@
           <section class="pane" id="pane-srv" aria-label="Server">
             <div class="pane-head">
               <strong>Server</strong>
-              <div class="path-row"><button class="btn small" type="button" id="srv-up" title="Up one folder">Up</button><input id="srv-path" class="mono" aria-label="Folder on the server"><button class="btn small" type="button" id="srv-mkdir">New Folder</button></div>
+              <div class="path-row"><button class="btn small" type="button" id="srv-up" title="Up one folder">Up</button><input id="srv-path" class="mono" aria-label="Folder on the server"><button class="btn small" type="button" id="srv-reload" title="Show what is in this folder now">Reload</button><button class="btn small" type="button" id="srv-mkdir">New Folder</button><button class="btn small" type="button" id="srv-trash" title="Items moved here wait until they are deleted for good">Trash</button></div>
               <p id="srv-web" class="warn-text" hidden>This folder is served by a website: anything put here can be seen by anyone.</p>
             </div>
             <div class="pane-list" id="srv-list" tabindex="0"></div>
             <div class="pane-preview" id="srv-preview" hidden></div>
-            <div class="pane-foot"><button class="btn small primary" type="button" id="do-download" disabled>← Download to PC</button><span id="srv-sel" class="muted"></span></div>
+            <div class="pane-foot"><button class="btn small primary" type="button" id="do-download" disabled>← Download to PC</button><span id="srv-sel" class="muted"></span><button class="btn small danger" type="button" id="do-delete" disabled>Move to Trash</button></div>
           </section>
         </div>
       </div>
@@ -159,16 +201,6 @@
           <section class="card wide">
             <h3>Sites</h3>
             <div class="table-wrap"><table><thead><tr><th scope="col">Name</th><th scope="col">What It Is</th><th scope="col">Answering</th><th scope="col">Certificate</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="ws-rows"></tbody></table></div>
-          </section>
-          <section class="card">
-            <h3>Web Server Configuration</h3>
-            <p id="wc-state" class="muted"></p>
-            <p class="muted small">To change it, edit the files in /opt/web on the Files page (the old version is kept). Then Check, and Apply. Apply restarts the web server: every site blips for a second or two. If a site that worked stops working, the last good configuration is put back by itself.</p>
-            <div class="btns"><button class="btn" type="button" id="wc-open">Open /opt/web in Files</button><button class="btn" type="button" id="wc-check">Check</button><button class="btn primary" type="button" id="wc-apply">Apply Changes</button></div>
-            <div id="wc-check-out"></div>
-            <details id="wc-files"><summary>Show the configuration files</summary><div id="wc-files-out"></div></details>
-            <details id="wc-hist"><summary>Earlier configurations</summary><div id="wc-hist-out"></div></details>
-            <div id="wc-job" class="job" hidden></div>
           </section>
           <section class="card">
             <h3>Add a Site</h3>
@@ -182,6 +214,21 @@
             <label id="sa-target-l" hidden><span id="sa-target-label"></span><input id="sa-target" class="mono"></label>
             <button class="btn primary" type="button" id="sa-go">Add Site</button>
             <div id="sa-dns"></div>
+          </section>
+        </div>
+      </div>
+
+      <div id="view-caddy" class="view" hidden>
+        <div class="cards">
+          <section class="card">
+            <h3>Web Server Configuration</h3>
+            <p id="wc-state" class="muted"></p>
+            <p class="muted small">To change it, edit the files in /opt/web on the Files page (the old version is kept). Then Check, and Apply. Apply restarts the web server: every site blips for a second or two. If a site that worked stops working, the last good configuration is put back by itself.</p>
+            <div class="btns"><button class="btn" type="button" id="wc-open">Open /opt/web in Files</button><button class="btn" type="button" id="wc-check">Check</button><button class="btn primary" type="button" id="wc-apply">Apply Changes</button></div>
+            <div id="wc-check-out"></div>
+            <details id="wc-files"><summary>Show the configuration files</summary><div id="wc-files-out"></div></details>
+            <details id="wc-hist"><summary>Earlier configurations</summary><div id="wc-hist-out"></div></details>
+            <div id="wc-job" class="job" hidden></div>
           </section>
         </div>
       </div>
@@ -270,7 +317,7 @@
           <section class="card full">
             <div class="card-head"><h3>Addresses</h3><div class="btns"><span class="muted small" id="si-count"></span><button class="btn small" type="button" id="si-sort-reset" hidden>Default Order</button><span class="sr" aria-live="polite" id="si-sort-say"></span></div></div>
             <p class="muted small">Every one of these was refused. SSH needs your key and your code; mail failures are wrong passwords. Your own addresses (where you sign in over SSH as mattridge or root, and any listed in /etc/argus/own-addresses on the server) are left out. Used Your SSH Key means your key was accepted there but the code was never right: if that wasn't you, your key has been copied; replace it and block the address. Addresses where a mailbox or upload account has signed in are only listed if they were also refused, marked Has Signed In: usually a mistyped password, but it could be a stolen one.</p>
-            <div class="table-wrap"><table id="si-table"><thead><tr><th scope="col" data-sort="ip" aria-sort="none"><button class="th-sort" type="button">Address<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="place" aria-sort="none"><button class="th-sort" type="button">Location<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="network" aria-sort="none"><button class="th-sort" type="button">Network<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="tries" aria-sort="none"><button class="th-sort" type="button">Tries<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="visits" aria-sort="none"><button class="th-sort" type="button">Visits<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="users" aria-sort="none"><button class="th-sort" type="button">Tried As<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="last" aria-sort="none"><button class="th-sort" type="button">Last Seen<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="si-rows"></tbody></table></div>
+            <div class="table-wrap"><table id="si-table"><thead><tr><th scope="col" data-sort="rank" aria-sort="none"><button class="th-sort" type="button">Rank<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="ip" aria-sort="none"><button class="th-sort" type="button">Address<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="place" aria-sort="none"><button class="th-sort" type="button">Location<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="network" aria-sort="none"><button class="th-sort" type="button">Network<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="tries" aria-sort="none"><button class="th-sort" type="button">Tries<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="visits" aria-sort="none"><button class="th-sort" type="button">Visits<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="users" aria-sort="none"><button class="th-sort" type="button">Tried As<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col" data-sort="last" aria-sort="none"><button class="th-sort" type="button">Last Seen<span class="sort-mark" aria-hidden="true"></span></button></th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="si-rows"></tbody></table></div>
           </section>
         </div>
       </div>
@@ -341,6 +388,15 @@
         </div>
         <p class="warn-text">This is the only time these are shown. Hand them over now; Argus clears the clipboard again after 30 seconds.</p>
         <div class="btns"><button class="btn" type="button" id="qr-copy">Copy Key and Codes</button><button class="btn primary" value="ok" type="submit">Done</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="trash-dlg" aria-labelledby="trash-title" class="wide">
+      <form method="dialog" class="dialog-body">
+        <h2 id="trash-title">Trash on the Server</h2>
+        <p class="muted small">Items moved here from the Server pane stay until you delete them for good.</p>
+        <div class="table-wrap"><table><thead><tr><th scope="col">Name</th><th scope="col">Was In</th><th scope="col">Type</th><th scope="col">Size</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody id="trash-rows"></tbody></table></div>
+        <div class="btns"><button class="btn danger" type="button" id="trash-empty">Empty Trash</button><button class="btn primary" value="ok" type="submit">Close</button></div>
       </form>
     </dialog>
 

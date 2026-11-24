@@ -69,8 +69,13 @@ pub async fn start_sign_in(
     drop(passphrase);
 
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(600)),
+        // No inactivity cutoff: an idle-but-alive connection stays up while the user is working.
+        // Liveness is policed by keepalives below - a genuinely dead link is dropped after
+        // keepalive_max unanswered keepalives (~4 * 30s = 2 minutes). "Operator walked away" is a
+        // separate concern handled by the app's 30-minute idle lock, not by tearing down SSH.
+        inactivity_timeout: None,
         keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_max: 4,
         ..Default::default()
     });
     within(NET_TIMEOUT, "signing in", connect_and_present_key(target, key, config)).await
